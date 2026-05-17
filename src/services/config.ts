@@ -120,6 +120,9 @@ export const CONFIG_KEYS = {
   // AI 足迹
   AI_FOOTPRINT_ENABLED: 'aiFootprintEnabled',
   AI_FOOTPRINT_SYSTEM_PROMPT: 'aiFootprintSystemPrompt',
+  AI_MESSAGE_INSIGHT_ENABLED: 'aiMessageInsightEnabled',
+  AI_MESSAGE_INSIGHT_CONTEXT_COUNT: 'aiMessageInsightContextCount',
+  AI_MESSAGE_INSIGHT_SYSTEM_PROMPT: 'aiMessageInsightSystemPrompt',
   AI_INSIGHT_DEBUG_LOG_ENABLED: 'aiInsightDebugLogEnabled',
   AUTO_DOWNLOAD_HIGH_RES: 'autoDownloadHighRes',
   AUTO_DOWNLOAD_WHITELIST: 'autoDownloadWhitelist'
@@ -2173,6 +2176,36 @@ export async function getAiFootprintSystemPrompt(): Promise<string> {
 
 export async function setAiFootprintSystemPrompt(prompt: string): Promise<void> {
   await config.set(CONFIG_KEYS.AI_FOOTPRINT_SYSTEM_PROMPT, prompt)
+}
+
+export async function getAiMessageInsightEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_MESSAGE_INSIGHT_ENABLED)
+  return value === true
+}
+
+export async function setAiMessageInsightEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MESSAGE_INSIGHT_ENABLED, enabled)
+}
+
+export async function getAiMessageInsightContextCount(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_MESSAGE_INSIGHT_CONTEXT_COUNT)
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return 50
+  return Math.max(1, Math.min(200, Math.floor(numeric)))
+}
+
+export async function setAiMessageInsightContextCount(count: number): Promise<void> {
+  const normalized = Number.isFinite(count) ? Math.max(1, Math.min(200, Math.floor(count))) : 50
+  await config.set(CONFIG_KEYS.AI_MESSAGE_INSIGHT_CONTEXT_COUNT, normalized)
+}
+
+export async function getAiMessageInsightSystemPrompt(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_MESSAGE_INSIGHT_SYSTEM_PROMPT)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiMessageInsightSystemPrompt(prompt: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MESSAGE_INSIGHT_SYSTEM_PROMPT, prompt)
 }
 
 export async function getAiInsightDebugLogEnabled(): Promise<boolean> {

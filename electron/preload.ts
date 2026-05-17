@@ -595,7 +595,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
       }
       privateSegments?: Array<{ displayName?: string; session_id?: string; incoming_count?: number; outgoing_count?: number; message_count?: number; replied?: boolean }>
       mentionGroups?: Array<{ displayName?: string; session_id?: string; count?: number }>
-    }) => ipcRenderer.invoke('insight:generateFootprintInsight', payload)
+    }) => ipcRenderer.invoke('insight:generateFootprintInsight', payload),
+    generateMessageInsight: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+      targetLocalId?: number
+      targetCreateTime?: number
+      targetMessageKey?: string
+      targetText: string
+      targetSenderName?: string
+      contextCount?: number
+      forceRefresh?: boolean
+    }) => ipcRenderer.invoke('insight:generateMessageInsight', payload)
   },
 
   social: {

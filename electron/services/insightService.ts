@@ -21,7 +21,12 @@ import { chatService, ChatSession, Message } from './chatService'
 import { snsService } from './snsService'
 import { weiboService } from './social/weiboService'
 import { showNotification } from '../windows/notificationWindow'
-import { insightRecordService, type InsightRecordLog, type InsightRecordTriggerReason } from './insightRecordService'
+import {
+  insightRecordService,
+  type InsightRecordLog,
+  type InsightRecordTriggerReason,
+  type MessageInsightAnalysis
+} from './insightRecordService'
 
 // ─── 常量 ────────────────────────────────────────────────────────────────────
 
@@ -80,6 +85,18 @@ interface SharedAiModelConfig {
 }
 
 type InsightFilterMode = 'whitelist' | 'blacklist'
+
+class ApiRequestError extends Error {
+  statusCode?: number
+  responseBody?: string
+
+  constructor(message: string, statusCode?: number, responseBody?: string) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.statusCode = statusCode
+    this.responseBody = responseBody
+  }
+}
 
 // ─── 日志 ─────────────────────────────────────────────────────────────────────
 
@@ -161,6 +178,52 @@ function normalizeSessionIdList(value: unknown): string[] {
   return Array.from(new Set(value.map((item) => String(item || '').trim()).filter(Boolean)))
 }
 
+function clampText(value: unknown, maxLength: number): string {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (text.length <= maxLength) return text
+  return `${text.slice(0, Math.max(0, maxLength - 1))}…`
+}
+
+function stripJsonFence(value: string): string {
+  const text = String(value || '').trim()
+  const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)
+  if (fenced) return fenced[1].trim()
+  const firstBrace = text.indexOf('{')
+  const lastBrace = text.lastIndexOf('}')
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return text.slice(firstBrace, lastBrace + 1).trim()
+  }
+  return text
+}
+
+function parseMessageInsightAnalysis(rawOutput: string): MessageInsightAnalysis {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stripJsonFence(rawOutput))
+  } catch {
+    throw new Error('模型输出格式异常：不是合法 JSON')
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('模型输出格式异常：JSON 根节点不是对象')
+  }
+  const source = parsed as Record<string, unknown>
+  const explicitText = clampText(source.explicit_text ?? source.explicitText, 120)
+  const emotion = clampText(source.emotion, 16)
+  const intent = clampText(source.intent, 20)
+  const topic = clampText(source.topic, 20)
+  if (!explicitText || !emotion || !intent || !topic) {
+    throw new Error('模型输出格式异常：缺少必要字段')
+  }
+  return { explicitText, emotion, intent, topic }
+}
+
+function shouldFallbackJsonMode(error: unknown): boolean {
+  const statusCode = Number((error as ApiRequestError)?.statusCode || 0)
+  if (statusCode === 400 || statusCode === 404 || statusCode === 422) return true
+  const text = `${(error as Error)?.message || ''}\n${(error as ApiRequestError)?.responseBody || ''}`.toLowerCase()
+  return text.includes('response_format') || text.includes('json_object') || text.includes('json mode')
+}
+
 /**
  * 调用 OpenAI 兼容 API（非流式），返回模型第一条消息内容。
  * 使用 Node 原生 https/http 模块，无需任何第三方 SDK。
@@ -171,7 +234,8 @@ function callApi(
   model: string,
   messages: Array<{ role: string; content: string }>,
   timeoutMs: number = API_TIMEOUT_MS,
-  maxTokens: number = API_MAX_TOKENS_DEFAULT
+  maxTokens: number = API_MAX_TOKENS_DEFAULT,
+  options?: { responseFormatJson?: boolean }
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const endpoint = buildApiUrl(apiBaseUrl, '/chat/completions')
@@ -183,15 +247,19 @@ function callApi(
       return
     }
 
-    const body = JSON.stringify({
+    const payload: Record<string, unknown> = {
       model,
       messages,
       max_tokens: normalizeApiMaxTokens(maxTokens),
       temperature: API_TEMPERATURE,
       stream: false
-    })
+    }
+    if (options?.responseFormatJson) {
+      payload.response_format = { type: 'json_object' }
+    }
+    const body = JSON.stringify(payload)
 
-    const options = {
+    const requestOptions = {
       hostname: urlObj.hostname,
       port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
       path: urlObj.pathname + urlObj.search,
@@ -205,11 +273,15 @@ function callApi(
 
     const isHttps = urlObj.protocol === 'https:'
     const requestFn = isHttps ? https.request : http.request
-    const req = requestFn(options, (res) => {
+    const req = requestFn(requestOptions, (res) => {
       let data = ''
       res.on('data', (chunk) => { data += chunk })
       res.on('end', () => {
         try {
+          if (res.statusCode && res.statusCode >= 400) {
+            reject(new ApiRequestError(`API 请求失败 (${res.statusCode}): ${data.slice(0, 200)}`, res.statusCode, data))
+            return
+          }
           const parsed = JSON.parse(data)
           const content = parsed?.choices?.[0]?.message?.content
           if (typeof content === 'string' && content.trim()) {
@@ -587,6 +659,207 @@ ${topMentionText}
       return { success: true, message: '生成成功', insight }
     } catch (error) {
       return { success: false, message: `生成失败：${(error as Error).message}` }
+    }
+  }
+
+  async generateMessageInsight(params: {
+    sessionId: string
+    displayName?: string
+    avatarUrl?: string
+    targetLocalId?: number
+    targetCreateTime?: number
+    targetMessageKey?: string
+    targetText: string
+    targetSenderName?: string
+    contextCount?: number
+    forceRefresh?: boolean
+  }): Promise<{ success: boolean; message: string; cached?: boolean; recordId?: string; data?: MessageInsightAnalysis }> {
+    const enabled = this.config.get('aiMessageInsightEnabled') === true
+    if (!enabled) {
+      return { success: false, message: '请先在设置中开启「消息解析」' }
+    }
+
+    const sessionId = String(params?.sessionId || '').trim()
+    const targetText = clampText(params?.targetText || '', 500)
+    const targetCreateTime = Math.floor(Number(params?.targetCreateTime || 0))
+    const targetLocalId = Math.floor(Number(params?.targetLocalId || 0))
+    const targetMessageKey = String(params?.targetMessageKey || '').trim()
+    if (!sessionId || !targetText || targetCreateTime <= 0) {
+      return { success: false, message: '目标消息无效，无法解析' }
+    }
+
+    if (params?.forceRefresh !== true) {
+      const cached = insightRecordService.findLatestMessageAnalysis({
+        sessionId,
+        targetLocalId,
+        targetCreateTime,
+        targetMessageKey
+      })
+      if (cached?.messageInsight?.analysis) {
+        return {
+          success: true,
+          message: '已读取缓存解析',
+          cached: true,
+          recordId: cached.id,
+          data: cached.messageInsight.analysis
+        }
+      }
+    }
+
+    const { apiBaseUrl, apiKey, model, maxTokens } = this.getSharedAiModelConfig()
+    if (!apiBaseUrl || !apiKey) {
+      return { success: false, message: '请先填写通用 AI 模型配置（API 地址和 Key）' }
+    }
+
+    const configuredContextCount = Number(this.config.get('aiMessageInsightContextCount') || 50)
+    const contextCount = Math.max(1, Math.min(200, Math.floor(Number(params?.contextCount || configuredContextCount) || 50)))
+    const displayName = await this.resolveInsightSessionDisplayName(sessionId, String(params?.displayName || sessionId))
+    const targetSenderName = clampText(params?.targetSenderName || displayName, 40) || displayName
+    const targetTextPreview = clampText(targetText, 120)
+    let avatarUrl = String(params?.avatarUrl || '').trim() || undefined
+    if (!avatarUrl) {
+      try {
+        const contact = await chatService.getContactAvatar(sessionId)
+        avatarUrl = String(contact?.avatarUrl || '').trim() || undefined
+      } catch {
+        avatarUrl = undefined
+      }
+    }
+
+    let beforeMessages: Message[] = []
+    let afterMessages: Message[] = []
+    let contextReadError = ''
+    try {
+      const aroundResult = await chatService.getMessagesAround(
+        sessionId,
+        { localId: targetLocalId, createTime: targetCreateTime, messageKey: targetMessageKey },
+        contextCount
+      )
+      if (aroundResult.success) {
+        beforeMessages = aroundResult.before || []
+        afterMessages = aroundResult.after || []
+      } else {
+        contextReadError = aroundResult.error || '读取上下文失败'
+      }
+    } catch (error) {
+      contextReadError = (error as Error).message || String(error)
+    }
+
+    const formatLine = (message: Message) => {
+      const senderName = message.isSend === 1 ? '我' : (message.senderDisplayName || targetSenderName || displayName)
+      return `${this.formatInsightMessageTimestamp(message.createTime)} ${senderName}：${this.formatInsightMessageContent(message)}`
+    }
+    const beforeText = beforeMessages.length > 0 ? beforeMessages.map(formatLine).join('\n') : '无'
+    const afterText = afterMessages.length > 0 ? afterMessages.map(formatLine).join('\n') : '无'
+
+    const DEFAULT_MESSAGE_INSIGHT_PROMPT = `你是一个克制、准确的聊天语义分析助手。你的任务是把用户选中的一句聊天消息做深度解析，帮助用户理解对方未明说的含义。
+
+严格要求：
+1. 必须且只能输出合法的纯 JSON。
+2. 禁止输出解释说明、前言后语，禁止使用 Markdown 或代码块。
+3. 不要编造上下文没有支持的信息；不确定时用谨慎表述。
+4. explicit_text 用自然中文说明这句话可能想表达的真实含义，80字以内。
+5. emotion、intent、topic 必须是短标签。
+
+JSON 输出格式：
+{
+  "explicit_text": "暗示转明示，80字以内",
+  "emotion": "2-6字情绪标签",
+  "intent": "2-8字意图标签",
+  "topic": "2-8字话题标签"
+}`
+    const customPrompt = String(this.config.get('aiMessageInsightSystemPrompt') || '').trim()
+    const systemPrompt = customPrompt || DEFAULT_MESSAGE_INSIGHT_PROMPT
+    const userPromptBase = `会话：${displayName}
+目标发送者：${targetSenderName}
+目标消息时间：${this.formatInsightMessageTimestamp(targetCreateTime)}
+
+目标消息：
+${targetText}
+
+目标消息之前的上下文（${beforeMessages.length} 条）：
+${beforeText}
+
+目标消息之后的上下文（${afterMessages.length} 条）：
+${afterText}
+
+请分析目标消息，只输出指定 JSON。`
+    const userPrompt = appendPromptCurrentTime(userPromptBase)
+    const endpoint = buildApiUrl(apiBaseUrl, '/chat/completions')
+    const requestMessages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt }
+    ]
+
+    let rawOutput = ''
+    let responseFormatJson = true
+    let responseFormatFallback = false
+    let responseFormatFallbackReason = ''
+    const startedAt = Date.now()
+    try {
+      try {
+        rawOutput = await callApi(apiBaseUrl, apiKey, model, requestMessages, API_TIMEOUT_MS, maxTokens, { responseFormatJson: true })
+      } catch (error) {
+        if (!shouldFallbackJsonMode(error)) throw error
+        responseFormatJson = false
+        responseFormatFallback = true
+        responseFormatFallbackReason = (error as Error).message || 'response_format 不受支持'
+        rawOutput = await callApi(apiBaseUrl, apiKey, model, requestMessages, API_TIMEOUT_MS, maxTokens)
+      }
+      const analysis = parseMessageInsightAnalysis(rawOutput)
+      const finalInsight = analysis.explicitText
+      const log: InsightRecordLog = {
+        endpoint,
+        model,
+        maxTokens,
+        temperature: API_TEMPERATURE,
+        triggerReason: 'message_analysis',
+        allowContext: true,
+        contextCount,
+        systemPrompt,
+        userPrompt,
+        rawOutput,
+        finalInsight,
+        durationMs: Date.now() - startedAt,
+        createdAt: Date.now(),
+        responseFormatJson,
+        responseFormatFallback,
+        responseFormatFallbackReason,
+        targetMessage: {
+          localId: targetLocalId,
+          createTime: targetCreateTime,
+          messageKey: targetMessageKey,
+          senderName: targetSenderName,
+          textPreview: targetTextPreview
+        },
+        contextStats: {
+          requested: contextCount,
+          beforeTarget: beforeMessages.length,
+          afterTarget: afterMessages.length,
+          readError: contextReadError || undefined
+        },
+        parsedAnalysis: analysis
+      }
+      const record = insightRecordService.addRecord({
+        sessionId,
+        displayName,
+        avatarUrl,
+        sourceType: 'message_analysis',
+        triggerReason: 'message_analysis',
+        insight: finalInsight,
+        messageInsight: {
+          targetLocalId,
+          targetCreateTime,
+          targetMessageKey,
+          targetSenderName,
+          targetTextPreview,
+          analysis
+        },
+        log
+      })
+      return { success: true, message: '解析完成', cached: false, recordId: record.id, data: analysis }
+    } catch (error) {
+      return { success: false, message: `解析失败：${(error as Error).message}` }
     }
   }
 

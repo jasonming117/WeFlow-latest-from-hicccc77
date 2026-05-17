@@ -2586,6 +2586,93 @@ class ChatService {
     }
   }
 
+  async getMessagesAround(
+    sessionId: string,
+    target: { localId?: number; createTime: number; messageKey?: string },
+    totalContextCount: number = 50
+  ): Promise<{
+    success: boolean
+    before: Message[]
+    after: Message[]
+    requested: number
+    error?: string
+  }> {
+    const requested = Math.max(1, Math.min(200, Math.floor(Number(totalContextCount) || 50)))
+    const targetCreateTime = Math.floor(Number(target?.createTime || 0))
+    if (!sessionId || targetCreateTime <= 0) {
+      return { success: false, before: [], after: [], requested, error: '无效的目标消息' }
+    }
+
+    const collect = async (ascending: boolean): Promise<Message[]> => {
+      let cursor: number | undefined
+      try {
+        const cursorResult = await wcdbService.openMessageCursorLite(
+          sessionId,
+          Math.min(240, Math.max(60, requested + 20)),
+          ascending,
+          ascending ? targetCreateTime : 0,
+          ascending ? 0 : targetCreateTime + 1
+        )
+        if (!cursorResult.success || !cursorResult.cursor) {
+          throw new Error(cursorResult.error || '打开消息游标失败')
+        }
+        cursor = cursorResult.cursor
+        const collected = await this.collectVisibleMessagesFromCursor(sessionId, cursor, requested + 1)
+        if (!collected.success) {
+          throw new Error(collected.error || '读取上下文消息失败')
+        }
+        const targetLocalId = Math.floor(Number(target?.localId || 0))
+        const targetMessageKey = String(target?.messageKey || '').trim()
+        return (collected.messages || []).filter((message) => {
+          const sameLocalId = targetLocalId > 0 && Number(message.localId || 0) === targetLocalId
+          const sameCreateTime = Number(message.createTime || 0) === targetCreateTime
+          const sameKey = Boolean(targetMessageKey && message.messageKey === targetMessageKey)
+          return !(sameKey || (sameLocalId && sameCreateTime))
+        })
+      } finally {
+        if (cursor) {
+          await wcdbService.closeMessageCursor(cursor).catch(() => {})
+        }
+      }
+    }
+
+    try {
+      const [beforeCandidatesRaw, afterCandidatesRaw] = await Promise.all([
+        collect(false),
+        collect(true)
+      ])
+      const beforeCandidates = beforeCandidatesRaw
+        .filter((message) => Number(message.createTime || 0) <= targetCreateTime)
+        .sort((a, b) => (a.createTime - b.createTime) || (a.sortSeq - b.sortSeq))
+      const afterCandidates = afterCandidatesRaw
+        .filter((message) => Number(message.createTime || 0) >= targetCreateTime)
+        .sort((a, b) => (a.createTime - b.createTime) || (a.sortSeq - b.sortSeq))
+
+      const baseBefore = Math.floor(requested / 2)
+      const baseAfter = requested - baseBefore
+      const takeAfter = Math.min(baseAfter, afterCandidates.length)
+      const takeBefore = Math.min(requested - takeAfter, beforeCandidates.length)
+      const remainingAfter = Math.max(0, requested - takeBefore - takeAfter)
+      const finalAfter = Math.min(afterCandidates.length, takeAfter + remainingAfter)
+      const finalBefore = Math.min(beforeCandidates.length, requested - finalAfter)
+
+      return {
+        success: true,
+        before: beforeCandidates.slice(Math.max(0, beforeCandidates.length - finalBefore)),
+        after: afterCandidates.slice(0, finalAfter),
+        requested
+      }
+    } catch (error) {
+      return {
+        success: false,
+        before: [],
+        after: [],
+        requested,
+        error: (error as Error).message || String(error)
+      }
+    }
+  }
+
   async getNewMessages(sessionId: string, minTime: number, limit: number = this.messageBatchDefault): Promise<{ success: boolean; messages?: Message[]; error?: string }> {
     try {
       const connectResult = await this.ensureConnected()

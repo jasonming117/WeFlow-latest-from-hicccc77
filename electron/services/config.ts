@@ -129,6 +129,9 @@ interface ConfigSchema {
   // AI 足迹
   aiFootprintEnabled: boolean
   aiFootprintSystemPrompt: string
+  aiMessageInsightEnabled: boolean
+  aiMessageInsightContextCount: number
+  aiMessageInsightSystemPrompt: string
   /** 是否将 AI 见解调试日志输出到桌面 */
   aiInsightDebugLogEnabled: boolean
   autoDownloadHighRes: boolean
@@ -252,6 +255,9 @@ export class ConfigService {
       aiInsightWeiboBindings: {},
       aiFootprintEnabled: false,
       aiFootprintSystemPrompt: '',
+      aiMessageInsightEnabled: false,
+      aiMessageInsightContextCount: 50,
+      aiMessageInsightSystemPrompt: '',
       aiInsightDebugLogEnabled: false,
       autoDownloadHighRes: false,
       autoDownloadWhitelist: []

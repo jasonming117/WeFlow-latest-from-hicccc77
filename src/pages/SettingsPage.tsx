@@ -32,9 +32,10 @@ type SettingsTab =
   | 'aiCommon'
   | 'insight'
   | 'aiFootprint'
+  | 'aiMessageInsight'
   | 'autoDownload'
 
-const tabs: { id: Exclude<SettingsTab, 'insight' | 'aiFootprint'>; label: string; icon: React.ElementType }[] = [
+const tabs: { id: Exclude<SettingsTab, 'insight' | 'aiFootprint' | 'aiMessageInsight'>; label: string; icon: React.ElementType }[] = [
   { id: 'appearance', label: '外观', icon: Palette },
   { id: 'notification', label: '通知', icon: Bell },
   { id: 'antiRevoke', label: '防撤回', icon: RotateCcw },
@@ -56,10 +57,11 @@ const filteredTabs = tabs.filter(tab => {
   return true
 })
 
-const aiTabs: Array<{ id: Extract<SettingsTab, 'aiCommon' | 'insight' | 'aiFootprint'>; label: string }> = [
+const aiTabs: Array<{ id: Extract<SettingsTab, 'aiCommon' | 'insight' | 'aiFootprint' | 'aiMessageInsight'>; label: string }> = [
   { id: 'aiCommon', label: '基础配置' },
   { id: 'insight', label: 'AI 见解' },
-  { id: 'aiFootprint', label: 'AI 足迹' }
+  { id: 'aiFootprint', label: 'AI 足迹' },
+  { id: 'aiMessageInsight', label: '消息解析' }
 ]
 
 const isMac = navigator.userAgent.toLowerCase().includes('mac')
@@ -327,6 +329,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [weiboBindingLoadingSessionId, setWeiboBindingLoadingSessionId] = useState<string | null>(null)
   const [aiFootprintEnabled, setAiFootprintEnabled] = useState(false)
   const [aiFootprintSystemPrompt, setAiFootprintSystemPrompt] = useState('')
+  const [aiMessageInsightEnabled, setAiMessageInsightEnabled] = useState(false)
+  const [aiMessageInsightContextCount, setAiMessageInsightContextCount] = useState(50)
+  const [aiMessageInsightSystemPrompt, setAiMessageInsightSystemPrompt] = useState('')
 
   // 自动下载图片
   const [autoDownloadStatus, setAutoDownloadStatus] = useState<{ isHooked: boolean; pid: number | null; supported: boolean } | null>(null)
@@ -372,7 +377,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   }, [location.state])
 
   useEffect(() => {
-    if (activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint') {
+    if (activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint' || activeTab === 'aiMessageInsight') {
       setAiGroupExpanded(true)
     }
   }, [activeTab])
@@ -590,6 +595,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       const savedAiInsightWeiboBindings = await configService.getAiInsightWeiboBindings()
       const savedAiFootprintEnabled = await configService.getAiFootprintEnabled()
       const savedAiFootprintSystemPrompt = await configService.getAiFootprintSystemPrompt()
+      const savedAiMessageInsightEnabled = await configService.getAiMessageInsightEnabled()
+      const savedAiMessageInsightContextCount = await configService.getAiMessageInsightContextCount()
+      const savedAiMessageInsightSystemPrompt = await configService.getAiMessageInsightSystemPrompt()
 
       setAiInsightEnabled(savedAiInsightEnabled)
       setAiModelApiBaseUrl(savedAiModelApiBaseUrl)
@@ -616,6 +624,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       setAiInsightWeiboBindings(savedAiInsightWeiboBindings)
       setAiFootprintEnabled(savedAiFootprintEnabled)
       setAiFootprintSystemPrompt(savedAiFootprintSystemPrompt)
+      setAiMessageInsightEnabled(savedAiMessageInsightEnabled)
+      setAiMessageInsightContextCount(savedAiMessageInsightContextCount)
+      setAiMessageInsightSystemPrompt(savedAiMessageInsightSystemPrompt)
 
     } catch (e: any) {
       console.error('加载配置失败:', e)
@@ -4021,6 +4032,107 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     </div>
   )
 
+  const renderAiMessageInsightTab = () => (
+    <div className="tab-content">
+      {(() => {
+        const DEFAULT_MESSAGE_INSIGHT_PROMPT = `你是一个克制、准确的聊天语义分析助手。你的任务是把用户选中的一句聊天消息做深度解析，帮助用户理解对方未明说的含义。
+
+严格要求：
+1. 必须且只能输出合法的纯 JSON。
+2. 禁止输出解释说明、前言后语，禁止使用 Markdown 或代码块。
+3. 不要编造上下文没有支持的信息；不确定时用谨慎表述。
+4. explicit_text 用自然中文说明这句话可能想表达的真实含义，80字以内。
+5. emotion、intent、topic 必须是短标签。
+
+JSON 输出格式：
+{
+  "explicit_text": "暗示转明示，80字以内",
+  "emotion": "2-6字情绪标签",
+  "intent": "2-8字意图标签",
+  "topic": "2-8字话题标签"
+}`
+        const displayValue = aiMessageInsightSystemPrompt || DEFAULT_MESSAGE_INSIGHT_PROMPT
+        return (
+          <>
+            <div className="form-group">
+              <label>消息深度解析</label>
+              <span className="form-hint">
+                开启后，在聊天页悬停对方文本消息时显示深度解析入口。点击后按需调用 AI，解析结果会保存到灵感信箱。
+              </span>
+              <div className="log-toggle-line">
+                <span className="log-status">{aiMessageInsightEnabled ? '已开启' : '已关闭'}</span>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={aiMessageInsightEnabled}
+                    onChange={async (e) => {
+                      const val = e.target.checked
+                      setAiMessageInsightEnabled(val)
+                      await configService.setAiMessageInsightEnabled(val)
+                    }}
+                  />
+                  <span className="switch-slider" />
+                </label>
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label>发送上下文对话条数</label>
+              <span className="form-hint">
+                围绕选中消息向前、向后各取一半；一侧不足时自动由另一侧补齐。条数越多分析越准确，token 消耗也越多。
+              </span>
+              <input
+                type="number"
+                className="field-input"
+                value={aiMessageInsightContextCount}
+                min={1}
+                max={200}
+                onChange={(e) => {
+                  const val = Math.max(1, Math.min(200, parseInt(e.target.value, 10) || 50))
+                  setAiMessageInsightContextCount(val)
+                  scheduleConfigSave('aiMessageInsightContextCount', () => configService.setAiMessageInsightContextCount(val))
+                }}
+                style={{ width: 100 }}
+              />
+            </div>
+
+            <div className="form-group">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <label style={{ marginBottom: 0 }}>消息解析提示词</label>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={async () => {
+                    setAiMessageInsightSystemPrompt('')
+                    await configService.setAiMessageInsightSystemPrompt('')
+                  }}
+                >
+                  恢复默认
+                </button>
+              </div>
+              <span className="form-hint">
+                消息解析专用提示词。留空时使用内置默认提示词。
+              </span>
+              <textarea
+                className="field-input ai-prompt-textarea"
+                rows={10}
+                style={{ width: '100%', resize: 'vertical' }}
+                value={displayValue}
+                onChange={(e) => {
+                  const val = e.target.value
+                  setAiMessageInsightSystemPrompt(val)
+                  scheduleConfigSave('aiMessageInsightSystemPrompt', () => configService.setAiMessageInsightSystemPrompt(val))
+                }}
+              />
+              <span className="form-hint" style={{ color: 'var(--danger, #ef4444)', marginTop: 8, display: 'block' }}>
+                该提示词控制 JSON 输出结构和解析口径，不建议随意修改，否则可能导致解析失败或内容错位。
+              </span>
+            </div>
+          </>
+        )
+      })()}
+    </div>
+  )
+
   const renderApiTab = () => (
     <div className="tab-content">
       <div className="form-group">
@@ -5049,7 +5161,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 row.push(
                   <div key="ai-settings-group" className={`tab-group ${aiGroupExpanded ? 'expanded' : ''}`}>
                     <button
-                      className={`tab-btn tab-group-trigger ${(activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint') ? 'active' : ''}`}
+                      className={`tab-btn tab-group-trigger ${(activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint' || activeTab === 'aiMessageInsight') ? 'active' : ''}`}
                       onClick={() => setAiGroupExpanded((prev) => !prev)}
                       aria-expanded={aiGroupExpanded}
                     >
@@ -5091,6 +5203,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
             {activeTab === 'aiCommon' && renderAiCommonTab()}
             {activeTab === 'insight' && renderInsightTab()}
             {activeTab === 'aiFootprint' && renderAiFootprintTab()}
+            {activeTab === 'aiMessageInsight' && renderAiMessageInsightTab()}
             {activeTab === 'autoDownload' && renderAutoDownloadTab()}
             {activeTab === 'updates' && renderUpdatesTab()}
             {activeTab === 'analytics' && renderAnalyticsTab()}

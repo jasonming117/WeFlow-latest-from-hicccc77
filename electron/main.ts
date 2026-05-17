@@ -1792,6 +1792,7 @@ function registerIpcHandlers() {
     sessionId?: string
     startTime?: number
     endTime?: number
+    sourceType?: 'insight' | 'message_analysis' | 'all'
     limit?: number
     offset?: number
   }) => {
@@ -1832,6 +1833,21 @@ function registerIpcHandlers() {
     mentionGroups?: Array<{ displayName?: string; session_id?: string; count?: number }>
   }) => {
     return insightService.generateFootprintInsight(payload)
+  })
+
+  ipcMain.handle('insight:generateMessageInsight', async (_, payload: {
+    sessionId: string
+    displayName?: string
+    avatarUrl?: string
+    targetLocalId?: number
+    targetCreateTime?: number
+    targetMessageKey?: string
+    targetText: string
+    targetSenderName?: string
+    contextCount?: number
+    forceRefresh?: boolean
+  }) => {
+    return insightService.generateMessageInsight(payload)
   })
 
   ipcMain.handle('social:saveWeiboCookie', async (_, rawInput: string) => {

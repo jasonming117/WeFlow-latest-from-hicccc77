@@ -21,7 +21,24 @@ export interface SocialSaveWeiboCookieResult {
   error?: string
 }
 
-export type InsightRecordTriggerReason = 'activity' | 'silence' | 'test'
+export type InsightRecordTriggerReason = 'activity' | 'silence' | 'test' | 'message_analysis'
+export type InsightRecordSourceType = 'insight' | 'message_analysis'
+
+export interface MessageInsightAnalysis {
+  explicitText: string
+  emotion: string
+  intent: string
+  topic: string
+}
+
+export interface MessageInsightTarget {
+  targetLocalId: number
+  targetCreateTime: number
+  targetMessageKey: string
+  targetSenderName: string
+  targetTextPreview: string
+  analysis: MessageInsightAnalysis
+}
 
 export interface InsightRecordLog {
   endpoint: string
@@ -37,10 +54,28 @@ export interface InsightRecordLog {
   finalInsight: string
   durationMs: number
   createdAt: number
+  responseFormatJson?: boolean
+  responseFormatFallback?: boolean
+  responseFormatFallbackReason?: string
+  targetMessage?: {
+    localId: number
+    createTime: number
+    messageKey: string
+    senderName: string
+    textPreview: string
+  }
+  contextStats?: {
+    requested: number
+    beforeTarget: number
+    afterTarget: number
+    readError?: string
+  }
+  parsedAnalysis?: MessageInsightAnalysis
 }
 
 export interface InsightRecordSummary {
   id: string
+  sourceType: InsightRecordSourceType
   createdAt: number
   sessionId: string
   displayName: string
@@ -48,6 +83,7 @@ export interface InsightRecordSummary {
   triggerReason: InsightRecordTriggerReason
   insight: string
   read: boolean
+  messageInsight?: MessageInsightTarget
 }
 
 export interface InsightRecord extends InsightRecordSummary {
@@ -67,6 +103,7 @@ export interface InsightRecordFilters {
   sessionId?: string
   startTime?: number
   endTime?: number
+  sourceType?: InsightRecordSourceType | 'all'
   limit?: number
   offset?: number
 }
@@ -1320,6 +1357,18 @@ export interface ElectronAPI {
       privateSegments?: Array<{ displayName?: string; session_id?: string; incoming_count?: number; outgoing_count?: number; message_count?: number; replied?: boolean }>
       mentionGroups?: Array<{ displayName?: string; session_id?: string; count?: number }>
     }) => Promise<{ success: boolean; message: string; insight?: string }>
+    generateMessageInsight: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+      targetLocalId?: number
+      targetCreateTime?: number
+      targetMessageKey?: string
+      targetText: string
+      targetSenderName?: string
+      contextCount?: number
+      forceRefresh?: boolean
+    }) => Promise<{ success: boolean; message: string; cached?: boolean; recordId?: string; data?: MessageInsightAnalysis }>
   }
 }
 
