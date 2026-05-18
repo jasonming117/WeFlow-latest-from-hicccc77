@@ -9250,7 +9250,7 @@ function ExportPage() {
             <div className="export-defaults-modal-actions">
               <button
                 type="button"
-                className="secondary-btn"
+                className="secondary-btn export-defaults-close-action"
                 onClick={() => setIsExportDefaultsModalOpen(false)}
               >
                 关闭

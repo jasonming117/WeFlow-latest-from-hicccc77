@@ -1177,8 +1177,16 @@
 }
 
 .export-defaults-modal-actions {
-  padding: 0 18px 16px;
+  padding: 12px 18px 16px;
+  border-top: 1px solid color-mix(in srgb, var(--border-color) 64%, transparent);
   background: var(--bg-primary);
+}
+
+.export-defaults-close-action {
+  min-width: 96px;
+  min-height: 38px;
+  justify-content: center;
+  border-radius: 8px;
 }
 
 .task-center-card-label {
@@ -5753,7 +5761,8 @@
   line-height: 1.6;
 }
 
-.close-icon-btn {
+.automation-modal .close-icon-btn,
+.automation-editor-modal .close-icon-btn {
   border: none;
   background: color-mix(in srgb, var(--text-tertiary) 8%, transparent);
   color: var(--text-secondary);
