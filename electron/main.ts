@@ -32,6 +32,7 @@ import { httpService } from './services/httpService'
 import { messagePushService } from './services/messagePushService'
 import { insightService } from './services/insightService'
 import { insightRecordService } from './services/insightRecordService'
+import { groupSummaryService } from './services/groupSummaryService'
 import { normalizeWeiboCookieInput, weiboService } from './services/social/weiboService'
 import { bizService } from './services/bizService'
 import { backupService } from './services/backupService'
@@ -1775,6 +1776,7 @@ function registerIpcHandlers() {
     }
     void messagePushService.handleConfigChanged(key)
     void insightService.handleConfigChanged(key)
+    void groupSummaryService.handleConfigChanged(key)
     return result
   })
 
@@ -1858,6 +1860,30 @@ function registerIpcHandlers() {
     return insightService.generateMessageInsight(payload)
   })
 
+  ipcMain.handle('groupSummary:listRecords', async (_, filters?: {
+    sessionId?: string
+    startTime?: number
+    endTime?: number
+    limit?: number
+    offset?: number
+  }) => {
+    return groupSummaryService.listRecords(filters || {})
+  })
+
+  ipcMain.handle('groupSummary:getRecord', async (_, id: string) => {
+    return groupSummaryService.getRecord(id)
+  })
+
+  ipcMain.handle('groupSummary:triggerManual', async (_, payload: {
+    sessionId: string
+    displayName?: string
+    avatarUrl?: string
+    startTime: number
+    endTime: number
+  }) => {
+    return groupSummaryService.triggerManual(payload)
+  })
+
   ipcMain.handle('social:saveWeiboCookie', async (_, rawInput: string) => {
     try {
       if (!configService) {
@@ -1894,6 +1920,7 @@ function registerIpcHandlers() {
     configService?.clear()
     messagePushService.handleConfigCleared()
     insightService.handleConfigCleared()
+    groupSummaryService.handleConfigCleared()
     return true
   })
 
@@ -4226,6 +4253,7 @@ app.whenReady().then(async () => {
   })
   messagePushService.start()
   insightService.start()
+  groupSummaryService.start()
   await delay(200)
 
   // 已完成引导时，在 Splash 阶段预热核心数据（联系人、消息库索引等）
@@ -4384,6 +4412,7 @@ const shutdownAppServices = async (): Promise<void> => {
     destroyNotificationWindow()
     messagePushService.stop()
     insightService.stop()
+    groupSummaryService.stop()
     // 兜底：5秒后强制退出，防止某个异步任务卡住导致进程残留
     const forceExitTimer = setTimeout(() => {
       console.warn('[App] Force exit after timeout')

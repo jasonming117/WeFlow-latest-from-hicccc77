@@ -8,6 +8,7 @@ import {
   Info,
   Loader2,
   Mic,
+  Newspaper,
   RefreshCw,
   Search,
   Sparkles,
@@ -22,9 +23,11 @@ export interface ChatHeaderProps {
   isGroupChat: boolean
   standaloneSessionWindow: boolean
   showGroupMembersPanel: boolean
+  showGroupSummaryPanel: boolean
   showJumpPopover: boolean
   showInSessionSearch: boolean
   showDetailPanel: boolean
+  aiGroupSummaryEnabled: boolean
   shouldHideStandaloneDetailButton: boolean
   isPrivateSnsSupported: boolean
   isExportActionBusy: boolean
@@ -39,6 +42,7 @@ export interface ChatHeaderProps {
   currentSessionId?: string | null
   jumpCalendarWrapRef: React.RefObject<HTMLDivElement | null>
   onTriggerSessionInsight: () => void
+  onToggleGroupSummaryPanel: () => void
   onGroupAnalytics: () => void
   onToggleGroupMembersPanel: () => void
   onExportCurrentSession: () => void
@@ -56,9 +60,11 @@ function ChatHeader({
   isGroupChat,
   standaloneSessionWindow,
   showGroupMembersPanel,
+  showGroupSummaryPanel,
   showJumpPopover,
   showInSessionSearch,
   showDetailPanel,
+  aiGroupSummaryEnabled,
   shouldHideStandaloneDetailButton,
   isPrivateSnsSupported,
   isExportActionBusy,
@@ -73,6 +79,7 @@ function ChatHeader({
   currentSessionId,
   jumpCalendarWrapRef,
   onTriggerSessionInsight,
+  onToggleGroupSummaryPanel,
   onGroupAnalytics,
   onToggleGroupMembersPanel,
   onExportCurrentSession,
@@ -116,6 +123,17 @@ function ChatHeader({
         >
           {isTriggeringSessionInsight ? <Loader2 size={18} className="spin" /> : <Sparkles size={18} />}
         </button>
+        {isGroupChat && aiGroupSummaryEnabled && (
+          <button
+            className={`icon-btn group-summary-btn ${showGroupSummaryPanel ? 'active' : ''}`}
+            onClick={onToggleGroupSummaryPanel}
+            disabled={!currentSessionId}
+            title="AI 群聊总结"
+            aria-label="AI 群聊总结"
+          >
+            <Newspaper size={18} />
+          </button>
+        )}
         {!standaloneSessionWindow && isGroupChat && (
           <button className="icon-btn group-analytics-btn" onClick={onGroupAnalytics} title="群聊分析">
             <BarChart3 size={18} />
@@ -217,9 +235,11 @@ function areEqual(prev: ChatHeaderProps, next: ChatHeaderProps) {
     prev.isGroupChat === next.isGroupChat &&
     prev.standaloneSessionWindow === next.standaloneSessionWindow &&
     prev.showGroupMembersPanel === next.showGroupMembersPanel &&
+    prev.showGroupSummaryPanel === next.showGroupSummaryPanel &&
     prev.showJumpPopover === next.showJumpPopover &&
     prev.showInSessionSearch === next.showInSessionSearch &&
     prev.showDetailPanel === next.showDetailPanel &&
+    prev.aiGroupSummaryEnabled === next.aiGroupSummaryEnabled &&
     prev.shouldHideStandaloneDetailButton === next.shouldHideStandaloneDetailButton &&
     prev.isPrivateSnsSupported === next.isPrivateSnsSupported &&
     prev.isExportActionBusy === next.isExportActionBusy &&
@@ -234,6 +254,7 @@ function areEqual(prev: ChatHeaderProps, next: ChatHeaderProps) {
     prev.currentSessionId === next.currentSessionId &&
     prev.jumpCalendarWrapRef === next.jumpCalendarWrapRef &&
     prev.onTriggerSessionInsight === next.onTriggerSessionInsight &&
+    prev.onToggleGroupSummaryPanel === next.onToggleGroupSummaryPanel &&
     prev.onGroupAnalytics === next.onGroupAnalytics &&
     prev.onToggleGroupMembersPanel === next.onToggleGroupMembersPanel &&
     prev.onExportCurrentSession === next.onExportCurrentSession &&

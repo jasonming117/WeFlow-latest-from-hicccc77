@@ -124,6 +124,78 @@ export interface InsightRecordResult {
   error?: string
 }
 
+export type GroupSummaryTriggerType = 'auto' | 'manual'
+
+export interface GroupSummaryTopic {
+  title: string
+  participants: string[]
+  keyPoints: string[]
+  conclusion: string
+}
+
+export interface GroupSummaryLog {
+  endpoint: string
+  model: string
+  temperature: number
+  triggerType: GroupSummaryTriggerType
+  periodStart: number
+  periodEnd: number
+  messageCount: number
+  readableMessageCount: number
+  systemPrompt: string
+  userPrompt: string
+  rawOutput: string
+  finalSummary: string
+  durationMs: number
+  createdAt: number
+  responseFormatJson?: boolean
+  responseFormatFallback?: boolean
+  responseFormatFallbackReason?: string
+  parsedTopics?: GroupSummaryTopic[]
+}
+
+export interface GroupSummaryRecordSummary {
+  id: string
+  createdAt: number
+  sessionId: string
+  displayName: string
+  avatarUrl?: string
+  triggerType: GroupSummaryTriggerType
+  periodStart: number
+  periodEnd: number
+  messageCount: number
+  readableMessageCount: number
+  topics: GroupSummaryTopic[]
+  summaryText: string
+}
+
+export interface GroupSummaryRecord extends GroupSummaryRecordSummary {
+  accountScope: string
+  rawOutput: string
+  log: GroupSummaryLog
+}
+
+export interface GroupSummaryRecordFilters {
+  sessionId?: string
+  startTime?: number
+  endTime?: number
+  limit?: number
+  offset?: number
+}
+
+export interface GroupSummaryRecordListResult {
+  success: boolean
+  records: GroupSummaryRecordSummary[]
+  total: number
+  error?: string
+}
+
+export interface GroupSummaryRecordResult {
+  success: boolean
+  record?: GroupSummaryRecord
+  error?: string
+}
+
 export interface BackupProgress {
   phase: 'preparing' | 'scanning' | 'exporting' | 'packing' | 'inspecting' | 'restoring' | 'done' | 'failed'
   message: string
@@ -1374,6 +1446,17 @@ export interface ElectronAPI {
       contextCount?: number
       forceRefresh?: boolean
     }) => Promise<{ success: boolean; message: string; cached?: boolean; recordId?: string; data?: MessageInsightAnalysis }>
+  }
+  groupSummary: {
+    listRecords: (filters?: GroupSummaryRecordFilters) => Promise<GroupSummaryRecordListResult>
+    getRecord: (id: string) => Promise<GroupSummaryRecordResult>
+    triggerManual: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+      startTime: number
+      endTime: number
+    }) => Promise<{ success: boolean; message: string; recordId?: string; record?: GroupSummaryRecord; skipped?: boolean; skippedReason?: string }>
   }
 }
 

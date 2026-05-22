@@ -120,6 +120,11 @@ export const CONFIG_KEYS = {
   // AI 足迹
   AI_FOOTPRINT_ENABLED: 'aiFootprintEnabled',
   AI_FOOTPRINT_SYSTEM_PROMPT: 'aiFootprintSystemPrompt',
+  AI_GROUP_SUMMARY_ENABLED: 'aiGroupSummaryEnabled',
+  AI_GROUP_SUMMARY_INTERVAL_HOURS: 'aiGroupSummaryIntervalHours',
+  AI_GROUP_SUMMARY_SYSTEM_PROMPT: 'aiGroupSummarySystemPrompt',
+  AI_GROUP_SUMMARY_FILTER_MODE: 'aiGroupSummaryFilterMode',
+  AI_GROUP_SUMMARY_FILTER_LIST: 'aiGroupSummaryFilterList',
   AI_MESSAGE_INSIGHT_ENABLED: 'aiMessageInsightEnabled',
   AI_MESSAGE_INSIGHT_CONTEXT_COUNT: 'aiMessageInsightContextCount',
   AI_MESSAGE_INSIGHT_SYSTEM_PROMPT: 'aiMessageInsightSystemPrompt',
@@ -2176,6 +2181,66 @@ export async function getAiFootprintSystemPrompt(): Promise<string> {
 
 export async function setAiFootprintSystemPrompt(prompt: string): Promise<void> {
   await config.set(CONFIG_KEYS.AI_FOOTPRINT_SYSTEM_PROMPT, prompt)
+}
+
+export type AiGroupSummaryFilterMode = 'whitelist' | 'blacklist'
+
+const AI_GROUP_SUMMARY_INTERVALS = new Set([1, 2, 4, 8, 12, 24])
+
+const normalizeAiGroupSummaryFilterList = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  return Array.from(new Set(
+    value
+      .map((item) => String(item || '').trim())
+      .filter((item) => item.endsWith('@chatroom'))
+  ))
+}
+
+export async function getAiGroupSummaryEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_ENABLED)
+  return value === true
+}
+
+export async function setAiGroupSummaryEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_ENABLED, enabled)
+}
+
+export async function getAiGroupSummaryIntervalHours(): Promise<number> {
+  const value = Number(await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_INTERVAL_HOURS))
+  const normalized = Number.isFinite(value) ? Math.floor(value) : 4
+  return AI_GROUP_SUMMARY_INTERVALS.has(normalized) ? normalized : 4
+}
+
+export async function setAiGroupSummaryIntervalHours(hours: number): Promise<void> {
+  const normalized = Math.floor(Number(hours) || 4)
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_INTERVAL_HOURS, AI_GROUP_SUMMARY_INTERVALS.has(normalized) ? normalized : 4)
+}
+
+export async function getAiGroupSummarySystemPrompt(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_SYSTEM_PROMPT)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiGroupSummarySystemPrompt(prompt: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_SYSTEM_PROMPT, prompt)
+}
+
+export async function getAiGroupSummaryFilterMode(): Promise<AiGroupSummaryFilterMode> {
+  const value = await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_FILTER_MODE)
+  return value === 'blacklist' ? 'blacklist' : 'whitelist'
+}
+
+export async function setAiGroupSummaryFilterMode(mode: AiGroupSummaryFilterMode): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_FILTER_MODE, mode === 'blacklist' ? 'blacklist' : 'whitelist')
+}
+
+export async function getAiGroupSummaryFilterList(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_FILTER_LIST)
+  return normalizeAiGroupSummaryFilterList(value)
+}
+
+export async function setAiGroupSummaryFilterList(list: string[]): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_FILTER_LIST, normalizeAiGroupSummaryFilterList(list))
 }
 
 export async function getAiMessageInsightEnabled(): Promise<boolean> {

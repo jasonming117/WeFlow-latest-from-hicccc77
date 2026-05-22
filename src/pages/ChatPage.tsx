@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture, Newspaper, Star, Sparkles } from 'lucide-react'
+import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture, Newspaper, Star, Sparkles, Code2 } from 'lucide-react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { createPortal } from 'react-dom'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
@@ -8,6 +8,7 @@ import { useChatStore } from '../stores/chatStore'
 import { useBatchTranscribeStore, type BatchVoiceTaskType } from '../stores/batchTranscribeStore'
 import { useBatchImageDecryptStore } from '../stores/batchImageDecryptStore'
 import type { ChatRecordItem, ChatSession, Message } from '../types/models'
+import type { GroupSummaryRecord, GroupSummaryRecordSummary } from '../types/electron'
 import { getEmojiPath } from 'wechat-emojis'
 import { VoiceTranscribeDialog } from '../components/VoiceTranscribeDialog'
 import { LivePhotoIcon } from '../components/LivePhotoIcon'
@@ -68,6 +69,7 @@ interface QuotedMessageJumpTarget {
 
 type GlobalMsgSearchPhase = 'idle' | 'seed' | 'backfill' | 'done'
 type GlobalMsgSearchResult = Message & { sessionId: string }
+type GroupSummaryRangeMode = 1 | 2 | 4 | 8 | 12 | 24 | 'custom'
 
 interface GlobalMsgPrefixCacheEntry {
   keyword: string
@@ -78,6 +80,7 @@ interface GlobalMsgPrefixCacheEntry {
 
 
 const GLOBAL_MSG_PER_SESSION_LIMIT = 10
+const GROUP_SUMMARY_MAX_RANGE_HOURS = 48
 const GLOBAL_MSG_SEED_LIMIT = 120
 const GLOBAL_MSG_BACKFILL_CONCURRENCY = 3
 const GLOBAL_MSG_LEGACY_CONCURRENCY = 6
@@ -760,6 +763,32 @@ function formatYmdHmDateTime(timestamp?: number): string {
   const h = `${d.getHours()}`.padStart(2, '0')
   const min = `${d.getMinutes()}`.padStart(2, '0')
   return `${y}-${m}-${day} ${h}:${min}`
+}
+
+function formatDateInputLocal(date: Date): string {
+  const y = date.getFullYear()
+  const m = `${date.getMonth() + 1}`.padStart(2, '0')
+  const day = `${date.getDate()}`.padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function formatDateTimeLocal(date: Date): string {
+  const y = date.getFullYear()
+  const m = `${date.getMonth() + 1}`.padStart(2, '0')
+  const day = `${date.getDate()}`.padStart(2, '0')
+  const h = `${date.getHours()}`.padStart(2, '0')
+  const min = `${date.getMinutes()}`.padStart(2, '0')
+  return `${y}-${m}-${day}T${h}:${min}`
+}
+
+function parseDateTimeLocalSeconds(value: string): number {
+  const parsed = new Date(value)
+  const time = parsed.getTime()
+  return Number.isFinite(time) ? Math.floor(time / 1000) : 0
+}
+
+function formatSummaryPeriod(start: number, end: number): string {
+  return `${formatYmdHmDateTime(start * 1000)} - ${formatYmdHmDateTime(end * 1000)}`
 }
 
 interface ChatPageProps {
@@ -1537,6 +1566,19 @@ function ChatPage(props: ChatPageProps) {
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, message: Message } | null>(null)
   const [showMessageInfo, setShowMessageInfo] = useState<Message | null>(null)
   const [editingMessage, setEditingMessage] = useState<{ message: Message, content: string } | null>(null)
+  const [aiGroupSummaryEnabled, setAiGroupSummaryEnabled] = useState(false)
+  const [showGroupSummaryPanel, setShowGroupSummaryPanel] = useState(false)
+  const [groupSummaryRecords, setGroupSummaryRecords] = useState<GroupSummaryRecordSummary[]>([])
+  const [groupSummaryTotal, setGroupSummaryTotal] = useState(0)
+  const [groupSummaryLoading, setGroupSummaryLoading] = useState(false)
+  const [groupSummaryError, setGroupSummaryError] = useState<string | null>(null)
+  const [groupSummaryDateFilter, setGroupSummaryDateFilter] = useState(() => formatDateInputLocal(new Date()))
+  const [groupSummaryRangeMode, setGroupSummaryRangeMode] = useState<GroupSummaryRangeMode>(4)
+  const [groupSummaryCustomStart, setGroupSummaryCustomStart] = useState(() => formatDateTimeLocal(new Date(Date.now() - 4 * 60 * 60 * 1000)))
+  const [groupSummaryCustomEnd, setGroupSummaryCustomEnd] = useState(() => formatDateTimeLocal(new Date()))
+  const [isTriggeringGroupSummary, setIsTriggeringGroupSummary] = useState(false)
+  const [groupSummaryHint, setGroupSummaryHint] = useState<{ success: boolean; message: string } | null>(null)
+  const [groupSummaryLogRecord, setGroupSummaryLogRecord] = useState<GroupSummaryRecord | null>(null)
 
   // 多选模式
   const [isSelectionMode, setIsSelectionMode] = useState(false)
@@ -1859,6 +1901,121 @@ function ChatPage(props: ChatPageProps) {
       if (prev.top === top && prev.left === left) return prev
       return { top, left }
     })
+  }, [])
+
+  const getGroupSummaryDateRangeMs = useCallback(() => {
+    const date = groupSummaryDateFilter || formatDateInputLocal(new Date())
+    const start = new Date(`${date}T00:00:00`)
+    if (!Number.isFinite(start.getTime())) {
+      const fallback = new Date()
+      fallback.setHours(0, 0, 0, 0)
+      const fallbackEnd = new Date(fallback)
+      fallbackEnd.setHours(23, 59, 59, 999)
+      return { startTime: fallback.getTime(), endTime: fallbackEnd.getTime() }
+    }
+    const end = new Date(start)
+    end.setHours(23, 59, 59, 999)
+    return { startTime: start.getTime(), endTime: end.getTime() }
+  }, [groupSummaryDateFilter])
+
+  const loadGroupSummaryRecords = useCallback(async (sessionId?: string) => {
+    const targetSessionId = String(sessionId || currentSessionRef.current || '').trim()
+    if (!targetSessionId || !targetSessionId.endsWith('@chatroom')) return
+    const { startTime, endTime } = getGroupSummaryDateRangeMs()
+    setGroupSummaryLoading(true)
+    setGroupSummaryError(null)
+    try {
+      const result = await window.electronAPI.groupSummary.listRecords({
+        sessionId: targetSessionId,
+        startTime,
+        endTime,
+        limit: 100
+      })
+      if (currentSessionRef.current !== targetSessionId) return
+      if (!result.success) {
+        setGroupSummaryRecords([])
+        setGroupSummaryTotal(0)
+        setGroupSummaryError(result.error || '读取群聊总结失败')
+        return
+      }
+      setGroupSummaryRecords(result.records || [])
+      setGroupSummaryTotal(result.total || 0)
+    } catch (error) {
+      if (currentSessionRef.current !== targetSessionId) return
+      setGroupSummaryRecords([])
+      setGroupSummaryTotal(0)
+      setGroupSummaryError((error as Error).message || String(error))
+    } finally {
+      if (currentSessionRef.current === targetSessionId) {
+        setGroupSummaryLoading(false)
+      }
+    }
+  }, [getGroupSummaryDateRangeMs])
+
+  const resolveGroupSummaryManualRange = useCallback(() => {
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    if (groupSummaryRangeMode !== 'custom') {
+      const hours = Number(groupSummaryRangeMode)
+      return { startTime: nowSeconds - hours * 60 * 60, endTime: nowSeconds }
+    }
+    return {
+      startTime: parseDateTimeLocalSeconds(groupSummaryCustomStart),
+      endTime: parseDateTimeLocalSeconds(groupSummaryCustomEnd)
+    }
+  }, [groupSummaryCustomEnd, groupSummaryCustomStart, groupSummaryRangeMode])
+
+  const triggerManualGroupSummary = useCallback(async () => {
+    const sessionId = String(currentSessionId || '').trim()
+    if (!sessionId || !sessionId.endsWith('@chatroom')) return
+    const sessionInfo = sessionMapRef.current.get(sessionId)
+    const { startTime, endTime } = resolveGroupSummaryManualRange()
+    if (startTime <= 0 || endTime <= startTime) {
+      setGroupSummaryHint({ success: false, message: '请选择有效的总结时段' })
+      return
+    }
+    if (endTime - startTime > GROUP_SUMMARY_MAX_RANGE_HOURS * 60 * 60) {
+      setGroupSummaryHint({ success: false, message: '手动总结时段不能超过 48 小时' })
+      return
+    }
+
+    setIsTriggeringGroupSummary(true)
+    setGroupSummaryHint({ success: true, message: '正在生成群聊总结...' })
+    try {
+      const result = await window.electronAPI.groupSummary.triggerManual({
+        sessionId,
+        displayName: sessionInfo?.displayName || sessionId,
+        avatarUrl: sessionInfo?.avatarUrl,
+        startTime,
+        endTime
+      })
+      if (result.success) {
+        setGroupSummaryHint({ success: true, message: result.message || '群聊总结已生成' })
+        if (!result.skipped) {
+          const dateForFilter = formatDateInputLocal(new Date(startTime * 1000))
+          setGroupSummaryDateFilter(dateForFilter)
+          await loadGroupSummaryRecords(sessionId)
+        }
+      } else {
+        setGroupSummaryHint({ success: false, message: result.message || '群聊总结生成失败' })
+      }
+    } catch (error) {
+      setGroupSummaryHint({ success: false, message: (error as Error).message || String(error) })
+    } finally {
+      setIsTriggeringGroupSummary(false)
+    }
+  }, [currentSessionId, loadGroupSummaryRecords, resolveGroupSummaryManualRange])
+
+  const openGroupSummaryLog = useCallback(async (recordId: string) => {
+    try {
+      const result = await window.electronAPI.groupSummary.getRecord(recordId)
+      if (!result.success || !result.record) {
+        setGroupSummaryHint({ success: false, message: result.error || '读取总结日志失败' })
+        return
+      }
+      setGroupSummaryLogRecord(result.record)
+    } catch (error) {
+      setGroupSummaryHint({ success: false, message: (error as Error).message || String(error) })
+    }
   }, [])
 
   const handleToggleJumpPopover = useCallback(() => {
@@ -2903,8 +3060,20 @@ function ChatPage(props: ChatPageProps) {
       return
     }
     setShowDetailPanel(false)
+    setShowGroupSummaryPanel(false)
     setShowGroupMembersPanel(true)
   }, [currentSessionId, showGroupMembersPanel, isGroupChatSession])
+
+  const toggleGroupSummaryPanel = useCallback(() => {
+    if (!currentSessionId || !isGroupChatSession(currentSessionId) || !aiGroupSummaryEnabled) return
+    if (showGroupSummaryPanel) {
+      setShowGroupSummaryPanel(false)
+      return
+    }
+    setShowDetailPanel(false)
+    setShowGroupMembersPanel(false)
+    setShowGroupSummaryPanel(true)
+  }, [aiGroupSummaryEnabled, currentSessionId, showGroupSummaryPanel, isGroupChatSession])
 
   // 切换详情面板
   const toggleDetailPanel = useCallback(() => {
@@ -2913,6 +3082,7 @@ function ChatPage(props: ChatPageProps) {
       return
     }
     setShowGroupMembersPanel(false)
+    setShowGroupSummaryPanel(false)
     setShowDetailPanel(true)
     if (currentSessionId) {
       void loadSessionDetail(currentSessionId)
@@ -2928,6 +3098,15 @@ function ChatPage(props: ChatPageProps) {
     setGroupMemberSearchKeyword('')
     void loadGroupMembersPanel(currentSessionId)
   }, [showGroupMembersPanel, currentSessionId, loadGroupMembersPanel, isGroupChatSession])
+
+  useEffect(() => {
+    if (!showGroupSummaryPanel) return
+    if (!currentSessionId || !isGroupChatSession(currentSessionId) || !aiGroupSummaryEnabled) {
+      setShowGroupSummaryPanel(false)
+      return
+    }
+    void loadGroupSummaryRecords(currentSessionId)
+  }, [aiGroupSummaryEnabled, currentSessionId, groupSummaryDateFilter, loadGroupSummaryRecords, showGroupSummaryPanel, isGroupChatSession])
 
   useEffect(() => {
     const chatroomId = String(sessionDetail?.wxid || '').trim()
@@ -3010,6 +3189,10 @@ function ChatPage(props: ChatPageProps) {
     setIsLoadingRelationStats(false)
     setShowDetailPanel(false)
     setShowGroupMembersPanel(false)
+    setShowGroupSummaryPanel(false)
+    setGroupSummaryRecords([])
+    setGroupSummaryError(null)
+    setGroupSummaryHint(null)
     setGroupPanelMembers([])
     setGroupMembersError(null)
     setGroupMembersLoadingHint('')
@@ -4405,6 +4588,9 @@ function ChatPage(props: ChatPageProps) {
     setShowJumpPopover(false)
     setShowDetailPanel(false)
     setShowGroupMembersPanel(false)
+    setShowGroupSummaryPanel(false)
+    setGroupSummaryError(null)
+    setGroupSummaryHint(null)
     setGroupMemberSearchKeyword('')
     setGroupMembersError(null)
     setGroupMembersLoadingHint('')
@@ -5867,6 +6053,29 @@ function ChatPage(props: ChatPageProps) {
         window.clearTimeout(sessionInsightHintTimerRef.current)
         sessionInsightHintTimerRef.current = null
       }
+    }
+  }, [])
+
+  useEffect(() => {
+    let canceled = false
+
+    const loadGroupSummaryConfig = () => {
+      void configService.getAiGroupSummaryEnabled()
+        .then((enabled) => {
+          if (!canceled) setAiGroupSummaryEnabled(enabled)
+        })
+        .catch((error) => {
+          console.warn('加载群聊总结配置失败:', error)
+          if (!canceled) setAiGroupSummaryEnabled(false)
+        })
+    }
+
+    loadGroupSummaryConfig()
+    const handleFocus = () => loadGroupSummaryConfig()
+    window.addEventListener('focus', handleFocus)
+    return () => {
+      canceled = true
+      window.removeEventListener('focus', handleFocus)
     }
   }, [])
 
@@ -7375,9 +7584,11 @@ function ChatPage(props: ChatPageProps) {
                 isGroupChat={isCurrentSessionGroup}
                 standaloneSessionWindow={standaloneSessionWindow}
                 showGroupMembersPanel={showGroupMembersPanel}
+                showGroupSummaryPanel={showGroupSummaryPanel}
                 showJumpPopover={showJumpPopover}
                 showInSessionSearch={showInSessionSearch}
                 showDetailPanel={showDetailPanel}
+                aiGroupSummaryEnabled={aiGroupSummaryEnabled}
                 shouldHideStandaloneDetailButton={shouldHideStandaloneDetailButton}
                 isPrivateSnsSupported={isCurrentSessionPrivateSnsSupported}
                 isExportActionBusy={isExportActionBusy}
@@ -7392,6 +7603,7 @@ function ChatPage(props: ChatPageProps) {
                 currentSessionId={currentSessionId}
                 jumpCalendarWrapRef={jumpCalendarWrapRef}
                 onTriggerSessionInsight={handleTriggerSessionInsight}
+                onToggleGroupSummaryPanel={toggleGroupSummaryPanel}
                 onGroupAnalytics={handleGroupAnalytics}
                 onToggleGroupMembersPanel={toggleGroupMembersPanel}
                 onExportCurrentSession={handleExportCurrentSession}
@@ -7440,6 +7652,13 @@ function ChatPage(props: ChatPageProps) {
               <div className={`session-insight-hint ${sessionInsightHint.success ? 'success' : 'error'}`} role="status" aria-live="polite">
                 {isTriggeringSessionInsight ? <Loader2 size={14} className="spin" /> : <Sparkles size={14} />}
                 <span>{sessionInsightHint.message}</span>
+              </div>
+            )}
+
+            {groupSummaryHint && (
+              <div className={`session-insight-hint ${groupSummaryHint.success ? 'success' : 'error'}`} role="status" aria-live="polite">
+                {isTriggeringGroupSummary ? <Loader2 size={14} className="spin" /> : <Newspaper size={14} />}
+                <span>{groupSummaryHint.message}</span>
               </div>
             )}
 
@@ -7680,6 +7899,141 @@ function ChatPage(props: ChatPageProps) {
                       ))}
                     </div>
                   )}
+                </div>
+              )}
+
+              {showGroupSummaryPanel && isCurrentSessionGroup && (
+                <div className="detail-panel group-summary-panel">
+                  <div className="detail-header">
+                    <div className="detail-title-wrap">
+                      <h4>AI 群聊总结</h4>
+                      <span className="detail-title-sub">{currentSession?.displayName || currentSessionId}</span>
+                    </div>
+                    <button className="close-btn" onClick={() => setShowGroupSummaryPanel(false)}>
+                      <X size={16} />
+                    </button>
+                  </div>
+
+                  <div className="group-summary-controls">
+                    <div className="group-summary-date-row">
+                      <label>日期</label>
+                      <input
+                        type="date"
+                        value={groupSummaryDateFilter}
+                        onChange={(event) => setGroupSummaryDateFilter(event.target.value || formatDateInputLocal(new Date()))}
+                      />
+                      <button
+                        type="button"
+                        className="group-summary-icon-btn"
+                        onClick={() => void loadGroupSummaryRecords(currentSessionId || undefined)}
+                        title="刷新总结"
+                      >
+                        <RefreshCw size={14} className={groupSummaryLoading ? 'spin' : ''} />
+                      </button>
+                    </div>
+
+                    <div className="group-summary-range-tabs">
+                      {([1, 2, 4, 8, 12, 24] as const).map((hours) => (
+                        <button
+                          key={hours}
+                          type="button"
+                          className={groupSummaryRangeMode === hours ? 'active' : ''}
+                          onClick={() => setGroupSummaryRangeMode(hours)}
+                        >
+                          {hours}h
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        className={groupSummaryRangeMode === 'custom' ? 'active' : ''}
+                        onClick={() => setGroupSummaryRangeMode('custom')}
+                      >
+                        自定义
+                      </button>
+                    </div>
+
+                    {groupSummaryRangeMode === 'custom' && (
+                      <div className="group-summary-custom-range">
+                        <input
+                          type="datetime-local"
+                          value={groupSummaryCustomStart}
+                          onChange={(event) => setGroupSummaryCustomStart(event.target.value)}
+                        />
+                        <input
+                          type="datetime-local"
+                          value={groupSummaryCustomEnd}
+                          onChange={(event) => setGroupSummaryCustomEnd(event.target.value)}
+                        />
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      className="group-summary-generate-btn"
+                      onClick={() => void triggerManualGroupSummary()}
+                      disabled={isTriggeringGroupSummary}
+                    >
+                      {isTriggeringGroupSummary ? <Loader2 size={14} className="spin" /> : <Sparkles size={14} />}
+                      <span>生成总结</span>
+                    </button>
+                    <div className="group-summary-rule-hint">少于 5 条可总结消息会自动跳过。</div>
+                  </div>
+
+                  <div className="group-summary-list">
+                    {groupSummaryLoading ? (
+                      <div className="detail-loading">
+                        <Loader2 size={20} className="spin" />
+                        <span>加载总结中...</span>
+                      </div>
+                    ) : groupSummaryError ? (
+                      <div className="detail-empty">{groupSummaryError}</div>
+                    ) : groupSummaryRecords.length === 0 ? (
+                      <div className="detail-empty">当前日期暂无群聊总结</div>
+                    ) : (
+                      <>
+                        <div className="group-summary-count">共 {groupSummaryTotal} 条总结</div>
+                        {groupSummaryRecords.map((record) => (
+                          <div key={record.id} className="group-summary-record">
+                            <div className="group-summary-record-head">
+                              <div>
+                                <span className="group-summary-period">{formatSummaryPeriod(record.periodStart, record.periodEnd)}</span>
+                                <span className="group-summary-meta">
+                                  {record.triggerType === 'manual' ? '手动' : '自动'} · {record.readableMessageCount} 条消息
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                className="group-summary-code-btn"
+                                onClick={() => void openGroupSummaryLog(record.id)}
+                                title="查看完整日志"
+                              >
+                                <Code2 size={14} />
+                              </button>
+                            </div>
+                            <div className="group-summary-topic-list">
+                              {record.topics.map((topic, topicIndex) => (
+                                <div key={`${record.id}-${topicIndex}`} className="group-summary-topic">
+                                  <h5>{topic.title}</h5>
+                                  <div className="group-summary-topic-row">
+                                    <span>参与者</span>
+                                    <p>{topic.participants.length > 0 ? topic.participants.join('、') : '未明确'}</p>
+                                  </div>
+                                  <div className="group-summary-topic-row">
+                                    <span>关键/矛盾点</span>
+                                    <p>{topic.keyPoints.length > 0 ? topic.keyPoints.join('；') : '无'}</p>
+                                  </div>
+                                  <div className="group-summary-topic-row">
+                                    <span>结论</span>
+                                    <p>{topic.conclusion || '暂无明确结论'}</p>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -8333,6 +8687,79 @@ function ChatPage(props: ChatPageProps) {
                   </div>
                 </div>
               )}
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
+      {groupSummaryLogRecord && createPortal(
+        <div className="message-info-overlay" onClick={() => setGroupSummaryLogRecord(null)}>
+          <div className="message-info-modal group-summary-log-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="detail-header">
+              <h4>群聊总结日志</h4>
+              <button className="close-btn" onClick={() => setGroupSummaryLogRecord(null)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="detail-content">
+              <div className="detail-section">
+                <div className="detail-item">
+                  <span className="label">群聊</span>
+                  <span className="value">{groupSummaryLogRecord.displayName}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">时段</span>
+                  <span className="value">{formatSummaryPeriod(groupSummaryLogRecord.periodStart, groupSummaryLogRecord.periodEnd)}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">触发</span>
+                  <span className="value">{groupSummaryLogRecord.triggerType === 'manual' ? '手动' : '自动'}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">模型</span>
+                  <span className="value">{groupSummaryLogRecord.log.model}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">消息数</span>
+                  <span className="value">{groupSummaryLogRecord.log.readableMessageCount} / {groupSummaryLogRecord.log.messageCount}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">JSON Mode</span>
+                  <span className="value">
+                    {groupSummaryLogRecord.log.responseFormatJson ? '启用' : '未启用'}
+                    {groupSummaryLogRecord.log.responseFormatFallback ? `，已降级：${groupSummaryLogRecord.log.responseFormatFallbackReason || '未知原因'}` : ''}
+                  </span>
+                </div>
+              </div>
+              <div className="detail-section">
+                <div className="section-title">
+                  <Code2 size={14} />
+                  <span>系统提示词</span>
+                </div>
+                <pre className="group-summary-log-pre">{groupSummaryLogRecord.log.systemPrompt}</pre>
+              </div>
+              <div className="detail-section">
+                <div className="section-title">
+                  <Code2 size={14} />
+                  <span>用户提示词与完整记录</span>
+                </div>
+                <pre className="group-summary-log-pre">{groupSummaryLogRecord.log.userPrompt}</pre>
+              </div>
+              <div className="detail-section">
+                <div className="section-title">
+                  <Code2 size={14} />
+                  <span>模型输出原文</span>
+                </div>
+                <pre className="group-summary-log-pre">{groupSummaryLogRecord.log.rawOutput}</pre>
+              </div>
+              <div className="detail-section">
+                <div className="section-title">
+                  <Newspaper size={14} />
+                  <span>最终总结</span>
+                </div>
+                <pre className="group-summary-log-pre">{groupSummaryLogRecord.log.finalSummary}</pre>
+              </div>
             </div>
           </div>
         </div>,

@@ -129,6 +129,11 @@ interface ConfigSchema {
   // AI 足迹
   aiFootprintEnabled: boolean
   aiFootprintSystemPrompt: string
+  aiGroupSummaryEnabled: boolean
+  aiGroupSummaryIntervalHours: number
+  aiGroupSummarySystemPrompt: string
+  aiGroupSummaryFilterMode: 'whitelist' | 'blacklist'
+  aiGroupSummaryFilterList: string[]
   aiMessageInsightEnabled: boolean
   aiMessageInsightContextCount: number
   aiMessageInsightSystemPrompt: string
@@ -255,6 +260,11 @@ export class ConfigService {
       aiInsightWeiboBindings: {},
       aiFootprintEnabled: false,
       aiFootprintSystemPrompt: '',
+      aiGroupSummaryEnabled: false,
+      aiGroupSummaryIntervalHours: 4,
+      aiGroupSummarySystemPrompt: '',
+      aiGroupSummaryFilterMode: 'whitelist',
+      aiGroupSummaryFilterList: [],
       aiMessageInsightEnabled: false,
       aiMessageInsightContextCount: 50,
       aiMessageInsightSystemPrompt: '',
