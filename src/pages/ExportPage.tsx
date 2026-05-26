@@ -68,6 +68,7 @@ import type { SnsPost } from '../types/sns'
 import {
   cloneExportDateRange,
   cloneExportDateRangeSelection,
+  createExportDateRangeSelectionFromPreset,
   createDateRangeByLastNDays,
   createDefaultDateRange,
   createDefaultExportDateRangeSelection,
@@ -82,7 +83,7 @@ import {
 import './ExportPage.scss'
 
 type ConversationTab = 'private' | 'group' | 'official' | 'former_friend'
-type TaskStatus = 'queued' | 'running' | 'success' | 'error'
+type TaskStatus = 'queued' | 'running' | 'pause_requested' | 'paused' | 'cancel_requested' | 'success' | 'error'
 type TaskScope = 'single' | 'multi' | 'content' | 'sns'
 type ContentType = 'text' | 'voice' | 'image' | 'video' | 'emoji' | 'file'
 type ContentCardType = ContentType | 'sns'
@@ -580,9 +581,26 @@ const formatDurationMs = (ms: number): string => {
 const getTaskStatusLabel = (task: ExportTask): string => {
   if (task.status === 'queued') return '排队中'
   if (task.status === 'running') return '进行中'
+  if (task.status === 'pause_requested') return '暂停中'
+  if (task.status === 'paused') return '已暂停'
+  if (task.status === 'cancel_requested') return '取消中'
   if (task.status === 'success') return '已完成'
   return '失败'
 }
+
+const resolveExportTaskCardClass = (status: TaskStatus): 'queued' | 'running' | 'paused' | 'stopped' | 'success' | 'error' => {
+  if (status === 'pause_requested' || status === 'paused') return 'paused'
+  if (status === 'cancel_requested') return 'stopped'
+  return status
+}
+
+const isExportTaskActiveStatus = (status: TaskStatus): boolean => (
+  status === 'queued' ||
+  status === 'running' ||
+  status === 'pause_requested' ||
+  status === 'paused' ||
+  status === 'cancel_requested'
+)
 
 const resolveBackgroundTaskCardClass = (status: BackgroundTaskRecord['status']): 'running' | 'paused' | 'stopped' | 'success' | 'error' => {
   if (status === 'running') return 'running'
@@ -641,8 +659,6 @@ const formatYmdHmDateTime = (timestamp?: number): string => {
   return `${y}-${m}-${day} ${h}:${min}`
 }
 
-// 将秒级时间戳格式化为最新消息时间：24h 内显示相对时间，超过则显示 YYYY-MM-DD HH:mm。
-// 返回 { text, title } 以便上层 title 属性展示完整绝对时间。
 const formatLatestMessageTimeFromSeconds = (
   timestamp?: number,
   now: number = Date.now()
@@ -670,7 +686,6 @@ const formatLatestMessageTimeFromSeconds = (
   return { text: absolute, title: absolute }
 }
 
-// 导出列表支持的排序维度。
 type ContactsSortKey = 'messageCount' | 'latestMessageTime'
 type ContactsSortOrder = 'desc' | 'asc'
 interface ContactsSortConfig {
@@ -1640,6 +1655,19 @@ const areExportSelectionsEqual = (left: ExportDateRangeSelection, right: ExportD
   left.dateRange.end.getTime() === right.dateRange.end.getTime()
 )
 
+const resolveDynamicExportSelection = (
+  selection: ExportDateRangeSelection,
+  now = new Date()
+): ExportDateRangeSelection => {
+  if (selection.useAllTime) {
+    return cloneExportDateRangeSelection(selection)
+  }
+  if (selection.preset === 'custom') {
+    return cloneExportDateRangeSelection(selection)
+  }
+  return createExportDateRangeSelectionFromPreset(selection.preset, now)
+}
+
 const pickSessionMediaMetric = (
   metricRaw: SessionExportMetric | SessionContentMetric | undefined
 ): SessionContentMetric | null => {
@@ -1836,6 +1864,9 @@ interface TaskCenterModalProps {
   nowTick: number
   onClose: () => void
   onTogglePerfTask: (taskId: string) => void
+  onPauseExportTask: (taskId: string) => void
+  onResumeExportTask: (taskId: string) => void
+  onCancelExportTask: (taskId: string) => void
   onPauseBackgroundTask: (taskId: string) => void
   onResumeBackgroundTask: (taskId: string) => void
   onCancelBackgroundTask: (taskId: string) => void
@@ -1851,6 +1882,9 @@ const TaskCenterModal = memo(function TaskCenterModal({
   nowTick,
   onClose,
   onTogglePerfTask,
+  onPauseExportTask,
+  onResumeExportTask,
+  onCancelExportTask,
   onPauseBackgroundTask,
   onResumeBackgroundTask,
   onCancelBackgroundTask
@@ -1939,6 +1973,9 @@ const TaskCenterModal = memo(function TaskCenterModal({
                 const mediaCacheMetricLabel = mediaCacheTotal > 0
                   ? `缓存命中 ${mediaCacheHitFiles}/${mediaCacheTotal}`
                   : ''
+                const mediaMissMetricLabel = mediaCacheMissFiles > 0
+                  ? `缓存未命中 ${mediaCacheMissFiles}`
+                  : ''
                 const mediaDedupMetricLabel = mediaDedupReuseFiles > 0
                   ? `复用 ${mediaDedupReuseFiles}`
                   : ''
@@ -1952,7 +1989,7 @@ const TaskCenterModal = memo(function TaskCenterModal({
                   )
                   : ''
                 const mediaLiveMetricLabel = task.progress.phase === 'exporting-media'
-                  ? (mediaDoneFiles > 0 ? `已处理 ${mediaDoneFiles}` : '')
+                  ? (mediaDoneFiles > 0 ? `已写入 ${mediaDoneFiles}` : '')
                   : ''
                 const sessionProgressLabel = completedSessionTotal > 0
                   ? `会话 ${completedSessionCount}/${completedSessionTotal}`
@@ -1978,15 +2015,31 @@ const TaskCenterModal = memo(function TaskCenterModal({
                       : `图片耗时 ${formatDurationMs(imageTimingElapsedMs)}`
                   )
                   : ''
+                const taskCardClass = resolveExportTaskCardClass(task.status)
+                const canShowProgress = (
+                  task.status === 'running' ||
+                  task.status === 'pause_requested' ||
+                  task.status === 'paused' ||
+                  task.status === 'cancel_requested'
+                )
+                const canPause = task.status === 'running'
+                const canResume = task.status === 'paused' || task.status === 'pause_requested'
+                const canCancel = (
+                  task.status === 'queued' ||
+                  task.status === 'running' ||
+                  task.status === 'pause_requested' ||
+                  task.status === 'paused' ||
+                  task.status === 'cancel_requested'
+                )
                 return (
-                  <div key={task.id} className={`task-card ${task.status}`}>
+                  <div key={task.id} className={`task-card ${taskCardClass}`}>
                     <div className="task-main">
                       <div className="task-title">{task.title}</div>
                       <div className="task-meta">
-                        <span className={`task-status ${task.status}`}>{getTaskStatusLabel(task)}</span>
+                        <span className={`task-status ${taskCardClass}`}>{getTaskStatusLabel(task)}</span>
                         <span>{new Date(task.createdAt).toLocaleString('zh-CN')}</span>
                       </div>
-                      {task.status === 'running' && (
+                      {canShowProgress && (
                         <>
                           <div className="task-progress-bar">
                             <div
@@ -1999,6 +2052,7 @@ const TaskCenterModal = memo(function TaskCenterModal({
                             {phaseMetricLabel ? ` · ${phaseMetricLabel}` : ''}
                             {mediaLiveMetricLabel ? ` · ${mediaLiveMetricLabel}` : ''}
                             {mediaCacheMetricLabel ? ` · ${mediaCacheMetricLabel}` : ''}
+                            {mediaMissMetricLabel ? ` · ${mediaMissMetricLabel}` : ''}
                             {mediaDedupMetricLabel ? ` · ${mediaDedupMetricLabel}` : ''}
                             {task.status === 'running' && currentSessionRatio !== null
                               ? `（当前会话 ${Math.round(currentSessionRatio * 100)}%）`
@@ -2071,6 +2125,34 @@ const TaskCenterModal = memo(function TaskCenterModal({
                           onClick={() => onTogglePerfTask(task.id)}
                         >
                           {isPerfExpanded ? '收起详情' : '性能详情'}
+                        </button>
+                      )}
+                      {canPause && (
+                        <button
+                          className="task-action-btn"
+                          type="button"
+                          onClick={() => onPauseExportTask(task.id)}
+                        >
+                          <Pause size={14} /> 暂停
+                        </button>
+                      )}
+                      {canResume && (
+                        <button
+                          className="task-action-btn primary"
+                          type="button"
+                          onClick={() => onResumeExportTask(task.id)}
+                        >
+                          <Play size={14} /> 继续
+                        </button>
+                      )}
+                      {canCancel && (
+                        <button
+                          className="task-action-btn danger"
+                          type="button"
+                          onClick={() => onCancelExportTask(task.id)}
+                          disabled={task.status === 'cancel_requested'}
+                        >
+                          <Square size={14} /> {task.status === 'cancel_requested' ? '取消中' : '取消'}
                         </button>
                       )}
                       <button
@@ -2225,16 +2307,13 @@ function ExportPage() {
   const [sessionMutualFriendsDialogTarget, setSessionMutualFriendsDialogTarget] = useState<SessionSnsTimelineTarget | null>(null)
   const [sessionMutualFriendsSearch, setSessionMutualFriendsSearch] = useState('')
   const [backgroundTasks, setBackgroundTasks] = useState<BackgroundTaskRecord[]>([])
-  // 会话列表排序状态：key=null 时回退默认顺序（按消息数降序）。
   const [contactsSortConfig, setContactsSortConfig] = useState<ContactsSortConfig>(DEFAULT_CONTACTS_SORT_CONFIG)
 
   const toggleContactsSort = useCallback((key: ContactsSortKey) => {
     setContactsSortConfig(prev => {
       if (prev.key !== key) {
-        // 切换到新列：从降序开始。
         return { key, order: 'desc' }
       }
-      // 同列循环：desc -> asc -> null (默认)
       if (prev.order === 'desc') return { key, order: 'asc' }
       if (prev.order === 'asc') return DEFAULT_CONTACTS_SORT_CONFIG
       return { key, order: 'desc' }
@@ -2289,6 +2368,27 @@ function ExportPage() {
     displayNamePreference: 'remark',
     exportConcurrency: 2
   })
+
+  const exportStatsRangeOptions = useMemo(() => {
+    if (options.useAllTime || !options.dateRange) return null
+    const beginTimestamp = Math.floor(options.dateRange.start.getTime() / 1000)
+    const endTimestamp = Math.floor(options.dateRange.end.getTime() / 1000)
+    if (!Number.isFinite(beginTimestamp) || !Number.isFinite(endTimestamp)) return null
+    if (beginTimestamp <= 0 && endTimestamp <= 0) return null
+    return {
+      beginTimestamp: Math.max(0, beginTimestamp),
+      endTimestamp: Math.max(0, endTimestamp)
+    }
+  }, [options.useAllTime, options.dateRange])
+
+  const withExportStatsRange = useCallback((statsOptions: Record<string, any>): Record<string, any> => {
+    if (!exportStatsRangeOptions) return statsOptions
+    return {
+      ...statsOptions,
+      beginTimestamp: exportStatsRangeOptions.beginTimestamp,
+      endTimestamp: exportStatsRangeOptions.endTimestamp
+    }
+  }, [exportStatsRangeOptions])
 
   const [exportDialog, setExportDialog] = useState<ExportDialogState>({
     open: false,
@@ -4055,7 +4155,7 @@ function ExportPage() {
           const cacheResult = await withTimeout(
             window.electronAPI.chat.getExportSessionStats(
               batchSessionIds,
-              { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+              withExportStatsRange({ includeRelations: false, allowStaleCache: true, cacheOnly: true })
             ),
             12000,
             'cacheOnly'
@@ -4070,7 +4170,7 @@ function ExportPage() {
             const freshResult = await withTimeout(
               window.electronAPI.chat.getExportSessionStats(
                 missingSessionIds,
-                { includeRelations: false, allowStaleCache: true }
+                withExportStatsRange({ includeRelations: false, allowStaleCache: true })
               ),
               45000,
               'fresh'
@@ -4114,7 +4214,7 @@ function ExportPage() {
         void runSessionMediaMetricWorker(runId)
       }
     }
-  }, [applySessionMediaMetricsFromStats, isSessionMediaMetricReady, patchSessionLoadTraceStage])
+  }, [applySessionMediaMetricsFromStats, isSessionMediaMetricReady, patchSessionLoadTraceStage, withExportStatsRange])
 
   const scheduleSessionMediaMetricWorker = useCallback(() => {
     if (activeTaskCountRef.current > 0) return
@@ -4314,7 +4414,7 @@ function ExportPage() {
     try {
       if (prioritizedSessionIds.length > 0) {
         patchSessionLoadTraceStage(prioritizedSessionIds, 'messageCount', 'loading')
-        const priorityResult = await window.electronAPI.chat.getSessionMessageCounts(prioritizedSessionIds)
+        const priorityResult = await window.electronAPI.chat.getSessionMessageCounts(prioritizedSessionIds, { bypassSessionCache: true, preferHintCache: false })
         if (isStale()) return { ...accumulatedCounts }
         if (priorityResult.success) {
           applyCounts(priorityResult.counts)
@@ -4331,7 +4431,7 @@ function ExportPage() {
 
       if (remainingSessionIds.length > 0) {
         patchSessionLoadTraceStage(remainingSessionIds, 'messageCount', 'loading')
-        const remainingResult = await window.electronAPI.chat.getSessionMessageCounts(remainingSessionIds)
+        const remainingResult = await window.electronAPI.chat.getSessionMessageCounts(remainingSessionIds, { bypassSessionCache: true, preferHintCache: false })
         if (isStale()) return { ...accumulatedCounts }
         if (remainingResult.success) {
           applyCounts(remainingResult.counts)
@@ -4821,19 +4921,20 @@ function ExportPage() {
   const clearSelection = () => setSelectedSessions(new Set())
 
   const openExportDialog = useCallback((payload: Omit<ExportDialogState, 'open' | 'intent'> & { intent?: ExportDialogState['intent'] }) => {
+    const dynamicDefaultRangeSelection = resolveDynamicExportSelection(exportDefaultDateRangeSelection, new Date())
     setExportDialog({ open: true, intent: payload.intent || 'manual', ...payload })
     setIsTimeRangeDialogOpen(false)
     setTimeRangeBounds(null)
-    setTimeRangeSelection(exportDefaultDateRangeSelection)
+    setTimeRangeSelection(dynamicDefaultRangeSelection)
 
     setOptions(prev => {
-      const nextDateRange = cloneExportDateRange(exportDefaultDateRangeSelection.dateRange)
+      const nextDateRange = cloneExportDateRange(dynamicDefaultRangeSelection.dateRange)
 
       const next: ExportOptions = {
         ...prev,
         format: exportDefaultFormat,
         exportAvatars: exportDefaultAvatars,
-        useAllTime: exportDefaultDateRangeSelection.useAllTime,
+        useAllTime: dynamicDefaultRangeSelection.useAllTime,
         dateRange: nextDateRange,
         exportMedia: Boolean(
           exportDefaultMedia.images ||
@@ -4894,9 +4995,13 @@ function ExportPage() {
     setTimeRangeBounds(null)
   }, [])
 
-  const resolveChatExportTimeRangeBounds = useCallback(async (sessionIds: string[]): Promise<TimeRangeBounds | null> => {
+  const resolveChatExportTimeRangeBounds = useCallback(async (
+    sessionIds: string[],
+    options?: { forceRefresh?: boolean }
+  ): Promise<TimeRangeBounds | null> => {
     const normalizedSessionIds = Array.from(new Set((sessionIds || []).map(id => String(id || '').trim()).filter(Boolean)))
     if (normalizedSessionIds.length === 0) return null
+    const forceRefresh = options?.forceRefresh === true
 
     const sessionRowMap = new Map<string, SessionRow>()
     for (const session of sessions) {
@@ -4959,29 +5064,36 @@ function ExportPage() {
       return !resolved?.hasMin || !resolved?.hasMax
     })
 
-    const staleSessionIds = new Set<string>()
-
-    if (missingSessionIds().length > 0) {
-      const cacheResult = await window.electronAPI.chat.getExportSessionStats(
-        missingSessionIds(),
-        { includeRelations: false, allowStaleCache: true, cacheOnly: true }
-      )
-      applyStatsResult(cacheResult)
-      for (const sessionId of cacheResult?.needsRefresh || []) {
-        staleSessionIds.add(String(sessionId || '').trim())
-      }
-    }
-
-    const sessionsNeedingFreshStats = Array.from(new Set([
-      ...missingSessionIds(),
-      ...Array.from(staleSessionIds).filter(Boolean)
-    ]))
-
-    if (sessionsNeedingFreshStats.length > 0) {
+    if (forceRefresh) {
       applyStatsResult(await window.electronAPI.chat.getExportSessionStats(
-        sessionsNeedingFreshStats,
-        { includeRelations: false }
+        normalizedSessionIds,
+        { includeRelations: false, forceRefresh: true }
       ))
+    } else {
+      const staleSessionIds = new Set<string>()
+
+      if (missingSessionIds().length > 0) {
+        const cacheResult = await window.electronAPI.chat.getExportSessionStats(
+          missingSessionIds(),
+          { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+        )
+        applyStatsResult(cacheResult)
+        for (const sessionId of cacheResult?.needsRefresh || []) {
+          staleSessionIds.add(String(sessionId || '').trim())
+        }
+      }
+
+      const sessionsNeedingFreshStats = Array.from(new Set([
+        ...missingSessionIds(),
+        ...Array.from(staleSessionIds).filter(Boolean)
+      ]))
+
+      if (sessionsNeedingFreshStats.length > 0) {
+        applyStatsResult(await window.electronAPI.chat.getExportSessionStats(
+          sessionsNeedingFreshStats,
+          { includeRelations: false }
+        ))
+      }
     }
 
     if (missingSessionIds().length > 0) {
@@ -5002,14 +5114,26 @@ function ExportPage() {
       if (isResolvingTimeRangeBounds) return
       setIsResolvingTimeRangeBounds(true)
       try {
+        const liveSelection = resolveDynamicExportSelection(timeRangeSelection, new Date())
+        if (!areExportSelectionsEqual(liveSelection, timeRangeSelection)) {
+          setTimeRangeSelection(liveSelection)
+          setOptions(prev => ({
+            ...prev,
+            useAllTime: liveSelection.useAllTime,
+            dateRange: cloneExportDateRange(liveSelection.dateRange)
+          }))
+        }
+
         let nextBounds: TimeRangeBounds | null = null
         if (exportDialog.scope !== 'sns') {
-          nextBounds = await resolveChatExportTimeRangeBounds(exportDialog.sessionIds)
+          nextBounds = await resolveChatExportTimeRangeBounds(exportDialog.sessionIds, {
+            forceRefresh: exportDialog.scope === 'single'
+          })
         }
         setTimeRangeBounds(nextBounds)
         if (nextBounds) {
-          const nextSelection = clampExportSelectionToBounds(timeRangeSelection, nextBounds)
-          if (!areExportSelectionsEqual(nextSelection, timeRangeSelection)) {
+          const nextSelection = clampExportSelectionToBounds(liveSelection, nextBounds)
+          if (!areExportSelectionsEqual(nextSelection, liveSelection)) {
             setTimeRangeSelection(nextSelection)
             setOptions(prev => ({
               ...prev,
@@ -5087,47 +5211,52 @@ function ExportPage() {
     return unsubscribe
   }, [loadBaseConfig, openExportDialog])
 
-  const buildExportOptions = (scope: TaskScope, contentType?: ContentType): ElectronExportOptions => {
+  const buildExportOptions = (
+    scope: TaskScope,
+    contentType?: ContentType,
+    sourceOptions: ExportOptions = options
+  ): ElectronExportOptions => {
     const sessionLayout: SessionLayout = writeLayout === 'C' ? 'per-session' : 'shared'
     const exportMediaEnabled = Boolean(
-      options.exportImages ||
-      options.exportVoices ||
-      options.exportVideos ||
-      options.exportEmojis ||
-      options.exportFiles
+      sourceOptions.exportImages ||
+      sourceOptions.exportVoices ||
+      sourceOptions.exportVideos ||
+      sourceOptions.exportEmojis ||
+      sourceOptions.exportFiles
     )
 
     const base: ElectronExportOptions = {
-      format: options.format,
-      exportAvatars: options.exportAvatars,
+      format: sourceOptions.format,
+      exportAvatars: sourceOptions.exportAvatars,
       exportMedia: exportMediaEnabled,
-      exportImages: options.exportImages,
-      exportVoices: options.exportVoices,
-      exportVideos: options.exportVideos,
-      exportEmojis: options.exportEmojis,
-      exportFiles: options.exportFiles,
-      maxFileSizeMb: options.maxFileSizeMb,
-      exportVoiceAsText: options.exportVoiceAsText,
-      excelCompactColumns: options.excelCompactColumns,
-      txtColumns: options.txtColumns,
-      displayNamePreference: options.displayNamePreference,
-      exportConcurrency: options.exportConcurrency,
+      exportImages: sourceOptions.exportImages,
+      exportVoices: sourceOptions.exportVoices,
+      exportVideos: sourceOptions.exportVideos,
+      exportEmojis: sourceOptions.exportEmojis,
+      exportFiles: sourceOptions.exportFiles,
+      maxFileSizeMb: sourceOptions.maxFileSizeMb,
+      exportVoiceAsText: sourceOptions.exportVoiceAsText,
+      excelCompactColumns: sourceOptions.excelCompactColumns,
+      txtColumns: sourceOptions.txtColumns,
+      displayNamePreference: sourceOptions.displayNamePreference,
+      exportConcurrency: sourceOptions.exportConcurrency,
       fileNamingMode: exportDefaultFileNamingMode,
       sessionLayout,
+      exportWriteLayout: writeLayout,
       sessionNameWithTypePrefix,
-      dateRange: options.useAllTime
+      dateRange: sourceOptions.useAllTime
         ? null
-        : options.dateRange
+        : sourceOptions.dateRange
           ? {
-              start: Math.floor(options.dateRange.start.getTime() / 1000),
-              end: Math.floor(options.dateRange.end.getTime() / 1000)
+              start: Math.floor(sourceOptions.dateRange.start.getTime() / 1000),
+              end: Math.floor(sourceOptions.dateRange.end.getTime() / 1000)
             }
           : null
     }
 
     if (scope === 'content' && contentType) {
       if (contentType === 'text') {
-        const textExportConcurrency = Math.min(2, Math.max(1, base.exportConcurrency ?? options.exportConcurrency))
+        const textExportConcurrency = Math.min(2, Math.max(1, base.exportConcurrency ?? sourceOptions.exportConcurrency))
         return {
           ...base,
           contentType,
@@ -5158,14 +5287,14 @@ function ExportPage() {
     return base
   }
 
-  const buildSnsExportOptions = () => {
+  const buildSnsExportOptions = (sourceOptions: ExportOptions = options) => {
     const format: SnsTimelineExportFormat = snsExportFormat
-    const dateRange = options.useAllTime
+    const dateRange = sourceOptions.useAllTime
       ? null
-      : options.dateRange
+      : sourceOptions.dateRange
         ? {
-            startTime: Math.floor(options.dateRange.start.getTime() / 1000),
-            endTime: Math.floor(options.dateRange.end.getTime() / 1000)
+            startTime: Math.floor(sourceOptions.dateRange.start.getTime() / 1000),
+            endTime: Math.floor(sourceOptions.dateRange.end.getTime() / 1000)
           }
         : null
 
@@ -5575,7 +5704,7 @@ function ExportPage() {
       const now = Date.now()
       const currentSessionId = String(payload.currentSessionId || '').trim()
       updateTask(next.id, task => {
-        if (task.status !== 'running') return task
+        if (task.status !== 'running' && task.status !== 'pause_requested' && task.status !== 'cancel_requested') return task
         const performance = applyProgressToTaskPerformance(task, payload, now)
         const settledSessionIds = task.settledSessionIds || []
         const nextSettledSessionIds = (
@@ -5729,7 +5858,8 @@ function ExportPage() {
           exportLivePhotos: snsOptions.exportLivePhotos,
           exportVideos: snsOptions.exportVideos,
           startTime: snsOptions.startTime,
-          endTime: snsOptions.endTime
+          endTime: snsOptions.endTime,
+          taskId: next.id
         })
 
         if (!result.success) {
@@ -5739,6 +5869,19 @@ function ExportPage() {
             finishedAt: Date.now(),
             error: result.error || '朋友圈导出失败',
             performance: finalizeTaskPerformance(task, Date.now())
+          }))
+        } else if (result.stopped) {
+          setTasks(prev => prev.filter(task => task.id !== next.id))
+        } else if (result.paused) {
+          updateTask(next.id, task => ({
+            ...task,
+            status: 'paused',
+            progress: {
+              ...task.progress,
+              phaseLabel: '已暂停，可继续或取消',
+              current: Math.max(task.progress.current, result.postCount || 0),
+              total: Math.max(task.progress.total, result.postCount || 0)
+            }
           }))
         } else {
           const doneAt = Date.now()
@@ -5771,7 +5914,8 @@ function ExportPage() {
         const result = await window.electronAPI.export.exportSessions(
           next.payload.sessionIds,
           next.payload.outputDir,
-          next.payload.options
+          next.payload.options,
+          { taskId: next.id }
         )
 
         if (!result.success) {
@@ -5781,6 +5925,33 @@ function ExportPage() {
             finishedAt: Date.now(),
             error: result.error || '导出失败',
             performance: finalizeTaskPerformance(task, Date.now())
+          }))
+        } else if (result.stopped) {
+          setTasks(prev => prev.filter(task => task.id !== next.id))
+        } else if (result.paused) {
+          const pendingSessionIds = Array.isArray(result.pendingSessionIds)
+            ? result.pendingSessionIds
+            : []
+          updateTask(next.id, task => ({
+            ...task,
+            status: 'paused',
+            payload: {
+              ...task.payload,
+              sessionIds: pendingSessionIds.length > 0 ? pendingSessionIds : task.payload.sessionIds
+            },
+            settledSessionIds: Array.isArray(result.successSessionIds)
+              ? Array.from(new Set([...(task.settledSessionIds || []), ...result.successSessionIds]))
+              : task.settledSessionIds,
+            sessionOutputPaths: {
+              ...(task.sessionOutputPaths || {}),
+              ...((result.sessionOutputPaths && typeof result.sessionOutputPaths === 'object')
+                ? result.sessionOutputPaths
+                : {})
+            },
+            progress: {
+              ...task.progress,
+              phaseLabel: '已暂停，可继续或取消'
+            }
           }))
         } else {
           const doneAt = Date.now()
@@ -5888,9 +6059,10 @@ function ExportPage() {
         }
     return {
       ...task.template.optionTemplate,
+      exportWriteLayout: task.template.optionTemplate.exportWriteLayout || writeLayout,
       dateRange
     }
-  }, [])
+  }, [writeLayout])
 
   const enqueueAutomationTask = useCallback((
     task: ExportAutomationTask,
@@ -5902,7 +6074,13 @@ function ExportPage() {
     }
 
     const hasConflict = tasksRef.current.some((item) => {
-      if (item.status !== 'running' && item.status !== 'queued') return false
+      if (
+        item.status !== 'running' &&
+        item.status !== 'queued' &&
+        item.status !== 'pause_requested' &&
+        item.status !== 'paused' &&
+        item.status !== 'cancel_requested'
+      ) return false
       return item.payload.automationTaskId === task.id
     })
     if (hasConflict) {
@@ -5977,12 +6155,27 @@ function ExportPage() {
     if (!exportDialog.open || !exportFolder) return
     if (exportDialog.scope !== 'sns' && exportDialog.sessionIds.length === 0) return
 
+    const effectiveRangeSelection = resolveDynamicExportSelection(timeRangeSelection, new Date())
+    if (!areExportSelectionsEqual(effectiveRangeSelection, timeRangeSelection)) {
+      setTimeRangeSelection(effectiveRangeSelection)
+    }
+    const effectiveOptionsState: ExportOptions = {
+      ...options,
+      useAllTime: effectiveRangeSelection.useAllTime,
+      dateRange: cloneExportDateRange(effectiveRangeSelection.dateRange)
+    }
+    setOptions(prev => ({
+      ...prev,
+      useAllTime: effectiveOptionsState.useAllTime,
+      dateRange: cloneExportDateRange(effectiveRangeSelection.dateRange)
+    }))
+
     const isAutomationCreateIntent = exportDialog.intent === 'automation-create'
     const exportOptions = exportDialog.scope === 'sns'
       ? undefined
-      : buildExportOptions(exportDialog.scope, exportDialog.contentType)
+      : buildExportOptions(exportDialog.scope, exportDialog.contentType, effectiveOptionsState)
     const snsOptions = exportDialog.scope === 'sns'
-      ? buildSnsExportOptions()
+      ? buildSnsExportOptions(effectiveOptionsState)
       : undefined
     const title =
       exportDialog.scope === 'single'
@@ -5999,7 +6192,7 @@ function ExportPage() {
         return
       }
       const { dateRange: _discard, ...optionTemplate } = exportOptions
-      const normalizedRangeSelection = cloneExportDateRangeSelection(timeRangeSelection)
+      const normalizedRangeSelection = cloneExportDateRangeSelection(effectiveRangeSelection)
       const scope = exportDialog.scope === 'single'
         ? 'single'
         : exportDialog.scope === 'content'
@@ -6174,7 +6367,7 @@ function ExportPage() {
   const runningSessionIds = useMemo(() => {
     const set = new Set<string>()
     for (const task of tasks) {
-      if (task.status !== 'running') continue
+      if (task.status !== 'running' && task.status !== 'pause_requested' && task.status !== 'cancel_requested') continue
       const settled = new Set(task.settledSessionIds || [])
       for (const id of task.payload.sessionIds) {
         if (settled.has(id)) continue
@@ -6187,7 +6380,7 @@ function ExportPage() {
   const queuedSessionIds = useMemo(() => {
     const set = new Set<string>()
     for (const task of tasks) {
-      if (task.status !== 'queued') continue
+      if (task.status !== 'queued' && task.status !== 'paused') continue
       for (const id of task.payload.sessionIds) {
         set.add(id)
       }
@@ -6198,7 +6391,7 @@ function ExportPage() {
   const inProgressSessionIds = useMemo(() => {
     const set = new Set<string>()
     for (const task of tasks) {
-      if (task.status !== 'running' && task.status !== 'queued') continue
+      if (!isExportTaskActiveStatus(task.status)) continue
       for (const id of task.payload.sessionIds) {
         set.add(id)
       }
@@ -6206,7 +6399,7 @@ function ExportPage() {
     return Array.from(set).sort()
   }, [tasks])
   const activeTaskCount = useMemo(
-    () => tasks.filter(task => task.status === 'running' || task.status === 'queued').length,
+    () => tasks.filter(task => isExportTaskActiveStatus(task.status)).length,
     [tasks]
   )
 
@@ -6221,7 +6414,7 @@ function ExportPage() {
       if (previousStatus === task.status) continue
 
       const now = Date.now()
-      if (task.status === 'running') {
+      if (task.status === 'running' || task.status === 'pause_requested' || task.status === 'paused' || task.status === 'cancel_requested') {
         patchAutomationTask(automationTaskId, (current) => ({
           ...current,
           updatedAt: now,
@@ -6312,7 +6505,13 @@ function ExportPage() {
         if (task.runState?.lastScheduleKey === scheduleKey) continue
 
         const hasConflict = tasksRef.current.some((item) => {
-          if (item.status !== 'running' && item.status !== 'queued') return false
+          if (
+            item.status !== 'running' &&
+            item.status !== 'queued' &&
+            item.status !== 'pause_requested' &&
+            item.status !== 'paused' &&
+            item.status !== 'cancel_requested'
+          ) return false
           return item.payload.automationTaskId === task.id
         })
         if (hasConflict) {
@@ -6422,7 +6621,7 @@ function ExportPage() {
   const runningCardTypes = useMemo(() => {
     const set = new Set<ContentCardType>()
     for (const task of tasks) {
-      if (task.status !== 'running') continue
+      if (!isExportTaskActiveStatus(task.status)) continue
       if (task.payload.scope === 'sns') {
         set.add('sns')
         continue
@@ -6517,17 +6716,11 @@ function ExportPage() {
       const counted = normalizeMessageCount(sessionMessageCounts[contact.username])
       const hinted = normalizeMessageCount(sessionRow?.messageCountHint)
       const count = typeof counted === 'number' ? counted : hinted
-      // 最新消息时间：优先使用 sessionContentMetrics 中的 lastTimestamp（更精确），
-      // 其次使用 SessionRow 的 sortTimestamp/lastTimestamp（通讯录加载即有）。
-      const metricTs = sessionContentMetrics[contact.username]?.lastTimestamp
-      const rowTs = sessionRow?.sortTimestamp || sessionRow?.lastTimestamp
-      const latestTime = (typeof metricTs === 'number' && metricTs > 0)
-        ? metricTs
-        : (typeof rowTs === 'number' && rowTs > 0 ? rowTs : undefined)
+      const rowTs = sessionRow?.lastTimestamp || sessionRow?.sortTimestamp
+      const latestTime = typeof rowTs === 'number' && rowTs > 0 ? rowTs : undefined
       return { contact, index, count, latestTime }
     })
 
-    // 比较器：空值稳定排在末尾；相等时按原始下标稳定兜底。
     const compareNullable = (a: number | undefined, b: number | undefined, order: ContactsSortOrder): number => {
       const aHas = typeof a === 'number' && Number.isFinite(a)
       const bHas = typeof b === 'number' && Number.isFinite(b)
@@ -6551,7 +6744,6 @@ function ExportPage() {
         const diff = compareNullable(a.count, b.count, sortOrder)
         if (diff !== 0) return diff
       } else {
-        // 默认（key===null）：保持旧有按消息数降序的行为，避免改变现有视觉顺序。
         const diff = compareNullable(a.count, b.count, 'desc')
         if (diff !== 0) return diff
       }
@@ -6559,7 +6751,7 @@ function ExportPage() {
     })
 
     return indexedContacts.map(item => item.contact)
-  }, [contactsList, activeTab, searchKeyword, sessionMessageCounts, sessionRowByUsername, sessionContentMetrics, contactsSortConfig])
+  }, [contactsList, activeTab, searchKeyword, sessionMessageCounts, sessionRowByUsername, contactsSortConfig])
 
   const keywordMatchedContactUsernameSet = useMemo(() => {
     const keyword = searchKeyword.trim().toLowerCase()
@@ -7315,7 +7507,7 @@ function ExportPage() {
       try {
         const quickStatsResult = await window.electronAPI.chat.getExportSessionStats(
           [normalizedSessionId],
-          { includeRelations: false, allowStaleCache: true, cacheOnly: true }
+          withExportStatsRange({ includeRelations: false, allowStaleCache: true, cacheOnly: true })
         )
         if (requestSeq !== detailRequestSeqRef.current) return
         if (quickStatsResult.success) {
@@ -7342,7 +7534,7 @@ function ExportPage() {
       try {
         const relationCacheResult = await window.electronAPI.chat.getExportSessionStats(
           [normalizedSessionId],
-          { includeRelations: true, allowStaleCache: true, cacheOnly: true }
+          withExportStatsRange({ includeRelations: true, allowStaleCache: true, cacheOnly: true })
         )
         if (requestSeq !== detailRequestSeqRef.current) return
         if (relationCacheResult.success && relationCacheResult.data) {
@@ -7367,7 +7559,7 @@ function ExportPage() {
             // 后台补齐非关系统计，不走精确特型扫描，避免阻塞列表统计队列。
             const freshResult = await window.electronAPI.chat.getExportSessionStats(
               [normalizedSessionId],
-              { includeRelations: false, forceRefresh: true }
+              withExportStatsRange({ includeRelations: false, forceRefresh: true })
             )
             if (requestSeq !== detailRequestSeqRef.current) return
             if (freshResult.success && freshResult.data) {
@@ -7402,7 +7594,7 @@ function ExportPage() {
         setIsLoadingSessionDetailExtra(false)
       }
     }
-  }, [applySessionDetailStats, contactByUsername, mergeSessionContentMetrics, sessionContentMetrics, sessionMessageCounts, sessionRowByUsername])
+  }, [applySessionDetailStats, contactByUsername, mergeSessionContentMetrics, sessionContentMetrics, sessionMessageCounts, sessionRowByUsername, withExportStatsRange])
 
   const loadSessionRelationStats = useCallback(async (options?: { forceRefresh?: boolean }) => {
     const normalizedSessionId = String(sessionDetail?.wxid || '').trim()
@@ -7415,7 +7607,7 @@ function ExportPage() {
       if (!forceRefresh) {
         const relationCacheResult = await window.electronAPI.chat.getExportSessionStats(
           [normalizedSessionId],
-          { includeRelations: true, allowStaleCache: true, cacheOnly: true }
+          withExportStatsRange({ includeRelations: true, allowStaleCache: true, cacheOnly: true })
         )
         if (requestSeq !== detailRequestSeqRef.current) return
 
@@ -7433,7 +7625,7 @@ function ExportPage() {
 
       const relationResult = await window.electronAPI.chat.getExportSessionStats(
         [normalizedSessionId],
-        { includeRelations: true, forceRefresh, preferAccurateSpecialTypes: true }
+        withExportStatsRange({ includeRelations: true, forceRefresh, preferAccurateSpecialTypes: true })
       )
       if (requestSeq !== detailRequestSeqRef.current) return
 
@@ -7453,7 +7645,7 @@ function ExportPage() {
         setIsLoadingSessionRelationStats(false)
       }
     }
-  }, [applySessionDetailStats, isLoadingSessionRelationStats, sessionDetail?.wxid])
+  }, [applySessionDetailStats, isLoadingSessionRelationStats, sessionDetail?.wxid, withExportStatsRange])
 
   const handleRefreshTableData = useCallback(async () => {
     const scopeKey = await ensureExportCacheScope()
@@ -7484,11 +7676,28 @@ function ExportPage() {
       scheduleSessionMutualFriendsWorker()
     }
 
+    // 记录刷新前的会话时间戳
+    const oldTimestamps = new Map(
+      sessionsRef.current.map(s => [s.username, s.lastTimestamp || s.sortTimestamp || 0])
+    )
+
     await Promise.all([
       loadContactsList({ scopeKey }),
       loadSnsStats({ full: true }),
       loadSnsUserPostCounts({ force: true })
     ])
+
+    // 找出有变动的会话（最后消息时间变化）
+    const changedSessions = sessionsRef.current.filter(session => {
+      const oldTs = oldTimestamps.get(session.username) || 0
+      const newTs = session.lastTimestamp || session.sortTimestamp || 0
+      return newTs > oldTs
+    })
+
+    // 只对有变动的会话重新加载消息数量
+    if (changedSessions.length > 0) {
+      await loadSessionMessageCounts(changedSessions, activeTabRef.current, { scopeKey })
+    }
 
     const currentDetailSessionId = showSessionDetailPanel
       ? String(sessionDetail?.wxid || '').trim()
@@ -7885,7 +8094,12 @@ function ExportPage() {
   )
   const isTabCountComputing = isSharedTabCountsLoading && !isSharedTabCountsReady
   const isSnsCardStatsLoading = !hasSeededSnsStats
-  const taskRunningCount = tasks.filter(task => task.status === 'running').length
+  const taskRunningCount = tasks.filter(task => (
+    task.status === 'running' ||
+    task.status === 'pause_requested' ||
+    task.status === 'paused' ||
+    task.status === 'cancel_requested'
+  )).length
   const taskQueuedCount = tasks.filter(task => task.status === 'queued').length
   const chatBackgroundTasks = useMemo(() => (
     backgroundTasks.filter(task => task.sourcePage === 'chat')
@@ -8099,6 +8313,112 @@ function ExportPage() {
   const toggleTaskPerfDetail = useCallback((taskId: string) => {
     setExpandedPerfTaskId(prev => (prev === taskId ? null : taskId))
   }, [])
+  const handlePauseExportTask = useCallback((taskId: string) => {
+    const task = tasksRef.current.find(item => item.id === taskId)
+    if (!task || task.status !== 'running') return
+    updateTask(taskId, current => ({
+      ...current,
+      status: 'pause_requested',
+      progress: {
+        ...current.progress,
+        phaseLabel: current.progress.phaseLabel || '暂停请求已发送'
+      }
+    }))
+    window.electronAPI.export.pauseTask(taskId).then(result => {
+      if (result.success) return
+      updateTask(taskId, current => ({
+        ...current,
+        status: current.status === 'pause_requested' ? 'running' : current.status,
+        error: result.error || '暂停请求失败'
+      }))
+    }).catch(error => {
+      updateTask(taskId, current => ({
+        ...current,
+        status: current.status === 'pause_requested' ? 'running' : current.status,
+        error: String(error)
+      }))
+    })
+  }, [updateTask])
+  const handleResumeExportTask = useCallback((taskId: string) => {
+    const task = tasksRef.current.find(item => item.id === taskId)
+    if (!task || (task.status !== 'paused' && task.status !== 'pause_requested')) return
+    window.electronAPI.export.resumeTask(taskId).then(result => {
+      const doneAt = Date.now()
+      if (!result.success) {
+        updateTask(taskId, current => ({
+          ...current,
+          status: 'error',
+          finishedAt: doneAt,
+          error: result.error || '继续任务失败',
+          performance: finalizeTaskPerformance(current, doneAt)
+        }))
+        return
+      }
+      updateTask(taskId, current => ({
+        ...current,
+        status: current.status === 'pause_requested' ? 'running' : 'queued',
+        finishedAt: undefined,
+        error: undefined,
+        progress: {
+          ...current.progress,
+          phaseLabel: current.status === 'pause_requested' ? '继续中' : '等待继续'
+        }
+      }))
+    }).catch(error => {
+      const doneAt = Date.now()
+      updateTask(taskId, current => ({
+        ...current,
+        status: 'error',
+        finishedAt: doneAt,
+        error: String(error),
+        performance: finalizeTaskPerformance(current, doneAt)
+      }))
+    })
+  }, [updateTask])
+  const handleCancelExportTask = useCallback((taskId: string) => {
+    const task = tasksRef.current.find(item => item.id === taskId)
+    if (!task) return
+    if (task.status === 'queued') {
+      setTasks(prev => prev.filter(item => item.id !== taskId))
+      return
+    }
+    if (task.status !== 'running' && task.status !== 'pause_requested' && task.status !== 'paused' && task.status !== 'cancel_requested') {
+      return
+    }
+    updateTask(taskId, current => ({
+      ...current,
+      status: 'cancel_requested',
+      progress: {
+        ...current.progress,
+        phaseLabel: '取消请求已发送，正在安全停止'
+      }
+    }))
+    window.electronAPI.export.cancelTask(taskId).then(result => {
+      if (result.success && task.status === 'paused') {
+        setTasks(prev => prev.filter(item => item.id !== taskId))
+        return
+      }
+      if (!result.success) {
+        const doneAt = Date.now()
+        updateTask(taskId, current => ({
+          ...current,
+          status: 'error',
+          finishedAt: doneAt,
+          error: result.error || '取消任务失败',
+          performance: finalizeTaskPerformance(current, doneAt)
+        }))
+      }
+    }).catch(error => {
+      const doneAt = Date.now()
+      updateTask(taskId, current => ({
+        ...current,
+        status: 'error',
+        finishedAt: doneAt,
+        error: String(error),
+        performance: finalizeTaskPerformance(current, doneAt)
+      }))
+    })
+  }, [updateTask])
 
   const toggleAutomationTaskEnabled = useCallback((taskId: string, enabled: boolean) => {
     const now = Date.now()
@@ -8151,12 +8471,8 @@ function ExportPage() {
     const hintedMessages = normalizeMessageCount(matchedSession?.messageCountHint)
     const displayedMessageCount = countedMessages ?? hintedMessages
     const mediaMetric = sessionContentMetrics[contact.username]
-    // 最新消息时间：优先取 metric.lastTimestamp（最精确），退回到 SessionRow 的 sortTimestamp/lastTimestamp。
-    const metricLatestTs = mediaMetric?.lastTimestamp
-    const rowLatestTs = matchedSession?.sortTimestamp || matchedSession?.lastTimestamp
-    const resolvedLatestTs = (typeof metricLatestTs === 'number' && metricLatestTs > 0)
-      ? metricLatestTs
-      : (typeof rowLatestTs === 'number' && rowLatestTs > 0 ? rowLatestTs : undefined)
+    const rowLatestTs = matchedSession?.lastTimestamp || matchedSession?.sortTimestamp
+    const resolvedLatestTs = typeof rowLatestTs === 'number' && rowLatestTs > 0 ? rowLatestTs : undefined
     const latestTimeInfo = formatLatestMessageTimeFromSeconds(resolvedLatestTs, nowTick)
     const latestTimeState: { state: 'value'; text: string; title: string } | { state: 'loading' } | { state: 'na'; text: '--' } =
       !canExport
@@ -8583,6 +8899,9 @@ function ExportPage() {
         nowTick={nowTick}
         onClose={closeTaskCenter}
         onTogglePerfTask={toggleTaskPerfDetail}
+        onPauseExportTask={handlePauseExportTask}
+        onResumeExportTask={handleResumeExportTask}
+        onCancelExportTask={handleCancelExportTask}
         onPauseBackgroundTask={handlePauseBackgroundTask}
         onResumeBackgroundTask={handleResumeBackgroundTask}
         onCancelBackgroundTask={handleCancelBackgroundTask}
@@ -8641,12 +8960,12 @@ function ExportPage() {
                 <div className="automation-task-list">
                   {sortedAutomationTasks.map((task) => {
                     const linkedQueueTask = tasks.find((item) => (
-                      (item.status === 'running' || item.status === 'queued') &&
+                      isExportTaskActiveStatus(item.status) &&
                       item.payload.automationTaskId === task.id
                     ))
                     const queueState: 'queued' | 'running' | null = linkedQueueTask?.status === 'running'
                       ? 'running'
-                      : linkedQueueTask?.status === 'queued'
+                      : linkedQueueTask && isExportTaskActiveStatus(linkedQueueTask.status)
                         ? 'queued'
                         : null
                     return (
@@ -9032,7 +9351,7 @@ function ExportPage() {
             <div className="export-defaults-modal-actions">
               <button
                 type="button"
-                className="secondary-btn"
+                className="secondary-btn export-defaults-close-action"
                 onClick={() => setIsExportDefaultsModalOpen(false)}
               >
                 关闭
@@ -9373,7 +9692,7 @@ function ExportPage() {
                         customScrollParent={contactsListScrollParent ?? undefined}
                         data={filteredContacts}
                         computeItemKey={(_, contact) => contact.username}
-                        fixedItemHeight={76}
+                        fixedItemHeight={64}
                         itemContent={renderContactRow}
                         rangeChanged={handleContactsRangeChanged}
                         atTopStateChange={setIsContactsListAtTop}

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
-import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture, Newspaper } from 'lucide-react'
+import { Search, MessageSquare, AlertCircle, Loader2, RefreshCw, X, ChevronDown, ChevronLeft, Info, Calendar, Database, Hash, Play, Pause, Image as ImageIcon, Mic, CheckCircle, Copy, Check, CheckSquare, Download, BarChart3, Edit2, Trash2, BellOff, Users, FolderClosed, UserCheck, Crown, Aperture, Newspaper, Star, Sparkles, Code2 } from 'lucide-react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { createPortal } from 'react-dom'
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
@@ -8,6 +8,7 @@ import { useChatStore } from '../stores/chatStore'
 import { useBatchTranscribeStore, type BatchVoiceTaskType } from '../stores/batchTranscribeStore'
 import { useBatchImageDecryptStore } from '../stores/batchImageDecryptStore'
 import type { ChatRecordItem, ChatSession, Message } from '../types/models'
+import type { GroupSummaryRecord, GroupSummaryRecordSummary } from '../types/electron'
 import { getEmojiPath } from 'wechat-emojis'
 import { VoiceTranscribeDialog } from '../components/VoiceTranscribeDialog'
 import { LivePhotoIcon } from '../components/LivePhotoIcon'
@@ -29,6 +30,8 @@ import {
   onSingleExportDialogStatus,
   requestExportSessionStatus
 } from '../services/exportBridge'
+import ChatHeader from './Chat/ChatHeader'
+import ChatMessageBubble from './Chat/ChatMessageBubble'
 import '../styles/batchTranscribe.scss'
 import './ChatPage.scss'
 
@@ -53,8 +56,20 @@ interface PendingFootprintJumpPayload {
   createTime: number
 }
 
+interface QuotedMessageJumpTarget {
+  sourceMessageKey: string
+  sourceCreateTime: number
+  sessionId: string
+  localId?: number
+  serverId?: string
+  createTime?: number
+  senderUsername?: string
+  content?: string
+}
+
 type GlobalMsgSearchPhase = 'idle' | 'seed' | 'backfill' | 'done'
 type GlobalMsgSearchResult = Message & { sessionId: string }
+type GroupSummaryRangeMode = 1 | 2 | 4 | 8 | 12 | 24
 
 interface GlobalMsgPrefixCacheEntry {
   keyword: string
@@ -62,7 +77,7 @@ interface GlobalMsgPrefixCacheEntry {
   completed: boolean
 }
 
-type QuoteLayout = configService.QuoteLayout
+
 
 const GLOBAL_MSG_PER_SESSION_LIMIT = 10
 const GLOBAL_MSG_SEED_LIMIT = 120
@@ -72,10 +87,145 @@ const GLOBAL_MSG_SEARCH_CANCELED_ERROR = '__WEFLOW_GLOBAL_MSG_SEARCH_CANCELED__'
 const GLOBAL_MSG_SHADOW_COMPARE_SAMPLE_RATE = 0.2
 const GLOBAL_MSG_SHADOW_COMPARE_STORAGE_KEY = 'weflow.debug.searchShadowCompare'
 const MESSAGE_LIST_SCROLL_IDLE_MS = 160
-const MESSAGE_TOP_WHEEL_LOAD_COOLDOWN_MS = 160
+const MESSAGE_TOP_EDGE_LOAD_COOLDOWN_MS = 160
 const MESSAGE_EDGE_TRIGGER_DISTANCE_PX = 96
+const MESSAGE_HISTORY_INITIAL_LIMIT = 50
+const MESSAGE_HISTORY_HEAVY_UNREAD_INITIAL_LIMIT = 70
+const MESSAGE_HISTORY_GROWTH_STEP = 20
+const MESSAGE_HISTORY_MAX_LIMIT = 180
+const MESSAGE_VIRTUAL_OVERSCAN_PX = 140
+const BYTES_PER_MEGABYTE = 1024 * 1024
+const EMOJI_CACHE_MAX_ENTRIES = 260
+const EMOJI_CACHE_MAX_BYTES = 32 * BYTES_PER_MEGABYTE
+const IMAGE_CACHE_MAX_ENTRIES = 360
+const IMAGE_CACHE_MAX_BYTES = 64 * BYTES_PER_MEGABYTE
+const VOICE_CACHE_MAX_ENTRIES = 120
+const VOICE_CACHE_MAX_BYTES = 24 * BYTES_PER_MEGABYTE
+const VOICE_TRANSCRIPT_CACHE_MAX_ENTRIES = 1800
+const VOICE_TRANSCRIPT_CACHE_MAX_BYTES = 2 * BYTES_PER_MEGABYTE
+const SENDER_AVATAR_CACHE_MAX_ENTRIES = 2000
+const AUTO_MEDIA_TASK_MAX_CONCURRENCY = 2
+const AUTO_MEDIA_TASK_MAX_QUEUE = 80
 
 type RequestIdleCallbackCompat = (callback: () => void, options?: { timeout?: number }) => number
+
+type BoundedCacheOptions<V> = {
+  maxEntries: number
+  maxBytes?: number
+  estimate?: (value: V) => number
+}
+
+type BoundedCache<V> = {
+  get: (key: string) => V | undefined
+  set: (key: string, value: V) => void
+  has: (key: string) => boolean
+  delete: (key: string) => boolean
+  clear: () => void
+  readonly size: number
+}
+
+function estimateStringBytes(value: string): number {
+  return Math.max(0, value.length * 2)
+}
+
+function createBoundedCache<V>(options: BoundedCacheOptions<V>): BoundedCache<V> {
+  const { maxEntries, maxBytes, estimate } = options
+  const storage = new Map<string, V>()
+  const valueSizes = new Map<string, number>()
+  let currentBytes = 0
+
+  const estimateSize = (value: V): number => {
+    if (!estimate) return 1
+    const raw = estimate(value)
+    if (!Number.isFinite(raw) || raw <= 0) return 1
+    return Math.max(1, Math.round(raw))
+  }
+
+  const removeKey = (key: string): boolean => {
+    if (!storage.has(key)) return false
+    const previousSize = valueSizes.get(key) || 0
+    currentBytes = Math.max(0, currentBytes - previousSize)
+    valueSizes.delete(key)
+    return storage.delete(key)
+  }
+
+  const touch = (key: string, value: V) => {
+    storage.delete(key)
+    storage.set(key, value)
+  }
+
+  const prune = () => {
+    const shouldPruneByBytes = Number.isFinite(maxBytes) && (maxBytes as number) > 0
+    while (storage.size > maxEntries || (shouldPruneByBytes && currentBytes > (maxBytes as number))) {
+      const oldestKey = storage.keys().next().value as string | undefined
+      if (!oldestKey) break
+      removeKey(oldestKey)
+    }
+  }
+
+  return {
+    get(key: string) {
+      const value = storage.get(key)
+      if (value === undefined) return undefined
+      touch(key, value)
+      return value
+    },
+    set(key: string, value: V) {
+      const nextSize = estimateSize(value)
+      if (storage.has(key)) {
+        const previousSize = valueSizes.get(key) || 0
+        currentBytes = Math.max(0, currentBytes - previousSize)
+      }
+      storage.set(key, value)
+      valueSizes.set(key, nextSize)
+      currentBytes += nextSize
+      prune()
+    },
+    has(key: string) {
+      return storage.has(key)
+    },
+    delete(key: string) {
+      return removeKey(key)
+    },
+    clear() {
+      storage.clear()
+      valueSizes.clear()
+      currentBytes = 0
+    },
+    get size() {
+      return storage.size
+    }
+  }
+}
+
+const autoMediaTaskQueue: Array<() => void> = []
+let autoMediaTaskRunningCount = 0
+
+function enqueueAutoMediaTask<T>(task: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const runTask = () => {
+      autoMediaTaskRunningCount += 1
+      task()
+        .then(resolve)
+        .catch(reject)
+        .finally(() => {
+          autoMediaTaskRunningCount = Math.max(0, autoMediaTaskRunningCount - 1)
+          const next = autoMediaTaskQueue.shift()
+          if (next) next()
+        })
+    }
+
+    if (autoMediaTaskRunningCount < AUTO_MEDIA_TASK_MAX_CONCURRENCY) {
+      runTask()
+      return
+    }
+    if (autoMediaTaskQueue.length >= AUTO_MEDIA_TASK_MAX_QUEUE) {
+      reject(new Error('AUTO_MEDIA_TASK_QUEUE_FULL'))
+      return
+    }
+    autoMediaTaskQueue.push(runTask)
+  })
+}
 
 function scheduleWhenIdle(task: () => void, options?: { timeout?: number; fallbackDelay?: number }): void {
   const requestIdleCallbackFn = (
@@ -539,6 +689,26 @@ function cleanMessageContent(content: string): string {
   return content.trim()
 }
 
+function normalizeMessageIdToken(value: unknown): string {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+  if (!/^\d+$/.test(raw)) return raw
+  return raw.replace(/^0+(?=\d)/, '')
+}
+
+function parsePositiveInteger(value: unknown): number | undefined {
+  const raw = String(value ?? '').trim()
+  if (!raw) return undefined
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined
+  return Math.floor(parsed)
+}
+
+function normalizeQuotedComparableText(value: unknown): string {
+  const text = cleanMessageContent(String(value ?? '')).replace(/\s+/g, ' ').trim()
+  return text.length > 160 ? text.slice(0, 160) : text
+}
+
 const CHAT_SESSION_LIST_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const CHAT_SESSION_PREVIEW_CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const CHAT_SESSION_PREVIEW_LIMIT_PER_SESSION = 30
@@ -592,6 +762,17 @@ function formatYmdHmDateTime(timestamp?: number): string {
   const h = `${d.getHours()}`.padStart(2, '0')
   const min = `${d.getMinutes()}`.padStart(2, '0')
   return `${y}-${m}-${day} ${h}:${min}`
+}
+
+function formatDateInputLocal(date: Date): string {
+  const y = date.getFullYear()
+  const m = `${date.getMonth() + 1}`.padStart(2, '0')
+  const day = `${date.getDate()}`.padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+function formatSummaryPeriod(start: number, end: number): string {
+  return `${formatYmdHmDateTime(start * 1000)} - ${formatYmdHmDateTime(end * 1000)}`
 }
 
 interface ChatPageProps {
@@ -977,6 +1158,15 @@ interface LoadMessagesOptions {
   inSessionJumpRequestSeq?: number
 }
 
+type LoadMessagesFn = (
+  sessionId: string,
+  offset?: number,
+  startTime?: number,
+  endTime?: number,
+  ascending?: boolean,
+  options?: LoadMessagesOptions
+) => Promise<void>
+
 // 全局头像加载队列管理器已移至 src/utils/AvatarLoadQueue.ts
 import { avatarLoadQueue } from '../utils/AvatarLoadQueue'
 import { Avatar } from '../components/Avatar'
@@ -1293,12 +1483,13 @@ function ChatPage(props: ChatPageProps) {
 
   const getMessageKey = useCallback((msg: Message): string => {
     if (msg.messageKey) return msg.messageKey
-    return `fallback:${msg.serverId || 0}:${msg.createTime}:${msg.sortSeq || 0}:${msg.localId || 0}:${msg.senderUsername || ''}:${msg.localType || 0}`
+    return `fallback:${msg._db_path || ''}:${msg.serverId || 0}:${msg.createTime}:${msg.sortSeq || 0}:${msg.localId || 0}:${msg.senderUsername || ''}:${msg.localType || 0}`
   }, [])
   const initialRevealTimerRef = useRef<number | null>(null)
   const sessionListRef = useRef<HTMLDivElement>(null)
   const jumpCalendarWrapRef = useRef<HTMLDivElement>(null)
   const jumpPopoverPortalRef = useRef<HTMLDivElement>(null)
+  const groupSummaryDateWrapRef = useRef<HTMLDivElement>(null)
   const [currentOffset, setCurrentOffset] = useState(0)
   const [jumpStartTime, setJumpStartTime] = useState(0)
   const [jumpEndTime, setJumpEndTime] = useState(0)
@@ -1318,6 +1509,7 @@ function ChatPage(props: ChatPageProps) {
   const [showScrollToBottom, setShowScrollToBottom] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(260)
   const [isResizing, setIsResizing] = useState(false)
+  const [isMarkingAllSessionsRead, setIsMarkingAllSessionsRead] = useState(false)
   const [showDetailPanel, setShowDetailPanel] = useState(false)
   const [showGroupMembersPanel, setShowGroupMembersPanel] = useState(false)
   const [sessionDetail, setSessionDetail] = useState<SessionDetail | null>(null)
@@ -1333,6 +1525,7 @@ function ChatPage(props: ChatPageProps) {
   const [groupMemberSearchKeyword, setGroupMemberSearchKeyword] = useState('')
   const [copiedField, setCopiedField] = useState<string | null>(null)
   const [highlightedMessageKeys, setHighlightedMessageKeys] = useState<string[]>([])
+  const [quoteLayout, setQuoteLayout] = useState<configService.QuoteLayout>('quote-top')
   const [isRefreshingSessions, setIsRefreshingSessions] = useState(false)
   const [foldedView, setFoldedView] = useState(false) // 是否在"折叠的群聊"视图
   const [bizView, setBizView] = useState(false) // 是否在"公众号"视图
@@ -1358,6 +1551,18 @@ function ChatPage(props: ChatPageProps) {
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, message: Message } | null>(null)
   const [showMessageInfo, setShowMessageInfo] = useState<Message | null>(null)
   const [editingMessage, setEditingMessage] = useState<{ message: Message, content: string } | null>(null)
+  const [aiGroupSummaryEnabled, setAiGroupSummaryEnabled] = useState(false)
+  const [showGroupSummaryPanel, setShowGroupSummaryPanel] = useState(false)
+  const [groupSummaryRecords, setGroupSummaryRecords] = useState<GroupSummaryRecordSummary[]>([])
+  const [groupSummaryTotal, setGroupSummaryTotal] = useState(0)
+  const [groupSummaryLoading, setGroupSummaryLoading] = useState(false)
+  const [groupSummaryError, setGroupSummaryError] = useState<string | null>(null)
+  const [groupSummaryDateFilter, setGroupSummaryDateFilter] = useState(() => formatDateInputLocal(new Date()))
+  const [groupSummaryRangeMode, setGroupSummaryRangeMode] = useState<GroupSummaryRangeMode>(4)
+  const [showGroupSummaryDatePopover, setShowGroupSummaryDatePopover] = useState(false)
+  const [isTriggeringGroupSummary, setIsTriggeringGroupSummary] = useState(false)
+  const [groupSummaryHint, setGroupSummaryHint] = useState<{ success: boolean; message: string } | null>(null)
+  const [groupSummaryLogRecord, setGroupSummaryLogRecord] = useState<GroupSummaryRecord | null>(null)
 
   // 多选模式
   const [isSelectionMode, setIsSelectionMode] = useState(false)
@@ -1434,6 +1639,8 @@ function ChatPage(props: ChatPageProps) {
   const [globalMsgSearchError, setGlobalMsgSearchError] = useState<string | null>(null)
   const pendingInSessionSearchRef = useRef<PendingInSessionSearchPayload | null>(null)
   const pendingFootprintJumpRef = useRef<PendingFootprintJumpPayload | null>(null)
+  const pendingQuotedMessageJumpRef = useRef<QuotedMessageJumpTarget | null>(null)
+  const loadMessagesRef = useRef<LoadMessagesFn | null>(null)
   const pendingGlobalMsgSearchReplayRef = useRef<string | null>(null)
   const globalMsgPrefixCacheRef = useRef<GlobalMsgPrefixCacheEntry | null>(null)
 
@@ -1456,6 +1663,11 @@ function ChatPage(props: ChatPageProps) {
 
 
   const highlightedMessageSet = useMemo(() => new Set(highlightedMessageKeys), [highlightedMessageKeys])
+  const [aiMessageInsightEnabled, setAiMessageInsightEnabled] = useState(false)
+  const [aiMessageInsightContextCount, setAiMessageInsightContextCount] = useState(50)
+  const [isTriggeringSessionInsight, setIsTriggeringSessionInsight] = useState(false)
+  const [sessionInsightHint, setSessionInsightHint] = useState<{ success: boolean; message: string } | null>(null)
+  const sessionInsightHintTimerRef = useRef<number | null>(null)
   const messageKeySetRef = useRef<Set<string>>(new Set())
   const lastMessageTimeRef = useRef(0)
   const isMessageListAtBottomRef = useRef(true)
@@ -1473,6 +1685,7 @@ function ChatPage(props: ChatPageProps) {
   const searchKeywordRef = useRef('')
   const preloadImageKeysRef = useRef<Set<string>>(new Set())
   const lastPreloadSessionRef = useRef<string | null>(null)
+  const messageMediaPreloadTimerRef = useRef<number | null>(null)
   const detailRequestSeqRef = useRef(0)
   const groupMembersRequestSeqRef = useRef(0)
   const groupMembersPanelCacheRef = useRef<Map<string, GroupMembersPanelCacheEntry>>(new Map())
@@ -1672,6 +1885,130 @@ function ChatPage(props: ChatPageProps) {
       if (prev.top === top && prev.left === left) return prev
       return { top, left }
     })
+  }, [])
+
+  const getGroupSummaryDateRangeSeconds = useCallback((dateValue = groupSummaryDateFilter) => {
+    const date = dateValue || formatDateInputLocal(new Date())
+    const start = new Date(`${date}T00:00:00`)
+    if (!Number.isFinite(start.getTime())) {
+      const fallback = new Date()
+      fallback.setHours(0, 0, 0, 0)
+      const fallbackEnd = new Date(fallback)
+      fallbackEnd.setHours(23, 59, 59, 999)
+      return { startTime: Math.floor(fallback.getTime() / 1000), endTime: Math.floor(fallbackEnd.getTime() / 1000) }
+    }
+    const end = new Date(start)
+    end.setHours(23, 59, 59, 999)
+    return { startTime: Math.floor(start.getTime() / 1000), endTime: Math.floor(end.getTime() / 1000) }
+  }, [groupSummaryDateFilter])
+
+  const isGroupSummaryToday = useMemo(() => {
+    return (groupSummaryDateFilter || formatDateInputLocal(new Date())) === formatDateInputLocal(new Date())
+  }, [groupSummaryDateFilter])
+
+  const loadGroupSummaryRecords = useCallback(async (sessionId?: string) => {
+    const targetSessionId = String(sessionId || currentSessionRef.current || '').trim()
+    if (!targetSessionId || !targetSessionId.endsWith('@chatroom')) return
+    const { startTime, endTime } = getGroupSummaryDateRangeSeconds()
+    setGroupSummaryLoading(true)
+    setGroupSummaryError(null)
+    try {
+      const result = await window.electronAPI.groupSummary.listRecords({
+        sessionId: targetSessionId,
+        startTime,
+        endTime,
+        limit: 100
+      })
+      if (currentSessionRef.current !== targetSessionId) return
+      if (!result.success) {
+        setGroupSummaryRecords([])
+        setGroupSummaryTotal(0)
+        setGroupSummaryError(result.error || '读取群聊总结失败')
+        return
+      }
+      setGroupSummaryRecords(result.records || [])
+      setGroupSummaryTotal(result.total || 0)
+    } catch (error) {
+      if (currentSessionRef.current !== targetSessionId) return
+      setGroupSummaryRecords([])
+      setGroupSummaryTotal(0)
+      setGroupSummaryError((error as Error).message || String(error))
+    } finally {
+      if (currentSessionRef.current === targetSessionId) {
+        setGroupSummaryLoading(false)
+      }
+    }
+  }, [getGroupSummaryDateRangeSeconds])
+
+  const resolveTodayGroupSummaryManualRange = useCallback(() => {
+    const nowSeconds = Math.floor(Date.now() / 1000)
+    const hours = Number(groupSummaryRangeMode)
+    return { startTime: nowSeconds - hours * 60 * 60, endTime: nowSeconds }
+  }, [groupSummaryRangeMode])
+
+  const triggerManualGroupSummary = useCallback(async () => {
+    const sessionId = String(currentSessionId || '').trim()
+    if (!sessionId || !sessionId.endsWith('@chatroom')) return
+    const sessionInfo = sessionMapRef.current.get(sessionId)
+    const selectedDate = groupSummaryDateFilter || formatDateInputLocal(new Date())
+    const today = formatDateInputLocal(new Date())
+
+    setIsTriggeringGroupSummary(true)
+    setGroupSummaryHint({ success: true, message: '正在生成群聊总结...' })
+    try {
+      if (selectedDate === today) {
+        const { startTime, endTime } = resolveTodayGroupSummaryManualRange()
+        if (startTime <= 0 || endTime <= startTime) {
+          setGroupSummaryHint({ success: false, message: '请选择有效的总结时段' })
+          return
+        }
+        const result = await window.electronAPI.groupSummary.triggerManual({
+          sessionId,
+          displayName: sessionInfo?.displayName || sessionId,
+          avatarUrl: sessionInfo?.avatarUrl,
+          startTime,
+          endTime
+        })
+        if (result.success) {
+          setGroupSummaryHint({ success: true, message: result.message || '群聊总结已生成' })
+          if (!result.skipped) {
+            await loadGroupSummaryRecords(sessionId)
+          }
+        } else {
+          setGroupSummaryHint({ success: false, message: result.message || '群聊总结生成失败' })
+        }
+      } else {
+        const result = await window.electronAPI.groupSummary.triggerDay({
+          sessionId,
+          displayName: sessionInfo?.displayName || sessionId,
+          avatarUrl: sessionInfo?.avatarUrl,
+          date: selectedDate
+        })
+        if (result.success) {
+          setGroupSummaryHint({ success: true, message: result.message || '群聊总结已生成' })
+          await loadGroupSummaryRecords(sessionId)
+        } else {
+          setGroupSummaryHint({ success: false, message: result.message || '群聊总结生成失败' })
+        }
+      }
+    } catch (error) {
+      setGroupSummaryHint({ success: false, message: (error as Error).message || String(error) })
+    } finally {
+      setIsTriggeringGroupSummary(false)
+    }
+  }, [currentSessionId, groupSummaryDateFilter, loadGroupSummaryRecords, resolveTodayGroupSummaryManualRange])
+
+  const openGroupSummaryLog = useCallback(async (recordId: string) => {
+    try {
+      const result = await window.electronAPI.groupSummary.getRecord(recordId)
+      if (!result.success || !result.record) {
+        setGroupSummaryHint({ success: false, message: result.error || '读取总结日志失败' })
+        return
+      }
+      setGroupSummaryLogRecord(result.record)
+    } catch (error) {
+      setGroupSummaryHint({ success: false, message: (error as Error).message || String(error) })
+    }
   }, [])
 
   const handleToggleJumpPopover = useCallback(() => {
@@ -2716,8 +3053,20 @@ function ChatPage(props: ChatPageProps) {
       return
     }
     setShowDetailPanel(false)
+    setShowGroupSummaryPanel(false)
     setShowGroupMembersPanel(true)
   }, [currentSessionId, showGroupMembersPanel, isGroupChatSession])
+
+  const toggleGroupSummaryPanel = useCallback(() => {
+    if (!currentSessionId || !isGroupChatSession(currentSessionId) || !aiGroupSummaryEnabled) return
+    if (showGroupSummaryPanel) {
+      setShowGroupSummaryPanel(false)
+      return
+    }
+    setShowDetailPanel(false)
+    setShowGroupMembersPanel(false)
+    setShowGroupSummaryPanel(true)
+  }, [aiGroupSummaryEnabled, currentSessionId, showGroupSummaryPanel, isGroupChatSession])
 
   // 切换详情面板
   const toggleDetailPanel = useCallback(() => {
@@ -2726,6 +3075,7 @@ function ChatPage(props: ChatPageProps) {
       return
     }
     setShowGroupMembersPanel(false)
+    setShowGroupSummaryPanel(false)
     setShowDetailPanel(true)
     if (currentSessionId) {
       void loadSessionDetail(currentSessionId)
@@ -2741,6 +3091,15 @@ function ChatPage(props: ChatPageProps) {
     setGroupMemberSearchKeyword('')
     void loadGroupMembersPanel(currentSessionId)
   }, [showGroupMembersPanel, currentSessionId, loadGroupMembersPanel, isGroupChatSession])
+
+  useEffect(() => {
+    if (!showGroupSummaryPanel) return
+    if (!currentSessionId || !isGroupChatSession(currentSessionId) || !aiGroupSummaryEnabled) {
+      setShowGroupSummaryPanel(false)
+      return
+    }
+    void loadGroupSummaryRecords(currentSessionId)
+  }, [aiGroupSummaryEnabled, currentSessionId, groupSummaryDateFilter, loadGroupSummaryRecords, showGroupSummaryPanel, isGroupChatSession])
 
   useEffect(() => {
     const chatroomId = String(sessionDetail?.wxid || '').trim()
@@ -2793,6 +3152,11 @@ function ChatPage(props: ChatPageProps) {
   }, [loadMyAvatar, resolveChatCacheScope])
 
   const handleAccountChanged = useCallback(async () => {
+    emojiDataUrlCache.clear()
+    imageDataUrlCache.clear()
+    voiceDataUrlCache.clear()
+    voiceTranscriptCache.clear()
+    imageDecryptInFlight.clear()
     senderAvatarCache.clear()
     senderAvatarLoading.clear()
     quotedSenderDisplayCache.clear()
@@ -2804,6 +3168,10 @@ function ChatPage(props: ChatPageProps) {
     sessionContactEnrichAttemptAtRef.current.clear()
     preloadImageKeysRef.current.clear()
     lastPreloadSessionRef.current = null
+    if (messageMediaPreloadTimerRef.current !== null) {
+      window.clearTimeout(messageMediaPreloadTimerRef.current)
+      messageMediaPreloadTimerRef.current = null
+    }
     pendingSessionLoadRef.current = null
     initialLoadRequestedSessionRef.current = null
     sessionSwitchRequestSeqRef.current += 1
@@ -2814,6 +3182,10 @@ function ChatPage(props: ChatPageProps) {
     setIsLoadingRelationStats(false)
     setShowDetailPanel(false)
     setShowGroupMembersPanel(false)
+    setShowGroupSummaryPanel(false)
+    setGroupSummaryRecords([])
+    setGroupSummaryError(null)
+    setGroupSummaryHint(null)
     setGroupPanelMembers([])
     setGroupMembersError(null)
     setGroupMembersLoadingHint('')
@@ -2878,6 +3250,63 @@ function ChatPage(props: ChatPageProps) {
   }, [])
 
   useEffect(() => {
+    let canceled = false
+    const loadQuoteLayout = () => {
+      void configService.getQuoteLayout()
+        .then((layout) => {
+          if (!canceled) setQuoteLayout(layout)
+        })
+        .catch(() => {
+          if (!canceled) setQuoteLayout('quote-top')
+        })
+    }
+
+    loadQuoteLayout()
+    const handleFocus = () => loadQuoteLayout()
+    const handleQuoteLayoutChanged = (event: Event) => {
+      const layout = (event as CustomEvent<configService.QuoteLayout>).detail
+      setQuoteLayout(layout === 'quote-bottom' ? 'quote-bottom' : 'quote-top')
+    }
+    window.addEventListener('focus', handleFocus)
+    window.addEventListener('quote-layout-changed', handleQuoteLayoutChanged)
+    return () => {
+      canceled = true
+      window.removeEventListener('focus', handleFocus)
+      window.removeEventListener('quote-layout-changed', handleQuoteLayoutChanged)
+    }
+  }, [])
+
+  useEffect(() => {
+    let canceled = false
+
+    const loadMessageInsightConfig = () => {
+      void Promise.all([
+        configService.getAiMessageInsightEnabled(),
+        configService.getAiMessageInsightContextCount()
+      ])
+        .then(([enabled, contextCount]) => {
+          if (canceled) return
+          setAiMessageInsightEnabled(enabled)
+          setAiMessageInsightContextCount(contextCount)
+        })
+        .catch((error) => {
+          console.warn('加载消息解析配置失败:', error)
+          if (canceled) return
+          setAiMessageInsightEnabled(false)
+          setAiMessageInsightContextCount(50)
+        })
+    }
+
+    loadMessageInsightConfig()
+    const handleFocus = () => loadMessageInsightConfig()
+    window.addEventListener('focus', handleFocus)
+    return () => {
+      canceled = true
+      window.removeEventListener('focus', handleFocus)
+    }
+  }, [])
+
+  useEffect(() => {
     let cancelled = false
     void (async () => {
       const scope = await resolveChatCacheScope()
@@ -2893,6 +3322,13 @@ function ChatPage(props: ChatPageProps) {
   // 同步 currentSessionId 到 ref
   useEffect(() => {
     currentSessionRef.current = currentSessionId
+    messageInsightMemoryCache.clear()
+    setSessionInsightHint(null)
+    setIsTriggeringSessionInsight(false)
+    if (sessionInsightHintTimerRef.current !== null) {
+      window.clearTimeout(sessionInsightHintTimerRef.current)
+      sessionInsightHintTimerRef.current = null
+    }
     isMessageListAtBottomRef.current = true
     topRangeLoadLockRef.current = false
     bottomRangeLoadLockRef.current = false
@@ -2982,6 +3418,35 @@ function ChatPage(props: ChatPageProps) {
       } else {
         setLoadingSessions(false)
       }
+    }
+  }
+
+  const handleMarkAllSessionsRead = async () => {
+    if (isMarkingAllSessionsRead || isLoadingSessions || isRefreshingSessions) return
+    setIsMarkingAllSessionsRead(true)
+    setConnectionError(null)
+    try {
+      const result = await window.electronAPI.chat.markAllSessionsRead()
+      if (!result.success) {
+        setConnectionError(result.error || '一键已读失败')
+        return
+      }
+
+      const latestSessions = useChatStore.getState().sessions || []
+      const nextSessions = latestSessions.map((session) => (
+        session.unreadCount > 0 ? { ...session, unreadCount: 0 } : session
+      ))
+      setSessions(nextSessions)
+      sessionsRef.current = nextSessions
+
+      const scope = await resolveChatCacheScope()
+      persistSessionListCache(scope, nextSessions)
+      await loadSessions({ silent: true })
+    } catch (e) {
+      console.error('一键已读失败:', e)
+      setConnectionError(`一键已读失败: ${String(e)}`)
+    } finally {
+      setIsMarkingAllSessionsRead(false)
     }
   }
 
@@ -3321,8 +3786,8 @@ function ChatPage(props: ChatPageProps) {
       setIsRefreshingMessages(false)
     }
   }
-  // 消息批量大小控制（保持稳定，避免游标反复重建）
-  const currentBatchSizeRef = useRef(50)
+  // 消息批量大小控制（会话内逐步增大，减少频繁触顶加载）
+  const currentBatchSizeRef = useRef(MESSAGE_HISTORY_INITIAL_LIMIT)
 
   const warmupGroupSenderProfiles = useCallback((usernames: string[], defer = false) => {
     if (!Array.isArray(usernames) || usernames.length === 0) return
@@ -3386,14 +3851,21 @@ function ChatPage(props: ChatPageProps) {
     let messageLimit: number
 
     if (offset === 0) {
+      const defaultInitialLimit = unreadCount > 99
+        ? MESSAGE_HISTORY_HEAVY_UNREAD_INITIAL_LIMIT
+        : MESSAGE_HISTORY_INITIAL_LIMIT
       const preferredLimit = Number.isFinite(options.forceInitialLimit)
         ? Math.max(10, Math.floor(options.forceInitialLimit as number))
-        : (unreadCount > 99 ? 30 : 40)
-      currentBatchSizeRef.current = preferredLimit
-      messageLimit = preferredLimit
-    } else {
-      // 同一会话内保持固定批量，避免后端游标因 batch 改变而重建
+        : defaultInitialLimit
+      currentBatchSizeRef.current = Math.min(preferredLimit, MESSAGE_HISTORY_MAX_LIMIT)
       messageLimit = currentBatchSizeRef.current
+    } else {
+      const grownBatchSize = Math.min(
+        Math.max(currentBatchSizeRef.current, MESSAGE_HISTORY_INITIAL_LIMIT) + MESSAGE_HISTORY_GROWTH_STEP,
+        MESSAGE_HISTORY_MAX_LIMIT
+      )
+      currentBatchSizeRef.current = grownBatchSize
+      messageLimit = grownBatchSize
     }
 
 
@@ -3445,10 +3917,10 @@ function ChatPage(props: ChatPageProps) {
       if (result.success && result.messages) {
         const resultMessages = result.messages
         if (offset === 0) {
+          setNoMessageTable(false)
           setMessages(resultMessages)
           persistSessionPreviewCache(sessionId, resultMessages)
           if (resultMessages.length === 0) {
-            setNoMessageTable(true)
             setHasMoreMessages(false)
           }
 
@@ -3549,7 +4021,10 @@ function ChatPage(props: ChatPageProps) {
           : offset + resultMessages.length
         setCurrentOffset(nextOffset)
       } else if (!result.success) {
-        setNoMessageTable(true)
+        const errorText = String(result.error || '')
+        const shouldMarkNoTable =
+          /schema mismatch|no message db|no table|消息数据库未找到|消息表|message schema/i.test(errorText)
+        setNoMessageTable(shouldMarkNoTable)
         setHasMoreMessages(false)
       }
     } catch (e) {
@@ -3557,6 +4032,7 @@ function ChatPage(props: ChatPageProps) {
       setConnectionError('加载消息失败')
       setHasMoreMessages(false)
       if (offset === 0 && currentSessionRef.current === sessionId) {
+        setNoMessageTable(false)
         setMessages([])
       }
     } finally {
@@ -3583,6 +4059,8 @@ function ChatPage(props: ChatPageProps) {
       }
     }
   }
+
+  loadMessagesRef.current = loadMessages
 
   const handleJumpDateSelect = useCallback((date: Date, options: { sessionId?: string; switchRequestSeq?: number } = {}) => {
     const targetSessionId = String(options.sessionId || currentSessionRef.current || currentSessionId || '').trim()
@@ -4095,7 +4573,7 @@ function ChatPage(props: ChatPageProps) {
       void loadMessages(normalizedSessionId, 0, 0, 0, false, {
         preferLatestPath: true,
         deferGroupSenderWarmup: true,
-        forceInitialLimit: 30,
+        forceInitialLimit: MESSAGE_HISTORY_INITIAL_LIMIT,
         switchRequestSeq
       })
     }
@@ -4103,6 +4581,9 @@ function ChatPage(props: ChatPageProps) {
     setShowJumpPopover(false)
     setShowDetailPanel(false)
     setShowGroupMembersPanel(false)
+    setShowGroupSummaryPanel(false)
+    setGroupSummaryError(null)
+    setGroupSummaryHint(null)
     setGroupMemberSearchKeyword('')
     setGroupMembersError(null)
     setGroupMembersLoadingHint('')
@@ -4586,24 +5067,40 @@ function ChatPage(props: ChatPageProps) {
     setShowScrollToBottom(prev => (prev === shouldShow ? prev : shouldShow))
   }, [messages.length, isLoadingMessages, isLoadingMore, isSessionSwitching])
 
+  const triggerTopEdgeHistoryLoad = useCallback((): boolean => {
+    if (!currentSessionId || isLoadingMore || isLoadingMessages || !hasMoreMessages) return false
+    const listEl = messageListRef.current
+    if (!listEl) return false
+    const distanceFromTop = Math.max(0, listEl.scrollTop)
+    if (distanceFromTop > MESSAGE_EDGE_TRIGGER_DISTANCE_PX) return false
+    if (topRangeLoadLockRef.current) return false
+    const now = Date.now()
+    if (now - topRangeLoadLastTriggerAtRef.current < MESSAGE_TOP_EDGE_LOAD_COOLDOWN_MS) return false
+    topRangeLoadLastTriggerAtRef.current = now
+    topRangeLoadLockRef.current = true
+    isMessageListAtBottomRef.current = false
+    void loadMessages(currentSessionId, currentOffset, jumpStartTime, jumpEndTime)
+    return true
+  }, [
+    currentSessionId,
+    isLoadingMore,
+    isLoadingMessages,
+    hasMoreMessages,
+    loadMessages,
+    currentOffset,
+    jumpStartTime,
+    jumpEndTime
+  ])
+
   const handleMessageListWheel = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
     markMessageListScrolling()
     if (!currentSessionId || isLoadingMore || isLoadingMessages) return
     const listEl = messageListRef.current
     if (!listEl) return
-    const distanceFromTop = listEl.scrollTop
     const distanceFromBottom = listEl.scrollHeight - (listEl.scrollTop + listEl.clientHeight)
 
     if (event.deltaY <= -18) {
-      if (!hasMoreMessages) return
-      if (distanceFromTop > MESSAGE_EDGE_TRIGGER_DISTANCE_PX) return
-      if (topRangeLoadLockRef.current) return
-      const now = Date.now()
-      if (now - topRangeLoadLastTriggerAtRef.current < MESSAGE_TOP_WHEEL_LOAD_COOLDOWN_MS) return
-      topRangeLoadLastTriggerAtRef.current = now
-      topRangeLoadLockRef.current = true
-      isMessageListAtBottomRef.current = false
-      void loadMessages(currentSessionId, currentOffset, jumpStartTime, jumpEndTime)
+      triggerTopEdgeHistoryLoad()
       return
     }
 
@@ -4619,22 +5116,21 @@ function ChatPage(props: ChatPageProps) {
   }, [
     currentSessionId,
     hasMoreLater,
-    hasMoreMessages,
     isLoadingMessages,
     isLoadingMore,
-    currentOffset,
-    jumpStartTime,
-    jumpEndTime,
     markMessageListScrolling,
-    loadMessages,
-    loadLaterMessages
+    loadLaterMessages,
+    triggerTopEdgeHistoryLoad
   ])
 
   const handleMessageAtTopStateChange = useCallback((atTop: boolean) => {
     if (!atTop) {
       topRangeLoadLockRef.current = false
+      return
     }
-  }, [])
+    // 支持拖动右侧滚动条到顶部时直接触发加载，不依赖滚轮事件。
+    triggerTopEdgeHistoryLoad()
+  }, [triggerTopEdgeHistoryLoad])
 
 
   const isSameSession = useCallback((prev: ChatSession, next: ChatSession): boolean => {
@@ -4677,6 +5173,136 @@ function ChatPage(props: ChatPageProps) {
       setHighlightedMessageKeys((prev) => prev.filter((k) => !keys.includes(k)))
     }, 2500)
   }, [])
+
+  const findQuotedTargetInMessages = useCallback((target: QuotedMessageJumpTarget): { index: number; message: Message } | null => {
+    if (messages.length === 0) return null
+
+    const targetServerId = normalizeMessageIdToken(target.serverId)
+    const targetLocalId = typeof target.localId === 'number' && target.localId > 0 ? target.localId : undefined
+    const targetCreateTime = typeof target.createTime === 'number' && target.createTime > 0 ? target.createTime : undefined
+    const targetSender = String(target.senderUsername || '').trim()
+    const targetContent = normalizeQuotedComparableText(target.content)
+    const sourceIndex = target.sourceMessageKey
+      ? messages.findIndex((item) => getMessageKey(item) === target.sourceMessageKey)
+      : -1
+
+    const orderedIndices: number[] = []
+    const usedIndices = new Set<number>()
+    const pushIndex = (index: number) => {
+      if (index < 0 || index >= messages.length || usedIndices.has(index)) return
+      usedIndices.add(index)
+      orderedIndices.push(index)
+    }
+
+    if (sourceIndex > 0) {
+      for (let index = sourceIndex - 1; index >= 0; index--) {
+        pushIndex(index)
+      }
+    }
+    for (let index = 0; index < messages.length; index++) {
+      pushIndex(index)
+    }
+
+    let best: { index: number; message: Message; score: number } | null = null
+    for (const index of orderedIndices) {
+      const item = messages[index]
+      const itemKey = getMessageKey(item)
+      if (itemKey === target.sourceMessageKey) continue
+
+      const itemServerId = normalizeMessageIdToken(item.serverIdRaw ?? item.serverId)
+      const serverMatch = Boolean(targetServerId && itemServerId && itemServerId === targetServerId)
+      const localIdMatch = Boolean(targetLocalId && Number(item.localId || 0) === targetLocalId)
+      const itemCreateTime = Number(item.createTime || 0)
+      const timeDelta = targetCreateTime ? Math.abs(itemCreateTime - targetCreateTime) : Number.POSITIVE_INFINITY
+      const exactTimeMatch = Boolean(targetCreateTime && timeDelta <= 1)
+      const nearTimeMatch = Boolean(targetCreateTime && timeDelta <= 300)
+      const senderMatch = Boolean(targetSender && String(item.senderUsername || '').trim() === targetSender)
+      const itemText = targetContent
+        ? normalizeQuotedComparableText(item.parsedContent || item.rawContent || item.content || '')
+        : ''
+      const contentMatch = Boolean(
+        targetContent &&
+        itemText &&
+        (itemText.includes(targetContent) || targetContent.includes(itemText))
+      )
+
+      const strongMatch = Boolean(
+        serverMatch ||
+        localIdMatch ||
+        (exactTimeMatch && (senderMatch || contentMatch)) ||
+        (exactTimeMatch && !targetSender && !targetContent)
+      )
+      if (!strongMatch) continue
+
+      const score =
+        (localIdMatch ? 100 : 0) +
+        (serverMatch ? 90 : 0) +
+        (exactTimeMatch ? 35 : (nearTimeMatch ? 8 : 0)) +
+        (senderMatch ? 12 : 0) +
+        (contentMatch ? 12 : 0)
+
+      if (!best || score > best.score) {
+        best = { index, message: item, score }
+        if (score >= 125) break
+      }
+    }
+
+    return best ? { index: best.index, message: best.message } : null
+  }, [messages, getMessageKey])
+
+  const scrollToResolvedMessage = useCallback((resolved: { index: number; message: Message }, behavior: 'auto' | 'smooth' = 'smooth') => {
+    const key = getMessageKey(resolved.message)
+    flashNewMessages([key])
+    requestAnimationFrame(() => {
+      if (messageVirtuosoRef.current) {
+        messageVirtuosoRef.current.scrollToIndex({
+          index: resolved.index,
+          align: 'center',
+          behavior
+        })
+      }
+    })
+  }, [flashNewMessages, getMessageKey])
+
+  const handleJumpToQuotedMessage = useCallback((target: QuotedMessageJumpTarget) => {
+    const targetSessionId = String(currentSessionRef.current || currentSessionId || target.sessionId || '').trim()
+    if (!targetSessionId) return
+
+    const normalizedTarget: QuotedMessageJumpTarget = {
+      ...target,
+      sessionId: targetSessionId
+    }
+    const resolved = findQuotedTargetInMessages(normalizedTarget)
+    if (resolved) {
+      pendingQuotedMessageJumpRef.current = null
+      scrollToResolvedMessage(resolved)
+      return
+    }
+
+    pendingQuotedMessageJumpRef.current = normalizedTarget
+    const targetTime = Number(normalizedTarget.createTime || 0)
+    if (!targetTime) return
+
+    const requestSeq = inSessionResultJumpRequestSeqRef.current + 1
+    inSessionResultJumpRequestSeqRef.current = requestSeq
+    setCurrentOffset(0)
+    setJumpStartTime(0)
+    setJumpEndTime(targetTime + 1)
+    suppressAutoLoadLaterRef.current = true
+    void loadMessagesRef.current?.(targetSessionId, 0, 0, targetTime + 1, false, {
+      forceInitialLimit: 120,
+      inSessionJumpRequestSeq: requestSeq
+    })
+  }, [currentSessionId, findQuotedTargetInMessages, scrollToResolvedMessage])
+
+  useEffect(() => {
+    const pending = pendingQuotedMessageJumpRef.current
+    if (!pending) return
+    const resolved = findQuotedTargetInMessages(pending)
+    if (!resolved) return
+    pendingQuotedMessageJumpRef.current = null
+    scrollToResolvedMessage(resolved, 'auto')
+  }, [messages, findQuotedTargetInMessages, scrollToResolvedMessage])
 
   const handleInSessionResultJump = useCallback((msg: Message) => {
     const targetTime = Number(msg.createTime || 0)
@@ -4787,6 +5413,10 @@ function ChatPage(props: ChatPageProps) {
         window.clearTimeout(messageListScrollTimeoutRef.current)
         messageListScrollTimeoutRef.current = null
       }
+      if (messageMediaPreloadTimerRef.current !== null) {
+        window.clearTimeout(messageMediaPreloadTimerRef.current)
+        messageMediaPreloadTimerRef.current = null
+      }
       isMessageListScrollingRef.current = false
       contactUpdateQueueRef.current.clear()
       pendingSessionContactEnrichRef.current.clear()
@@ -4857,36 +5487,54 @@ function ChatPage(props: ChatPageProps) {
   }, [currentSessionId])
 
   useEffect(() => {
-    if (!currentSessionId || messages.length === 0) return
-    const preloadEdgeCount = 40
-    const maxPreload = 30
-    const head = messages.slice(0, preloadEdgeCount)
-    const tail = messages.slice(-preloadEdgeCount)
-    const candidates = [...head, ...tail]
-    const queued = preloadImageKeysRef.current
-    const seen = new Set<string>()
-    const payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number }> = []
-    for (const msg of candidates) {
-      if (payloads.length >= maxPreload) break
-      if (msg.localType !== 3) continue
-      const cacheKey = msg.imageMd5 || msg.imageDatName || `local:${msg.localId}`
-      if (!msg.imageMd5 && !msg.imageDatName) continue
-      if (imageDataUrlCache.has(cacheKey)) continue
-      const taskKey = `${currentSessionId}|${cacheKey}`
-      if (queued.has(taskKey) || seen.has(taskKey)) continue
-      queued.add(taskKey)
-      seen.add(taskKey)
-      payloads.push({
-        sessionId: currentSessionId,
-        imageMd5: msg.imageMd5 || undefined,
-        imageDatName: msg.imageDatName,
-        createTime: msg.createTime
-      })
+    if (messageMediaPreloadTimerRef.current !== null) {
+      window.clearTimeout(messageMediaPreloadTimerRef.current)
+      messageMediaPreloadTimerRef.current = null
     }
-    if (payloads.length > 0) {
-      window.electronAPI.image.preload(payloads, {
-        allowCacheIndex: false
-      }).catch(() => { })
+    if (!currentSessionId || messages.length === 0) return
+
+    messageMediaPreloadTimerRef.current = window.setTimeout(() => {
+      messageMediaPreloadTimerRef.current = null
+      scheduleWhenIdle(() => {
+        if (isMessageListScrollingRef.current) return
+        const preloadEdgeCount = 20
+        const maxPreload = 12
+        const head = messages.slice(0, preloadEdgeCount)
+        const tail = messages.slice(-preloadEdgeCount)
+        const candidates = [...head, ...tail]
+        const queued = preloadImageKeysRef.current
+        const seen = new Set<string>()
+        const payloads: Array<{ sessionId?: string; imageMd5?: string; imageDatName?: string; createTime?: number }> = []
+        for (const msg of candidates) {
+          if (payloads.length >= maxPreload) break
+          if (msg.localType !== 3) continue
+          const cacheKey = msg.imageMd5 || msg.imageDatName || `local:${msg.localId}`
+          if (!msg.imageMd5 && !msg.imageDatName) continue
+          if (imageDataUrlCache.has(cacheKey)) continue
+          const taskKey = `${currentSessionId}|${cacheKey}`
+          if (queued.has(taskKey) || seen.has(taskKey)) continue
+          queued.add(taskKey)
+          seen.add(taskKey)
+          payloads.push({
+            sessionId: currentSessionId,
+            imageMd5: msg.imageMd5 || undefined,
+            imageDatName: msg.imageDatName,
+            createTime: msg.createTime
+          })
+        }
+        if (payloads.length > 0) {
+          window.electronAPI.image.preload(payloads, {
+            allowCacheIndex: false
+          }).catch(() => { })
+        }
+      }, { timeout: 1400, fallbackDelay: 120 })
+    }, 120)
+
+    return () => {
+      if (messageMediaPreloadTimerRef.current !== null) {
+        window.clearTimeout(messageMediaPreloadTimerRef.current)
+        messageMediaPreloadTimerRef.current = null
+      }
     }
   }, [currentSessionId, messages])
 
@@ -4983,7 +5631,7 @@ function ChatPage(props: ChatPageProps) {
       void loadMessages(currentSessionId, 0, 0, 0, false, {
         preferLatestPath: true,
         deferGroupSenderWarmup: true,
-        forceInitialLimit: 30
+        forceInitialLimit: MESSAGE_HISTORY_INITIAL_LIMIT
       })
     }
   }, [currentSessionId, isConnected, messages.length, isLoadingMessages, isLoadingMore, noMessageTable])
@@ -5042,6 +5690,20 @@ function ChatPage(props: ChatPageProps) {
       document.removeEventListener('mousedown', handleGlobalPointerDown)
     }
   }, [showJumpPopover])
+
+  useEffect(() => {
+    if (!showGroupSummaryDatePopover) return
+    const handleGlobalPointerDown = (event: MouseEvent) => {
+      const target = event.target as Node | null
+      if (!target) return
+      if (groupSummaryDateWrapRef.current?.contains(target)) return
+      setShowGroupSummaryDatePopover(false)
+    }
+    document.addEventListener('mousedown', handleGlobalPointerDown)
+    return () => {
+      document.removeEventListener('mousedown', handleGlobalPointerDown)
+    }
+  }, [showGroupSummaryDatePopover])
 
   useEffect(() => {
     if (!showJumpPopover) return
@@ -5116,6 +5778,18 @@ function ChatPage(props: ChatPageProps) {
       return []
     }
 
+    const getSessionSortTime = (session: Pick<ChatSession, 'sortTimestamp' | 'lastTimestamp'>) =>
+      Number(session.sortTimestamp || session.lastTimestamp || 0)
+    const insertSessionByTimeDesc = (list: ChatSession[], entry: ChatSession) => {
+      const entryTime = getSessionSortTime(entry)
+      const insertIndex = list.findIndex(s => getSessionSortTime(s) < entryTime)
+      if (insertIndex === -1) {
+        list.push(entry)
+      } else {
+        list.splice(insertIndex, 0, entry)
+      }
+    }
+
     const officialSessions = sessions.filter(s => s.username.startsWith('gh_'))
 
     // 检查是否有折叠的群聊
@@ -5130,11 +5804,12 @@ function ChatPage(props: ChatPageProps) {
 
     const latestOfficial = officialSessions.reduce<ChatSession | null>((latest, current) => {
       if (!latest) return current
-      const latestTime = latest.sortTimestamp || latest.lastTimestamp
-      const currentTime = current.sortTimestamp || current.lastTimestamp
+      const latestTime = getSessionSortTime(latest)
+      const currentTime = getSessionSortTime(current)
       return currentTime > latestTime ? current : latest
     }, null)
     const officialUnreadCount = officialSessions.reduce((sum, s) => sum + (s.unreadCount || 0), 0)
+    const officialLatestTime = latestOfficial ? getSessionSortTime(latestOfficial) : 0
 
     const bizEntry: ChatSession = {
       username: OFFICIAL_ACCOUNTS_VIRTUAL_ID,
@@ -5143,8 +5818,8 @@ function ChatPage(props: ChatPageProps) {
         ? `${latestOfficial.displayName || latestOfficial.username}: ${latestOfficial.summary || '查看公众号历史消息'}`
         : '查看公众号历史消息',
       type: 0,
-      sortTimestamp: 9999999999,  // 放到最前面？  目前还没有严格的对时间进行排序，  后面可以改一下
-      lastTimestamp: latestOfficial?.lastTimestamp || latestOfficial?.sortTimestamp || 0,
+      sortTimestamp: officialLatestTime,
+      lastTimestamp: officialLatestTime,
       lastMsgType: latestOfficial?.lastMsgType || 0,
       unreadCount: officialUnreadCount,
       isMuted: false,
@@ -5152,7 +5827,7 @@ function ChatPage(props: ChatPageProps) {
     }
 
     if (!visible.some(s => s.username === OFFICIAL_ACCOUNTS_VIRTUAL_ID)) {
-      visible.unshift(bizEntry)
+      insertSessionByTimeDesc(visible, bizEntry)
     }
 
     if (hasFoldedGroups && !visible.some(s => s.username.toLowerCase().includes('placeholder_foldgroup'))) {
@@ -5176,17 +5851,7 @@ function ChatPage(props: ChatPageProps) {
         isFolded: false
       }
 
-      // 按时间戳插入到正确位置
-      const foldTime = foldEntry.sortTimestamp || foldEntry.lastTimestamp
-      const insertIndex = visible.findIndex(s => {
-        const sTime = s.sortTimestamp || s.lastTimestamp
-        return sTime < foldTime
-      })
-      if (insertIndex === -1) {
-        visible.push(foldEntry)
-      } else {
-        visible.splice(insertIndex, 0, foldEntry)
-      }
+      insertSessionByTimeDesc(visible, foldEntry)
     }
 
     if (!searchKeyword.trim()) {
@@ -5377,6 +6042,50 @@ function ChatPage(props: ChatPageProps) {
     })
   }, [currentSession, isCurrentSessionPrivateSnsSupported])
 
+  const showSessionInsightHint = useCallback((hint: { success: boolean; message: string }) => {
+    if (sessionInsightHintTimerRef.current !== null) {
+      window.clearTimeout(sessionInsightHintTimerRef.current)
+      sessionInsightHintTimerRef.current = null
+    }
+    setSessionInsightHint(hint)
+    sessionInsightHintTimerRef.current = window.setTimeout(() => {
+      setSessionInsightHint(null)
+      sessionInsightHintTimerRef.current = null
+    }, 5000)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (sessionInsightHintTimerRef.current !== null) {
+        window.clearTimeout(sessionInsightHintTimerRef.current)
+        sessionInsightHintTimerRef.current = null
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    let canceled = false
+
+    const loadGroupSummaryConfig = () => {
+      void configService.getAiGroupSummaryEnabled()
+        .then((enabled) => {
+          if (!canceled) setAiGroupSummaryEnabled(enabled)
+        })
+        .catch((error) => {
+          console.warn('加载群聊总结配置失败:', error)
+          if (!canceled) setAiGroupSummaryEnabled(false)
+        })
+    }
+
+    loadGroupSummaryConfig()
+    const handleFocus = () => loadGroupSummaryConfig()
+    window.addEventListener('focus', handleFocus)
+    return () => {
+      canceled = true
+      window.removeEventListener('focus', handleFocus)
+    }
+  }, [])
+
   useEffect(() => {
     if (!standaloneSessionWindow) return
     setStandaloneInitialLoadRequested(false)
@@ -5438,7 +6147,7 @@ function ChatPage(props: ChatPageProps) {
     selectSessionById
   ])
 
-  // 监听 URL 参数中的会话/锚点（通知跳转 + 足迹锚点定位）
+  // 监听 URL 参数中的会话/锚点（通知跳转 + 足迹/深度解析锚点定位）
   useEffect(() => {
     if (standaloneSessionWindow) return // standalone模式由上面的useEffect处理
     const params = new URLSearchParams(location.search)
@@ -5453,8 +6162,41 @@ function ChatPage(props: ChatPageProps) {
       && jumpLocalId > 0
       && Number.isFinite(jumpCreateTime)
       && jumpCreateTime > 0
+    const hasMessageAnalysisAnchor = jumpSource === 'messageAnalysis'
+      && Number.isFinite(jumpLocalId)
+      && jumpLocalId > 0
+      && Number.isFinite(jumpCreateTime)
+      && jumpCreateTime > 0
 
     if (hasFootprintAnchor) {
+      pendingFootprintJumpRef.current = {
+        sessionId: urlSessionId,
+        localId: jumpLocalId,
+        createTime: jumpCreateTime
+      }
+      if (currentSessionId !== urlSessionId) {
+        selectSessionById(urlSessionId)
+        return
+      }
+      const messageStub: Message = {
+        messageKey: `footprint:${urlSessionId}:${jumpCreateTime}:${jumpLocalId}`,
+        localId: jumpLocalId,
+        serverId: 0,
+        localType: 0,
+        createTime: jumpCreateTime,
+        sortSeq: jumpCreateTime,
+        isSend: null,
+        senderUsername: null,
+        parsedContent: '',
+        rawContent: ''
+      }
+      handleInSessionResultJump(messageStub)
+      pendingFootprintJumpRef.current = null
+      navigate('/chat', { replace: true })
+      return
+    }
+
+    if (hasMessageAnalysisAnchor) {
       pendingFootprintJumpRef.current = {
         sessionId: urlSessionId,
         localId: jumpLocalId,
@@ -5684,6 +6426,41 @@ function ChatPage(props: ChatPageProps) {
       requestId
     })
   }, [currentSession, currentSessionId, inProgressExportSessionIds, isPreparingExportDialog])
+
+  const handleTriggerSessionInsight = useCallback(async () => {
+    const session = currentSession
+    const sessionId = String(session?.username || currentSessionId || '').trim()
+    if (!sessionId || isTriggeringSessionInsight) return
+
+    setIsTriggeringSessionInsight(true)
+    if (sessionInsightHintTimerRef.current !== null) {
+      window.clearTimeout(sessionInsightHintTimerRef.current)
+      sessionInsightHintTimerRef.current = null
+    }
+    setSessionInsightHint({ success: true, message: '正在生成当前聊天的 AI 见解...' })
+    try {
+      const result = await window.electronAPI.insight.triggerSessionInsight({
+        sessionId,
+        displayName: session?.displayName || sessionId,
+        avatarUrl: session?.avatarUrl
+      })
+      if (currentSessionRef.current !== sessionId) return
+      showSessionInsightHint({
+        success: result.success,
+        message: result.message || (result.success ? 'AI 见解已生成' : 'AI 见解生成失败')
+      })
+    } catch (error) {
+      if (currentSessionRef.current !== sessionId) return
+      showSessionInsightHint({
+        success: false,
+        message: `触发失败：${(error as Error).message || String(error)}`
+      })
+    } finally {
+      if (currentSessionRef.current === sessionId) {
+        setIsTriggeringSessionInsight(false)
+      }
+    }
+  }, [currentSession, currentSessionId, isTriggeringSessionInsight, showSessionInsightHint])
 
   const handleGroupAnalytics = useCallback(() => {
     if (!currentSessionId || !isGroupChatSession(currentSessionId)) return
@@ -6448,13 +7225,17 @@ function ChatPage(props: ChatPageProps) {
           myAvatarUrl={myAvatarUrl}
           myWxid={myWxid}
           isGroupChat={isCurrentSessionGroup}
+          quoteLayout={quoteLayout}
           autoTranscribeVoiceEnabled={autoTranscribeVoiceEnabled}
           onRequireModelDownload={handleRequireModelDownload}
           onContextMenu={handleContextMenu}
+          onJumpToQuotedMessage={handleJumpToQuotedMessage}
           isSelectionMode={isSelectionMode}
           messageKey={messageKey}
           isSelected={selectedMessages.has(messageKey)}
           onToggleSelection={handleToggleSelection}
+          aiMessageInsightEnabled={aiMessageInsightEnabled}
+          aiMessageInsightContextCount={aiMessageInsightContextCount}
         />
       </div>
     )
@@ -6467,12 +7248,16 @@ function ChatPage(props: ChatPageProps) {
     myAvatarUrl,
     myWxid,
     isCurrentSessionGroup,
+    quoteLayout,
     autoTranscribeVoiceEnabled,
     handleRequireModelDownload,
     handleContextMenu,
+    handleJumpToQuotedMessage,
     isSelectionMode,
     selectedMessages,
-    handleToggleSelection
+    handleToggleSelection,
+    aiMessageInsightEnabled,
+    aiMessageInsightContextCount
   ])
 
   return (
@@ -6578,6 +7363,15 @@ function ChatPage(props: ChatPageProps) {
               </div>
               <button className="icon-btn refresh-btn" onClick={handleRefresh} disabled={isLoadingSessions || isRefreshingSessions}>
                 <RefreshCw size={16} className={(isLoadingSessions || isRefreshingSessions) ? 'spin' : ''} />
+              </button>
+              <button
+                className="icon-btn refresh-btn mark-read-btn"
+                onClick={handleMarkAllSessionsRead}
+                disabled={isMarkingAllSessionsRead || isLoadingSessions || isRefreshingSessions}
+                title="一键已读"
+                aria-label="一键已读"
+              >
+                {isMarkingAllSessionsRead ? <Loader2 size={16} className="spin" /> : <CheckSquare size={16} />}
               </button>
             </div>
           </div>
@@ -6792,160 +7586,86 @@ function ChatPage(props: ChatPageProps) {
             <BizMessageArea account={selectedBizAccount} />
         ) : currentSession ? (
             <>
-              <div className="message-header">
-              <Avatar
-                src={currentSession.avatarUrl}
-                name={currentSession.displayName || currentSession.username}
-                size={40}
-                className={isCurrentSessionGroup ? 'group session-avatar' : 'session-avatar'}
+              <ChatHeader
+                session={currentSession}
+                isGroupChat={isCurrentSessionGroup}
+                standaloneSessionWindow={standaloneSessionWindow}
+                showGroupMembersPanel={showGroupMembersPanel}
+                showGroupSummaryPanel={showGroupSummaryPanel}
+                showJumpPopover={showJumpPopover}
+                showInSessionSearch={showInSessionSearch}
+                showDetailPanel={showDetailPanel}
+                aiGroupSummaryEnabled={aiGroupSummaryEnabled}
+                shouldHideStandaloneDetailButton={shouldHideStandaloneDetailButton}
+                isPrivateSnsSupported={isCurrentSessionPrivateSnsSupported}
+                isExportActionBusy={isExportActionBusy}
+                isCurrentSessionExporting={isCurrentSessionExporting}
+                isPreparingExportDialog={isPreparingExportDialog}
+                isBatchTranscribing={isBatchTranscribing}
+                runningBatchVoiceTaskType={runningBatchVoiceTaskType}
+                isBatchDecrypting={isBatchDecrypting}
+                isTriggeringSessionInsight={isTriggeringSessionInsight}
+                isRefreshingMessages={isRefreshingMessages}
+                isLoadingMessages={isLoadingMessages}
+                currentSessionId={currentSessionId}
+                jumpCalendarWrapRef={jumpCalendarWrapRef}
+                onTriggerSessionInsight={handleTriggerSessionInsight}
+                onToggleGroupSummaryPanel={toggleGroupSummaryPanel}
+                onGroupAnalytics={handleGroupAnalytics}
+                onToggleGroupMembersPanel={toggleGroupMembersPanel}
+                onExportCurrentSession={handleExportCurrentSession}
+                onOpenSnsTimeline={openCurrentSessionSnsTimeline}
+                onBatchTranscribe={handleBatchTranscribe}
+                onBatchDecrypt={handleBatchDecrypt}
+                onToggleJumpPopover={handleToggleJumpPopover}
+                onToggleInSessionSearch={handleToggleInSessionSearch}
+                onRefreshMessages={handleRefreshMessages}
+                onToggleDetailPanel={toggleDetailPanel}
               />
-              <div className="header-info">
-                <h3>{currentSession.displayName || currentSession.username}</h3>
-                {isCurrentSessionGroup && (
-                  <div className="header-subtitle">群聊</div>
-                )}
-              </div>
-              <div className="header-actions">
-                {!standaloneSessionWindow && isCurrentSessionGroup && (
-                  <button
-                    className="icon-btn group-analytics-btn"
-                    onClick={handleGroupAnalytics}
-                    title="群聊分析"
-                  >
-                    <BarChart3 size={18} />
-                  </button>
-                )}
-                {isCurrentSessionGroup && (
-                  <button
-                    className={`icon-btn group-members-btn ${showGroupMembersPanel ? 'active' : ''}`}
-                    onClick={toggleGroupMembersPanel}
-                    title="群成员"
-                  >
-                    <Users size={18} />
-                  </button>
-                )}
-                {!standaloneSessionWindow && (
-                  <button
-                    className={`icon-btn export-session-btn${isExportActionBusy ? ' exporting' : ''}`}
-                    onClick={handleExportCurrentSession}
-                    disabled={!currentSessionId || isExportActionBusy}
-                    title={isCurrentSessionExporting ? '导出中' : isPreparingExportDialog ? '正在准备导出模块' : '导出当前会话'}
-                  >
-                    {isExportActionBusy ? (
-                      <Loader2 size={18} className="spin" />
-                    ) : (
-                      <Download size={18} />
-                    )}
-                  </button>
-                )}
-                {!standaloneSessionWindow && isCurrentSessionPrivateSnsSupported && (
-                  <button
-                    className="icon-btn chat-sns-timeline-btn"
-                    onClick={openCurrentSessionSnsTimeline}
-                    disabled={!currentSessionId}
-                    title="查看对方朋友圈"
-                  >
-                    <Aperture size={18} />
-                  </button>
-                )}
-                {!standaloneSessionWindow && (
-                  <button
-                    className={`icon-btn batch-transcribe-btn${isBatchTranscribing ? ' transcribing' : ''}`}
-                    onClick={handleBatchTranscribe}
-                    disabled={!currentSessionId}
-                    title={isBatchTranscribing
-                      ? `${runningBatchVoiceTaskType === 'decrypt' ? '批量语音解密' : '批量转写'}中，可在导出页任务中心查看进度`
-                      : '批量语音处理（解密/转文字）'}
-                  >
-                    {isBatchTranscribing ? (
-                      <Loader2 size={18} className="spin" />
-                    ) : (
-                      <Mic size={18} />
-                    )}
-                  </button>
-                )}
-                {!standaloneSessionWindow && (
-                  <button
-                    className={`icon-btn batch-decrypt-btn${isBatchDecrypting ? ' transcribing' : ''}`}
-                    onClick={handleBatchDecrypt}
-                    disabled={!currentSessionId}
-                    title={isBatchDecrypting
-                      ? '批量解密中，可在导出页任务中心查看进度'
-                      : '批量解密图片'}
-                  >
-                    {isBatchDecrypting ? (
-                      <Loader2 size={18} className="spin" />
-                    ) : (
-                      <ImageIcon size={18} />
-                    )}
-                  </button>
-                )}
-                <div className="jump-calendar-anchor" ref={jumpCalendarWrapRef}>
-                  <button
-                    className={`icon-btn jump-to-time-btn ${showJumpPopover ? 'active' : ''}`}
-                    onClick={handleToggleJumpPopover}
-                    title="跳转到指定时间"
-                  >
-                    <Calendar size={18} />
-                  </button>
-                </div>
-                {showJumpPopover && createPortal(
-                  <div
-                    ref={jumpPopoverPortalRef}
-                    style={{
-                      position: 'fixed',
-                      top: jumpPopoverPosition.top,
-                      left: jumpPopoverPosition.left,
-                      zIndex: 3600
-                    }}
-                  >
-                    <JumpToDatePopover
-                      isOpen={showJumpPopover}
-                      currentDate={jumpPopoverDate}
-                      onClose={() => setShowJumpPopover(false)}
-                      onSelect={handleJumpDateSelect}
-                      messageDates={messageDates}
-                      hasLoadedMessageDates={hasLoadedMessageDates}
-                      messageDateCounts={messageDateCounts}
-                      loadingDates={loadingDates}
-                      loadingDateCounts={loadingDateCounts}
-                      style={{ position: 'static', top: 'auto', right: 'auto' }}
-                    />
-                  </div>,
-                  document.body
-                )}
-                <button
-                  className={`icon-btn in-session-search-btn ${showInSessionSearch ? 'active' : ''}`}
-                  onClick={handleToggleInSessionSearch}
-                  disabled={!currentSessionId}
-                  title="搜索会话消息"
+              {showJumpPopover && createPortal(
+                <div
+                  ref={jumpPopoverPortalRef}
+                  style={{
+                    position: 'fixed',
+                    top: jumpPopoverPosition.top,
+                    left: jumpPopoverPosition.left,
+                    zIndex: 3600
+                  }}
                 >
-                  <Search size={18} />
-                </button>
-                <button
-                  className="icon-btn refresh-messages-btn"
-                  onClick={handleRefreshMessages}
-                  disabled={isRefreshingMessages || isLoadingMessages}
-                  title="刷新消息"
-                >
-                  <RefreshCw size={18} className={isRefreshingMessages ? 'spin' : ''} />
-                </button>
-                {!shouldHideStandaloneDetailButton && (
-                  <button
-                    className={`icon-btn detail-btn ${showDetailPanel ? 'active' : ''}`}
-                    onClick={toggleDetailPanel}
-                    title="会话详情"
-                  >
-                    <Info size={18} />
-                  </button>
-                )}
-              </div>
-            </div>
+                  <JumpToDatePopover
+                    isOpen={showJumpPopover}
+                    currentDate={jumpPopoverDate}
+                    onClose={() => setShowJumpPopover(false)}
+                    onSelect={handleJumpDateSelect}
+                    messageDates={messageDates}
+                    hasLoadedMessageDates={hasLoadedMessageDates}
+                    messageDateCounts={messageDateCounts}
+                    loadingDates={loadingDates}
+                    loadingDateCounts={loadingDateCounts}
+                    style={{ position: 'static', top: 'auto', right: 'auto' }}
+                  />
+                </div>,
+                document.body
+              )}
 
             {isPreparingExportDialog && exportPrepareHint && (
               <div className="export-prepare-hint" role="status" aria-live="polite">
                 <Loader2 size={14} className="spin" />
                 <span>{exportPrepareHint}</span>
+              </div>
+            )}
+
+            {sessionInsightHint && (
+              <div className={`session-insight-hint ${sessionInsightHint.success ? 'success' : 'error'}`} role="status" aria-live="polite">
+                {isTriggeringSessionInsight ? <Loader2 size={14} className="spin" /> : <Sparkles size={14} />}
+                <span>{sessionInsightHint.message}</span>
+              </div>
+            )}
+
+            {groupSummaryHint && (
+              <div className={`session-insight-hint ${groupSummaryHint.success ? 'success' : 'error'}`} role="status" aria-live="polite">
+                {isTriggeringGroupSummary ? <Loader2 size={14} className="spin" /> : <Newspaper size={14} />}
+                <span>{groupSummaryHint.message}</span>
               </div>
             )}
 
@@ -7074,7 +7794,7 @@ function ChatPage(props: ChatPageProps) {
                     className="message-virtuoso"
                     customScrollParent={messageListScrollParent ?? undefined}
                     data={messages}
-                    overscan={220}
+                    overscan={MESSAGE_VIRTUAL_OVERSCAN_PX}
                     followOutput={(atBottom) => (
                       prependingHistoryRef.current
                         ? false
@@ -7186,6 +7906,138 @@ function ChatPage(props: ChatPageProps) {
                       ))}
                     </div>
                   )}
+                </div>
+              )}
+
+              {showGroupSummaryPanel && isCurrentSessionGroup && (
+                <div className="detail-panel group-summary-panel">
+                  <div className="detail-header">
+                    <div className="detail-title-wrap">
+                      <h4>AI 群聊总结</h4>
+                      <span className="detail-title-sub">{currentSession?.displayName || currentSessionId}</span>
+                    </div>
+                    <button className="close-btn" onClick={() => setShowGroupSummaryPanel(false)}>
+                      <X size={16} />
+                    </button>
+                  </div>
+
+                  <div className="group-summary-controls">
+                    <div className="group-summary-date-row">
+                      <label>日期</label>
+                      <div className="group-summary-date-picker" ref={groupSummaryDateWrapRef}>
+                        <button
+                          type="button"
+                          className={`group-summary-date-trigger ${showGroupSummaryDatePopover ? 'open' : ''}`}
+                          onClick={() => setShowGroupSummaryDatePopover((open) => !open)}
+                        >
+                          <span>{groupSummaryDateFilter}</span>
+                          <Calendar size={14} />
+                        </button>
+                        <JumpToDatePopover
+                          isOpen={showGroupSummaryDatePopover}
+                          onClose={() => setShowGroupSummaryDatePopover(false)}
+                          currentDate={new Date(`${groupSummaryDateFilter || formatDateInputLocal(new Date())}T00:00:00`)}
+                          onSelect={(date) => setGroupSummaryDateFilter(formatDateInputLocal(date))}
+                          className="group-summary-calendar-popover"
+                          maxDate={new Date()}
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        className="group-summary-icon-btn"
+                        onClick={() => void loadGroupSummaryRecords(currentSessionId || undefined)}
+                        title="刷新总结"
+                      >
+                        <RefreshCw size={14} className={groupSummaryLoading ? 'spin' : ''} />
+                      </button>
+                    </div>
+
+                    {isGroupSummaryToday ? (
+                      <div className="group-summary-range-tabs">
+                        {([1, 2, 4, 8, 12, 24] as const).map((hours) => (
+                          <button
+                            key={hours}
+                            type="button"
+                            className={groupSummaryRangeMode === hours ? 'active' : ''}
+                            onClick={() => setGroupSummaryRangeMode(hours)}
+                          >
+                            {hours}h
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="group-summary-rule-hint">将按设置里的自动总结间隔切分选中日期的完整聊天记录。</div>
+                    )}
+
+                    <button
+                      type="button"
+                      className="group-summary-generate-btn"
+                      onClick={() => void triggerManualGroupSummary()}
+                      disabled={isTriggeringGroupSummary}
+                    >
+                      {isTriggeringGroupSummary ? <Loader2 size={14} className="spin" /> : <Sparkles size={14} />}
+                      <span>生成总结</span>
+                    </button>
+                    <div className="group-summary-rule-hint">
+                      {isGroupSummaryToday ? '少于 5 条可总结消息会自动跳过。' : '每个切片少于 5 条可总结消息会自动跳过。'}
+                    </div>
+                  </div>
+
+                  <div className="group-summary-list">
+                    {groupSummaryLoading ? (
+                      <div className="detail-loading">
+                        <Loader2 size={20} className="spin" />
+                        <span>加载总结中...</span>
+                      </div>
+                    ) : groupSummaryError ? (
+                      <div className="detail-empty">{groupSummaryError}</div>
+                    ) : groupSummaryRecords.length === 0 ? (
+                      <div className="detail-empty">当前日期暂无群聊总结</div>
+                    ) : (
+                      <>
+                        <div className="group-summary-count">共 {groupSummaryTotal} 条总结</div>
+                        {groupSummaryRecords.map((record) => (
+                          <div key={record.id} className="group-summary-record">
+                            <div className="group-summary-record-head">
+                              <div>
+                                <span className="group-summary-period">{formatSummaryPeriod(record.periodStart, record.periodEnd)}</span>
+                                <span className="group-summary-meta">
+                                  {record.triggerType === 'manual' ? '手动' : '自动'} · {record.readableMessageCount} 条消息
+                                </span>
+                              </div>
+                              <button
+                                type="button"
+                                className="group-summary-code-btn"
+                                onClick={() => void openGroupSummaryLog(record.id)}
+                                title="查看完整日志"
+                              >
+                                <Code2 size={14} />
+                              </button>
+                            </div>
+                            <div className="group-summary-topic-list">
+                              {record.topics.map((topic, topicIndex) => (
+                                <div key={`${record.id}-${topicIndex}`} className="group-summary-topic">
+                                  <h5>{topic.title}</h5>
+                                  <div className="group-summary-topic-row">
+                                    <span>参与者</span>
+                                    <p>{topic.participants.length > 0 ? topic.participants.join('、') : '未明确'}</p>
+                                  </div>
+                                  <div className="group-summary-topic-row">
+                                    <span>关键/矛盾点</span>
+                                    <p>{topic.keyPoints.length > 0 ? topic.keyPoints.join('；') : '无'}</p>
+                                  </div>
+                                  <div className="group-summary-topic-row">
+                                    <span>结论</span>
+                                    <p>{topic.conclusion || '暂无明确结论'}</p>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </>
+                    )}
+                  </div>
                 </div>
               )}
 
@@ -7845,6 +8697,79 @@ function ChatPage(props: ChatPageProps) {
         document.body
       )}
 
+      {groupSummaryLogRecord && createPortal(
+        <div className="message-info-overlay" onClick={() => setGroupSummaryLogRecord(null)}>
+          <div className="message-info-modal group-summary-log-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="detail-header">
+              <h4>群聊总结日志</h4>
+              <button className="close-btn" onClick={() => setGroupSummaryLogRecord(null)}>
+                <X size={16} />
+              </button>
+            </div>
+            <div className="detail-content">
+              <div className="detail-section">
+                <div className="detail-item">
+                  <span className="label">群聊</span>
+                  <span className="value">{groupSummaryLogRecord.displayName}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">时段</span>
+                  <span className="value">{formatSummaryPeriod(groupSummaryLogRecord.periodStart, groupSummaryLogRecord.periodEnd)}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">触发</span>
+                  <span className="value">{groupSummaryLogRecord.triggerType === 'manual' ? '手动' : '自动'}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">模型</span>
+                  <span className="value">{groupSummaryLogRecord.log.model}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">消息数</span>
+                  <span className="value">{groupSummaryLogRecord.log.readableMessageCount} / {groupSummaryLogRecord.log.messageCount}</span>
+                </div>
+                <div className="detail-item">
+                  <span className="label">JSON Mode</span>
+                  <span className="value">
+                    {groupSummaryLogRecord.log.responseFormatJson ? '启用' : '未启用'}
+                    {groupSummaryLogRecord.log.responseFormatFallback ? `，已降级：${groupSummaryLogRecord.log.responseFormatFallbackReason || '未知原因'}` : ''}
+                  </span>
+                </div>
+              </div>
+              <div className="detail-section">
+                <div className="section-title">
+                  <Code2 size={14} />
+                  <span>系统提示词</span>
+                </div>
+                <pre className="group-summary-log-pre">{groupSummaryLogRecord.log.systemPrompt}</pre>
+              </div>
+              <div className="detail-section">
+                <div className="section-title">
+                  <Code2 size={14} />
+                  <span>用户提示词与完整记录</span>
+                </div>
+                <pre className="group-summary-log-pre">{groupSummaryLogRecord.log.userPrompt}</pre>
+              </div>
+              <div className="detail-section">
+                <div className="section-title">
+                  <Code2 size={14} />
+                  <span>模型输出原文</span>
+                </div>
+                <pre className="group-summary-log-pre">{groupSummaryLogRecord.log.rawOutput}</pre>
+              </div>
+              <div className="detail-section">
+                <div className="section-title">
+                  <Newspaper size={14} />
+                  <span>最终总结</span>
+                </div>
+                <pre className="group-summary-log-pre">{groupSummaryLogRecord.log.finalSummary}</pre>
+              </div>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+
       {/* 修改消息弹窗 */}
       {editingMessage && createPortal(
         <div className="modal-overlay">
@@ -8018,10 +8943,26 @@ const globalVoiceManager = {
 }
 
 // 前端表情包缓存
-const emojiDataUrlCache = new Map<string, string>()
-const imageDataUrlCache = new Map<string, string>()
-const voiceDataUrlCache = new Map<string, string>()
-const voiceTranscriptCache = new Map<string, string>()
+const emojiDataUrlCache = createBoundedCache<string>({
+  maxEntries: EMOJI_CACHE_MAX_ENTRIES,
+  maxBytes: EMOJI_CACHE_MAX_BYTES,
+  estimate: estimateStringBytes
+})
+const imageDataUrlCache = createBoundedCache<string>({
+  maxEntries: IMAGE_CACHE_MAX_ENTRIES,
+  maxBytes: IMAGE_CACHE_MAX_BYTES,
+  estimate: estimateStringBytes
+})
+const voiceDataUrlCache = createBoundedCache<string>({
+  maxEntries: VOICE_CACHE_MAX_ENTRIES,
+  maxBytes: VOICE_CACHE_MAX_BYTES,
+  estimate: estimateStringBytes
+})
+const voiceTranscriptCache = createBoundedCache<string>({
+  maxEntries: VOICE_TRANSCRIPT_CACHE_MAX_ENTRIES,
+  maxBytes: VOICE_TRANSCRIPT_CACHE_MAX_BYTES,
+  estimate: estimateStringBytes
+})
 type SharedImageDecryptResult = {
   success: boolean
   localPath?: string
@@ -8030,8 +8971,36 @@ type SharedImageDecryptResult = {
   failureKind?: 'not_found' | 'decrypt_failed'
 }
 const imageDecryptInFlight = new Map<string, Promise<SharedImageDecryptResult>>()
-const senderAvatarCache = new Map<string, { avatarUrl?: string; displayName?: string }>()
+const senderAvatarCache = createBoundedCache<{ avatarUrl?: string; displayName?: string }>({
+  maxEntries: SENDER_AVATAR_CACHE_MAX_ENTRIES
+})
 const senderAvatarLoading = new Map<string, Promise<{ avatarUrl?: string; displayName?: string } | null>>()
+
+type MessageInsightAnalysis = {
+  explicitText: string
+  emotion: string
+  intent: string
+  topic: string
+}
+
+type MessageInsightState = {
+  status: 'idle' | 'loading' | 'success' | 'error'
+  data?: MessageInsightAnalysis
+  error?: string
+  cached?: boolean
+  recordId?: string
+}
+
+const messageInsightMemoryCache = new Map<string, MessageInsightState>()
+
+function buildMessageInsightCacheKey(sessionId: string, message: Message, messageKey: string): string {
+  return [
+    String(sessionId || '').trim(),
+    Math.floor(Number(message.localId || 0)),
+    Math.floor(Number(message.createTime || 0)),
+    messageKey
+  ].join(':')
+}
 
 function getSharedImageDecryptTask(
   key: string,
@@ -8084,10 +9053,194 @@ function QuotedEmoji({ cdnUrl, md5 }: { cdnUrl: string; md5?: string }) {
 
   if (error || (!loading && !localPath)) return <span className="quoted-type-label">[动画表情]</span>
   if (loading) return <span className="quoted-type-label">[动画表情]</span>
-  return <img src={localPath} alt="动画表情" className="quoted-emoji-image" />
+  return <img src={localPath} alt="动画表情" className="quoted-emoji-image" loading="lazy" decoding="async" />
 }
 
 // 消息气泡组件
+function MessageInsightControl({
+  message,
+  messageKey,
+  session,
+  displayName,
+  avatarUrl,
+  senderName,
+  targetText,
+  contextCount,
+  compact
+}: {
+  message: Message
+  messageKey: string
+  session: ChatSession
+  displayName?: string
+  avatarUrl?: string
+  senderName?: string
+  targetText: string
+  contextCount: number
+  compact?: boolean
+}) {
+  const anchorRef = useRef<HTMLButtonElement | null>(null)
+  const cardRef = useRef<HTMLDivElement | null>(null)
+  const cacheKey = useMemo(() => buildMessageInsightCacheKey(session.username, message, messageKey), [message, messageKey, session.username])
+  const [open, setOpen] = useState(false)
+  const [state, setState] = useState<MessageInsightState>(() => messageInsightMemoryCache.get(cacheKey) || { status: 'idle' })
+  const [position, setPosition] = useState<{ top: number; left: number; placement: 'top' | 'bottom' }>({ top: 0, left: 0, placement: 'top' })
+
+  useEffect(() => {
+    setState(messageInsightMemoryCache.get(cacheKey) || { status: 'idle' })
+    setOpen(false)
+  }, [cacheKey])
+
+  const updatePosition = useCallback(() => {
+    const anchor = anchorRef.current
+    if (!anchor) return
+    const rect = anchor.getBoundingClientRect()
+    const cardWidth = cardRef.current?.offsetWidth || 320
+    const cardHeight = cardRef.current?.offsetHeight || 190
+    const gap = 10
+    const preferredTop = rect.top - cardHeight - gap
+    const placement: 'top' | 'bottom' = preferredTop < 8 ? 'bottom' : 'top'
+    const top = placement === 'top' ? preferredTop : rect.bottom + gap
+    const left = Math.min(Math.max(8, rect.left + 20), Math.max(8, window.innerWidth - cardWidth - 8))
+    setPosition({
+      top: Math.min(Math.max(8, top), Math.max(8, window.innerHeight - cardHeight - 8)),
+      left,
+      placement
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!open) return
+    updatePosition()
+    const handle = () => updatePosition()
+    window.addEventListener('resize', handle)
+    window.addEventListener('scroll', handle, true)
+    return () => {
+      window.removeEventListener('resize', handle)
+      window.removeEventListener('scroll', handle, true)
+    }
+  }, [open, updatePosition])
+
+  const requestInsight = useCallback(async (forceRefresh = false) => {
+    if (!forceRefresh) {
+      const cached = messageInsightMemoryCache.get(cacheKey)
+      if (cached?.status === 'success') {
+        setState(cached)
+        return
+      }
+    }
+    setState({ status: 'loading' })
+    try {
+      const result = await window.electronAPI.insight.generateMessageInsight({
+        sessionId: session.username,
+        displayName: displayName || session.displayName || session.username,
+        avatarUrl: avatarUrl || session.avatarUrl,
+        targetLocalId: message.localId,
+        targetCreateTime: message.createTime,
+        targetMessageKey: messageKey,
+        targetText,
+        targetSenderName: senderName || displayName || session.displayName || session.username,
+        contextCount,
+        forceRefresh
+      })
+      if (result.success && result.data) {
+        const nextState: MessageInsightState = {
+          status: 'success',
+          data: result.data,
+          cached: result.cached === true,
+          recordId: result.recordId
+        }
+        messageInsightMemoryCache.set(cacheKey, nextState)
+        setState(nextState)
+      } else {
+        setState({ status: 'error', error: result.message || '解析失败' })
+      }
+    } catch (error) {
+      setState({ status: 'error', error: (error as Error).message || '解析失败' })
+    }
+  }, [avatarUrl, cacheKey, contextCount, displayName, message.createTime, message.localId, messageKey, senderName, session.avatarUrl, session.displayName, session.username, targetText])
+
+  const handleOpen = useCallback((event: React.MouseEvent) => {
+    event.stopPropagation()
+    setOpen(true)
+    window.setTimeout(updatePosition, 0)
+    const cached = messageInsightMemoryCache.get(cacheKey)
+    if (cached?.status === 'success') {
+      setState(cached)
+      return
+    }
+    void requestInsight(false)
+  }, [cacheKey, requestInsight, updatePosition])
+
+  const card = open ? createPortal(
+    <>
+      <button className="message-insight-backdrop" type="button" aria-label="关闭深度解析" onClick={() => setOpen(false)} />
+      <div
+        ref={cardRef}
+        className={`message-insight-card open placement-${position.placement}`}
+        style={{ top: position.top, left: position.left }}
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="message-insight-card-header">
+          <Star size={14} />
+          <span>深度解析</span>
+          <button
+            type="button"
+            className="message-insight-refresh"
+            title="重新解析"
+            onClick={() => void requestInsight(true)}
+            disabled={state.status === 'loading'}
+          >
+            {state.status === 'loading' ? <Loader2 size={13} className="spin" /> : <RefreshCw size={13} />}
+          </button>
+        </div>
+        <div className="message-insight-card-body">
+          {state.status === 'loading' && (
+            <div className="message-insight-loading">
+              <Loader2 size={15} className="spin" />
+              <span>解析中...</span>
+            </div>
+          )}
+          {state.status === 'error' && (
+            <div className="message-insight-error">
+              <span>{state.error || '解析失败'}</span>
+              <button type="button" onClick={() => void requestInsight(true)}>重试</button>
+            </div>
+          )}
+          {state.status === 'success' && state.data && (
+            <>
+              <p className="message-insight-text">{state.data.explicitText}</p>
+              <div className="message-insight-divider" />
+              <div className="message-insight-tags">
+                <span className="message-insight-tag mood">情绪：{state.data.emotion}</span>
+                <span className="message-insight-tag intent">意图：{state.data.intent}</span>
+                <span className="message-insight-tag">话题：{state.data.topic}</span>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </>,
+    document.body
+  ) : null
+
+  return (
+    <>
+      <button
+        ref={anchorRef}
+        type="button"
+        className={`message-insight-trigger ${compact ? 'compact' : ''}`}
+        onClick={handleOpen}
+        title="深度解析"
+        aria-label="深度解析"
+      >
+        <Star size={12} />
+        {!compact && <span>深度解析</span>}
+      </button>
+      {card}
+    </>
+  )
+}
+
 function MessageBubble({
   message,
   messageKey,
@@ -8096,12 +9249,16 @@ function MessageBubble({
   myAvatarUrl,
   myWxid,
   isGroupChat,
+  quoteLayout,
   autoTranscribeVoiceEnabled,
   onRequireModelDownload,
   onContextMenu,
+  onJumpToQuotedMessage,
   isSelectionMode,
   isSelected,
-  onToggleSelection
+  onToggleSelection,
+  aiMessageInsightEnabled,
+  aiMessageInsightContextCount
 }: {
   message: Message;
   messageKey: string;
@@ -8110,12 +9267,16 @@ function MessageBubble({
   myAvatarUrl?: string;
   myWxid?: string;
   isGroupChat?: boolean;
+  quoteLayout: configService.QuoteLayout;
   autoTranscribeVoiceEnabled?: boolean;
   onRequireModelDownload?: (sessionId: string, messageId: string) => void;
   onContextMenu?: (e: React.MouseEvent, message: Message) => void;
+  onJumpToQuotedMessage?: (target: QuotedMessageJumpTarget) => void;
   isSelectionMode?: boolean;
   isSelected?: boolean;
   onToggleSelection?: (messageKey: string, isShiftKey?: boolean) => void;
+  aiMessageInsightEnabled?: boolean;
+  aiMessageInsightContextCount?: number;
 }) {
   const isSystem = isSystemMessage(message.localType)
   const isEmoji = message.localType === 47
@@ -8129,7 +9290,6 @@ function MessageBubble({
   const [senderAvatarUrl, setSenderAvatarUrl] = useState<string | undefined>(undefined)
   const [senderName, setSenderName] = useState<string | undefined>(undefined)
   const [quotedSenderName, setQuotedSenderName] = useState<string | undefined>(undefined)
-  const [quoteLayout, setQuoteLayout] = useState<QuoteLayout>('quote-top')
   const [solitaireExpanded, setSolitaireExpanded] = useState(false)
   const senderProfileRequestSeqRef = useRef(0)
   const [emojiError, setEmojiError] = useState(false)
@@ -8156,6 +9316,8 @@ function MessageBubble({
 
   // State variables...
   const [imageError, setImageError] = useState(false)
+  const [imageErrorReason, setImageErrorReason] = useState<string | undefined>(undefined)
+  const [imageFailureKind, setImageFailureKind] = useState<'not_found' | 'decrypt_failed' | undefined>(undefined)
   const [imageLoading, setImageLoading] = useState(false)
   const [imageLoaded, setImageLoaded] = useState(false)
   const [imageStageLockHeight, setImageStageLockHeight] = useState<number | null>(null)
@@ -8187,7 +9349,10 @@ function MessageBubble({
   const [voiceCurrentTime, setVoiceCurrentTime] = useState(0)
   const [voiceDuration, setVoiceDuration] = useState(0)
   const [voiceWaveform, setVoiceWaveform] = useState<number[]>([])
+  const [voiceWaveformRequested, setVoiceWaveformRequested] = useState(false)
   const voiceAutoDecryptTriggered = useRef(false)
+  const pendingScrollerDeltaRef = useRef(0)
+  const pendingScrollerDeltaRafRef = useRef<number | null>(null)
 
 
   const [systemAlert, setSystemAlert] = useState<{
@@ -8278,7 +9443,7 @@ function MessageBubble({
 
   const stabilizeScrollerByDelta = useCallback((host: HTMLElement | null, delta: number) => {
     if (!host) return
-    if (!Number.isFinite(delta) || Math.abs(delta) < 1) return
+    if (!Number.isFinite(delta) || Math.abs(delta) < 1.5) return
     const scroller = host.closest('.message-list') as HTMLDivElement | null
     if (!scroller) return
 
@@ -8291,7 +9456,17 @@ function MessageBubble({
     const viewportBottom = scroller.scrollTop + scroller.clientHeight
     if (hostTopInScroller > viewportBottom + 24) return
 
-    scroller.scrollTop += delta
+    pendingScrollerDeltaRef.current += delta
+    if (pendingScrollerDeltaRafRef.current !== null) return
+    pendingScrollerDeltaRafRef.current = window.requestAnimationFrame(() => {
+      pendingScrollerDeltaRafRef.current = null
+      const applyDelta = pendingScrollerDeltaRef.current
+      pendingScrollerDeltaRef.current = 0
+      if (!Number.isFinite(applyDelta) || Math.abs(applyDelta) < 1.5) return
+      const nextScroller = host.closest('.message-list') as HTMLDivElement | null
+      if (!nextScroller) return
+      nextScroller.scrollTop += applyDelta
+    })
   }, [])
 
   const bindResizeObserverForHost = useCallback((
@@ -8382,12 +9557,12 @@ function MessageBubble({
   useEffect(() => {
     if (!isImage) return
     return bindResizeObserverForHost(imageContainerRef.current, imageObservedHeightRef, imageResizeBaselineRef)
-  }, [isImage, imageLocalPath, imageLoading, imageError, bindResizeObserverForHost])
+  }, [isImage, bindResizeObserverForHost])
 
   useEffect(() => {
     if (!isEmoji) return
     return bindResizeObserverForHost(emojiContainerRef.current, emojiObservedHeightRef, emojiResizeBaselineRef)
-  }, [isEmoji, emojiLocalPath, emojiLoading, emojiError, bindResizeObserverForHost])
+  }, [isEmoji, bindResizeObserverForHost])
 
   // 下载表情包
   const downloadEmoji = () => {
@@ -8530,7 +9705,11 @@ function MessageBubble({
         if (result.success && result.localPath) {
           const renderPath = toRenderableImageSrc(result.localPath)
           if (!renderPath) {
-            if (!silent) setImageError(true)
+            if (!silent) {
+              setImageError(true)
+              setImageErrorReason('路径无效')
+              setImageFailureKind('decrypt_failed')
+            }
             return { success: false }
           }
           imageDataUrlCache.set(imageCacheKey, renderPath)
@@ -8542,6 +9721,10 @@ function MessageBubble({
           setImageHasUpdate(false)
           if (result.liveVideoPath) setImageLiveVideoPath(result.liveVideoPath)
           return { ...result, localPath: renderPath }
+        } else if (!silent && result.error) {
+          setImageError(true)
+          setImageErrorReason(result.error)
+          setImageFailureKind(result.failureKind)
         }
       }
 
@@ -8558,9 +9741,17 @@ function MessageBubble({
         setImageHasUpdate(false)
         return { success: true, localPath: dataUrl }
       }
-      if (!silent) setImageError(true)
-    } catch {
-      if (!silent) setImageError(true)
+      if (!silent) {
+        setImageError(true)
+        setImageErrorReason('图片数据获取失败')
+        setImageFailureKind('not_found')
+      }
+    } catch (e) {
+      if (!silent) {
+        setImageError(true)
+        setImageErrorReason(e instanceof Error ? e.message : '解密异常')
+        setImageFailureKind('decrypt_failed')
+      }
     } finally {
       if (!silent) setImageLoading(false)
       imageDecryptPendingRef.current = false
@@ -8568,13 +9759,13 @@ function MessageBubble({
     return { success: false }
   }, [isImage, message.imageMd5, message.imageDatName, message.createTime, message.localId, session.username, imageCacheKey, detectImageMimeFromBase64, imageLocalPath, captureImageResizeBaseline, lockImageStageHeight])
 
-  const triggerForceHd = useCallback(() => {
+  const triggerForceHd = useCallback(async (): Promise<void> => {
     if (!message.imageMd5 && !message.imageDatName) return
     if (imageForceHdAttempted.current === imageCacheKey) return
     if (imageForceHdPending.current) return
     imageForceHdAttempted.current = imageCacheKey
     imageForceHdPending.current = true
-    requestImageDecrypt(true, true).finally(() => {
+    await requestImageDecrypt(true, true).finally(() => {
       imageForceHdPending.current = false
     })
   }, [imageCacheKey, message.imageDatName, message.imageMd5, requestImageDecrypt])
@@ -8662,6 +9853,11 @@ function MessageBubble({
       if (imageClickTimerRef.current) {
         window.clearTimeout(imageClickTimerRef.current)
       }
+      if (pendingScrollerDeltaRafRef.current !== null) {
+        window.cancelAnimationFrame(pendingScrollerDeltaRafRef.current)
+        pendingScrollerDeltaRafRef.current = null
+      }
+      pendingScrollerDeltaRef.current = 0
     }
   }, [])
 
@@ -8795,14 +9991,16 @@ function MessageBubble({
     if (!message.imageMd5 && !message.imageDatName) return
     if (imageAutoDecryptTriggered.current) return
     imageAutoDecryptTriggered.current = true
-    void requestImageDecrypt()
+    void enqueueAutoMediaTask(async () => requestImageDecrypt()).catch(() => { })
   }, [isImage, imageInView, imageLocalPath, imageLoading, message.imageMd5, message.imageDatName, requestImageDecrypt])
 
   useEffect(() => {
     if (!isImage || !imageHasUpdate || !imageInView) return
     if (imageAutoHdTriggered.current === imageCacheKey) return
     imageAutoHdTriggered.current = imageCacheKey
-    triggerForceHd()
+    void enqueueAutoMediaTask(async () => {
+      await triggerForceHd()
+    }).catch(() => { })
   }, [isImage, imageHasUpdate, imageInView, imageCacheKey, triggerForceHd])
 
 
@@ -8844,30 +10042,36 @@ function MessageBubble({
 
   // 生成波形数据
   useEffect(() => {
-    if (!voiceDataUrl) {
+    if (!voiceDataUrl || !voiceWaveformRequested) {
       setVoiceWaveform([])
       return
     }
+
+    let cancelled = false
+    let audioCtx: AudioContext | null = null
 
     const generateWaveform = async () => {
       try {
         // 从 data:audio/wav;base64,... 提取 base64
         const base64 = voiceDataUrl.split(',')[1]
+        if (!base64) return
         const binaryString = window.atob(base64)
         const bytes = new Uint8Array(binaryString.length)
         for (let i = 0; i < binaryString.length; i++) {
           bytes[i] = binaryString.charCodeAt(i)
         }
 
-        const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+        audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
         const audioBuffer = await audioCtx.decodeAudioData(bytes.buffer)
+        if (cancelled) return
         const rawData = audioBuffer.getChannelData(0) // 获取单声道数据
-        const samples = 35 // 波形柱子数量
+        const samples = 24 // 波形柱子数量（降低解码计算成本）
         const blockSize = Math.floor(rawData.length / samples)
+        if (blockSize <= 0) return
         const filteredData: number[] = []
 
         for (let i = 0; i < samples; i++) {
-          let blockStart = blockSize * i
+          const blockStart = blockSize * i
           let sum = 0
           for (let j = 0; j < blockSize; j++) {
             sum = sum + Math.abs(rawData[blockStart + j])
@@ -8876,19 +10080,39 @@ function MessageBubble({
         }
 
         // 归一化
-        const multiplier = Math.pow(Math.max(...filteredData), -1)
+        const peak = Math.max(...filteredData)
+        if (!Number.isFinite(peak) || peak <= 0) return
+        const multiplier = Math.pow(peak, -1)
         const normalizedData = filteredData.map(n => n * multiplier)
-        setVoiceWaveform(normalizedData)
-        void audioCtx.close()
+        if (!cancelled) {
+          setVoiceWaveform(normalizedData)
+        }
       } catch (e) {
         console.error('Failed to generate waveform:', e)
         // 降级：生成随机但平滑的波形
-        setVoiceWaveform(Array.from({ length: 35 }, () => 0.2 + Math.random() * 0.8))
+        if (!cancelled) {
+          setVoiceWaveform(Array.from({ length: 24 }, () => 0.2 + Math.random() * 0.8))
+        }
+      } finally {
+        if (audioCtx) {
+          void audioCtx.close().catch(() => { })
+        }
       }
     }
 
-    void generateWaveform()
-  }, [voiceDataUrl])
+    scheduleWhenIdle(() => {
+      if (cancelled) return
+      void generateWaveform()
+    }, { timeout: 900, fallbackDelay: 80 })
+
+    return () => {
+      cancelled = true
+      if (audioCtx) {
+        void audioCtx.close().catch(() => { })
+        audioCtx = null
+      }
+    }
+  }, [voiceDataUrl, voiceWaveformRequested])
 
   // 消息加载时自动检测语音缓存
   useEffect(() => {
@@ -9072,7 +10296,9 @@ function MessageBubble({
     if (videoAutoLoadTriggered.current) return
 
     videoAutoLoadTriggered.current = true
-    void requestVideoInfo()
+    void enqueueAutoMediaTask(async () => requestVideoInfo()).catch(() => {
+      videoAutoLoadTriggered.current = false
+    })
   }, [isVideo, isVideoVisible, videoInfo, requestVideoInfo])
 
   useEffect(() => {
@@ -9147,8 +10373,14 @@ function MessageBubble({
     appMsgTextCache.set(selector, value)
     return value
   }, [appMsgDoc, appMsgTextCache])
+  const decodeHtmlEntities = useCallback((text: string): string => {
+    const textarea = document.createElement('textarea')
+    textarea.innerHTML = text
+    return textarea.value
+  }, [])
+
   const queryPreferredQuotedContent = useCallback((): string => {
-    if (message.quotedContent) return message.quotedContent
+    if (message.quotedContent) return decodeHtmlEntities(message.quotedContent)
     const candidates = [
       'refermsg > selectedcontent',
       'refermsg > selectedtext',
@@ -9165,10 +10397,10 @@ function MessageBubble({
     ]
     for (const selector of candidates) {
       const value = queryAppMsgText(selector)
-      if (value) return value
+      if (value) return decodeHtmlEntities(value)
     }
     return ''
-  }, [message.quotedContent, queryAppMsgText])
+  }, [message.quotedContent, queryAppMsgText, decodeHtmlEntities])
   const appMsgThumbRawCandidate = useMemo(() => (
     message.linkThumb ||
     message.appMsgThumbUrl ||
@@ -9230,17 +10462,7 @@ function MessageBubble({
     myWxid
   ])
 
-  useEffect(() => {
-    let cancelled = false
-    void configService.getQuoteLayout().then((layout) => {
-      if (!cancelled) setQuoteLayout(layout)
-    }).catch(() => {
-      if (!cancelled) setQuoteLayout('quote-top')
-    })
-    return () => {
-      cancelled = true
-    }
-  }, [])
+  // quoteLayout config removed - Ambient Reply uses a single fixed layout
 
   const locationMessageMeta = useMemo(() => {
     if (message.localType !== 48) return null
@@ -9273,35 +10495,130 @@ function MessageBubble({
   const avatarUrl = isSent
     ? (myAvatarUrl || resolvedSenderAvatarUrl)
     : (isGroupChat ? resolvedSenderAvatarUrl : session.avatarUrl)
+  const canShowMessageInsight = Boolean(
+    aiMessageInsightEnabled &&
+    !isSent &&
+    !isSystem &&
+    !isImage &&
+    !isVideo &&
+    !isVoice &&
+    !isEmoji &&
+    !isCard &&
+    !isCall &&
+    !isType49 &&
+    message.localType === 1 &&
+    cleanedParsedContent.trim()
+  )
+  const messageInsightControl = canShowMessageInsight ? (
+    <MessageInsightControl
+      message={message}
+      messageKey={messageKey}
+      session={session}
+      displayName={session.displayName || session.username}
+      avatarUrl={avatarUrl}
+      senderName={resolvedSenderName || session.displayName || session.username}
+      targetText={cleanedParsedContent}
+      contextCount={aiMessageInsightContextCount || 50}
+      compact={!isGroupChat}
+    />
+  ) : null
 
   // 是否有引用消息
   const hasQuote = quotedContent.length > 0
   const displayQuotedSenderName = quotedSenderName || quotedSenderFallbackName
-  const renderBubbleWithQuote = useCallback((quotedNode: React.ReactNode, messageNode: React.ReactNode) => {
-    const quoteFirst = quoteLayout !== 'quote-bottom'
-    return (
-      <div className={`bubble-content ${quoteFirst ? 'quote-layout-top' : 'quote-layout-bottom'}`}>
-        {quoteFirst ? (
-          <>
-            {quotedNode}
-            {messageNode}
-          </>
-        ) : (
-          <>
-            {messageNode}
-            {quotedNode}
-          </>
-        )}
-      </div>
-    )
-  }, [quoteLayout])
+  const quotedJumpTarget = useMemo<QuotedMessageJumpTarget | null>(() => {
+    if (!hasQuote) return null
 
-  const renderQuotedMessageBlock = useCallback((contentNode: React.ReactNode) => (
-    <div className="quoted-message">
-      {displayQuotedSenderName && <span className="quoted-sender">{displayQuotedSenderName}</span>}
-      <span className="quoted-text">{contentNode}</span>
+    const quotedServerId = normalizeMessageIdToken(
+      queryAppMsgText('refermsg > svrid') ||
+      queryAppMsgText('refermsg > msgsvrid') ||
+      queryAppMsgText('refermsg > newmsgid') ||
+      queryAppMsgText('refermsg > msgid')
+    )
+    const quotedCreateTime = parsePositiveInteger(
+      queryAppMsgText('refermsg > createtime') ||
+      queryAppMsgText('refermsg > create_time') ||
+      queryAppMsgText('refermsg > createTime')
+    )
+    const quotedLocalId = parsePositiveInteger(
+      queryAppMsgText('refermsg > localid') ||
+      queryAppMsgText('refermsg > local_id') ||
+      queryAppMsgText('refermsg > localId')
+    )
+    const normalizedQuotedContent = normalizeQuotedComparableText(quotedContent)
+
+    if (!quotedServerId && !quotedCreateTime && !quotedLocalId && !normalizedQuotedContent) {
+      return null
+    }
+
+    return {
+      sourceMessageKey: messageKey,
+      sourceCreateTime: Number(message.createTime || 0),
+      sessionId: session.username,
+      localId: quotedLocalId,
+      serverId: quotedServerId || undefined,
+      createTime: quotedCreateTime,
+      senderUsername: quotedSenderUsername || undefined,
+      content: normalizedQuotedContent || undefined
+    }
+  }, [hasQuote, message.createTime, messageKey, queryAppMsgText, quotedContent, quotedSenderUsername, session.username])
+  const handleQuotedJumpClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    if (isSelectionMode) return
+    if (!quotedJumpTarget || !onJumpToQuotedMessage) return
+    event.stopPropagation()
+    onJumpToQuotedMessage(quotedJumpTarget)
+  }, [isSelectionMode, onJumpToQuotedMessage, quotedJumpTarget])
+  const handleQuotedJumpKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    if (isSelectionMode) return
+    if (!quotedJumpTarget || !onJumpToQuotedMessage) return
+    event.preventDefault()
+    event.stopPropagation()
+    onJumpToQuotedMessage(quotedJumpTarget)
+  }, [isSelectionMode, onJumpToQuotedMessage, quotedJumpTarget])
+  const isQuoteBelow = quoteLayout === 'quote-bottom'
+  const renderBubbleWithQuote = useCallback((quotedNode: React.ReactNode, messageNode: React.ReactNode) => (
+    <div className={`bubble-content ${isQuoteBelow ? 'quote-layout-bottom' : 'quote-layout-top'}`}>
+      {isQuoteBelow ? (
+        <>
+          {messageNode}
+          {quotedNode}
+        </>
+      ) : (
+        <>
+          {quotedNode}
+          {messageNode}
+        </>
+      )}
     </div>
-  ), [displayQuotedSenderName])
+  ), [isQuoteBelow])
+
+  // Ambient Reply: render reply-anchor + ghost preview
+  const renderQuotedMessageBlock = useCallback((contentNode: React.ReactNode) => (
+    <div className={`ambient-reply-wrapper ${isQuoteBelow ? 'preview-below' : 'preview-above'}`}>
+      {/* Reply anchor - always visible, subtle */}
+      <div
+        className={`reply-anchor ${quotedJumpTarget ? 'jumpable' : ''}`}
+        role={quotedJumpTarget && !isSelectionMode ? 'button' : undefined}
+        tabIndex={quotedJumpTarget && !isSelectionMode ? 0 : undefined}
+        onClick={handleQuotedJumpClick}
+        onKeyDown={handleQuotedJumpKeyDown}
+      >
+        <svg className="reply-anchor-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="9 14 4 9 9 4" />
+          <path d="M20 20v-7a4 4 0 0 0-4-4H4" />
+        </svg>
+        {displayQuotedSenderName && <span className="reply-anchor-name">{displayQuotedSenderName}</span>}
+        <span className="reply-anchor-sep">&middot;</span>
+        <span className="reply-anchor-excerpt">{contentNode}</span>
+      </div>
+      {/* Ghost preview - appears on hover */}
+      <div className="reply-ghost">
+        {displayQuotedSenderName && <div className="reply-ghost-sender">{displayQuotedSenderName}</div>}
+        <div className="reply-ghost-text">{contentNode}</div>
+      </div>
+    </div>
+  ), [displayQuotedSenderName, handleQuotedJumpClick, handleQuotedJumpKeyDown, isQuoteBelow, isSelectionMode, quotedJumpTarget])
 
   const handlePlayVideo = useCallback(async () => {
     if (!videoInfo?.videoUrl) return
@@ -9362,7 +10679,7 @@ function MessageBubble({
   // 渲染消息内容
   const renderContent = () => {
     if (isImage) {
-      return (
+      const imageContent = (
         <div
           ref={imageContainerRef}
           className={`image-stage ${imageStageLockHeight ? 'locked' : ''}`}
@@ -9374,14 +10691,15 @@ function MessageBubble({
             </div>
           ) : imageError || !imageLocalPath ? (
             <button
-              className={`image-unavailable ${imageClicked ? 'clicked' : ''}`}
+              className={`image-unavailable ${imageClicked ? 'clicked' : ''} ${imageError ? 'error' : ''}`}
               onClick={handleImageClick}
               disabled={imageLoading}
               type="button"
             >
               <ImageIcon size={24} />
-              <span>图片未解密</span>
-              <span className="image-action">{imageClicked ? '已点击…' : '点击解密'}</span>
+              <span>{imageError ? '解密失败' : '图片未解密'}</span>
+              {imageErrorReason && <span className="image-error-reason">{imageErrorReason}</span>}
+              <span className="image-action">{imageClicked ? '已点击…' : '点击重试'}</span>
             </button>
           ) : (
             <>
@@ -9391,10 +10709,14 @@ function MessageBubble({
                   src={imageLocalPath}
                   alt="图片"
                   className={`image-message ${imageLoaded ? 'ready' : 'pending'}`}
+                  loading="lazy"
+                  decoding="async"
                   onClick={() => { void handleOpenImageViewer() }}
                   onLoad={() => {
                     setImageLoaded(true)
                     setImageError(false)
+                    setImageErrorReason(undefined)
+                    setImageFailureKind(undefined)
                     stabilizeImageScrollAfterResize()
                     releaseImageStageLock()
                   }}
@@ -9415,13 +10737,24 @@ function MessageBubble({
           )}
         </div>
       )
+
+      if (hasQuote) {
+        return renderBubbleWithQuote(
+          renderQuotedMessageBlock(renderTextWithEmoji(cleanMessageContent(quotedContent))),
+          imageContent
+        )
+      }
+
+      return <div className="bubble-content">{imageContent}</div>
     }
 
     // 视频消息
     if (isVideo) {
+      let videoContent: React.ReactNode
+
       // 未进入可视区域时显示占位符
       if (!isVideoVisible) {
-        return (
+        videoContent = (
           <div className="video-placeholder" ref={videoContainerRef as React.RefObject<HTMLDivElement>}>
             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <polygon points="23 7 16 12 23 17 23 7"></polygon>
@@ -9429,20 +10762,16 @@ function MessageBubble({
             </svg>
           </div>
         )
-      }
-
-      // 加载中
-      if (videoLoading) {
-        return (
+      } else if (videoLoading) {
+        // 加载中
+        videoContent = (
           <div className="video-loading" ref={videoContainerRef as React.RefObject<HTMLDivElement>}>
             <Loader2 size={20} className="spin" />
           </div>
         )
-      }
-
-      // 视频不存在 - 添加点击重试功能
-      if (!videoInfo?.exists || !videoInfo.videoUrl) {
-        return (
+      } else if (!videoInfo?.exists || !videoInfo.videoUrl) {
+        // 视频不存在 - 添加点击重试功能
+        videoContent = (
           <button
             className={`video-unavailable ${videoClicked ? 'clicked' : ''}`}
             ref={videoContainerRef as React.RefObject<HTMLButtonElement>}
@@ -9462,33 +10791,45 @@ function MessageBubble({
             <span className="video-action">{videoClicked ? '已点击…' : '点击重试'}</span>
           </button>
         )
+      } else {
+        // 默认显示缩略图，点击打开独立播放窗口
+        const thumbSrc = videoInfo.thumbUrl || videoInfo.coverUrl
+        videoContent = (
+          <div className="video-thumb-wrapper" ref={videoContainerRef as React.RefObject<HTMLDivElement>} onClick={handlePlayVideo}>
+            {thumbSrc ? (
+              <img src={thumbSrc} alt="视频缩略图" className="video-thumb" loading="lazy" decoding="async" />
+            ) : (
+              <div className="video-thumb-placeholder">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <polygon points="23 7 16 12 23 17 23 7"></polygon>
+                  <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
+                </svg>
+              </div>
+            )}
+            <div className="video-play-button">
+              <Play size={32} fill="white" />
+            </div>
+          </div>
+        )
       }
 
-      // 默认显示缩略图，点击打开独立播放窗口
-      const thumbSrc = videoInfo.thumbUrl || videoInfo.coverUrl
-      return (
-        <div className="video-thumb-wrapper" ref={videoContainerRef as React.RefObject<HTMLDivElement>} onClick={handlePlayVideo}>
-          {thumbSrc ? (
-            <img src={thumbSrc} alt="视频缩略图" className="video-thumb" />
-          ) : (
-            <div className="video-thumb-placeholder">
-              <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <polygon points="23 7 16 12 23 17 23 7"></polygon>
-                <rect x="1" y="5" width="15" height="14" rx="2" ry="2"></rect>
-              </svg>
-            </div>
-          )}
-          <div className="video-play-button">
-            <Play size={32} fill="white" />
-          </div>
-        </div>
-      )
+      if (hasQuote) {
+        return renderBubbleWithQuote(
+          renderQuotedMessageBlock(renderTextWithEmoji(cleanMessageContent(quotedContent))),
+          videoContent
+        )
+      }
+
+      return <div className="bubble-content">{videoContent}</div>
     }
 
     if (isVoice) {
       const durationText = message.voiceDurationSeconds ? `${message.voiceDurationSeconds}"` : ''
       const handleToggle = async () => {
         if (voiceLoading) return
+        if (!voiceWaveformRequested) {
+          setVoiceWaveformRequested(true)
+        }
         const audio = voiceAudioRef.current || new Audio()
         if (!voiceAudioRef.current) {
           voiceAudioRef.current = audio
@@ -9567,7 +10908,7 @@ function MessageBubble({
         void requestVoiceTranscript()
       }
 
-      return (
+      const voiceContent = (
         <div className="voice-stack">
           <div className={`voice-message ${isVoicePlaying ? 'playing' : ''}`} onClick={handleToggle}>
             <button
@@ -9650,6 +10991,15 @@ function MessageBubble({
           )}
         </div>
       )
+
+      if (hasQuote) {
+        return renderBubbleWithQuote(
+          renderQuotedMessageBlock(renderTextWithEmoji(cleanMessageContent(quotedContent))),
+          voiceContent
+        )
+      }
+
+      return <div className="bubble-content">{voiceContent}</div>
     }
 
     // 名片消息
@@ -9753,10 +11103,30 @@ function MessageBubble({
             return <span className="quoted-type-label">[动画表情]</span>
           }
 
+          // 链接类消息：需区分真正的链接和嵌套引用
+          // 当一个引用了别的消息的消息被引用（B引用A，C又引用B），那么 B 在 C 的 refermsg 里 type=49
+          // 与此同时，一个链接的 type 也是 49，这可能意味着 49 是一个更高级别的分类
+          // 因此，不能将 type=49 的引用信息一律视为链接，它也可能是嵌套引用。那么怎么区分呢？
+          // 答：嵌套引用的 referContent 中 xmlType=57，真正的链接 xmlType=49 或 5
+          // 对于更多层的嵌套引用，微信不会保存所有层的信息，因此和两层的情况差不多
+          // 注意：需从原始 XML 获取 refermsg > content，而非后端处理过的 quotedContent
+          if (referType === '49') {
+            try {
+              const rawReferContent = q('refermsg > content') || ''
+              const innerDoc = new DOMParser().parseFromString(rawReferContent, 'text/xml')
+              const innerXmlType = innerDoc.querySelector('appmsg > type')?.textContent?.trim()
+              if (innerXmlType === '57') {
+                const innerTitle = innerDoc.querySelector('title')?.textContent?.trim() || ''
+                if (innerTitle) return <>{renderTextWithEmoji(cleanMessageContent(innerTitle))}</>
+              }
+            } catch { /* 解析失败降级 */ }
+            return <span className="quoted-type-label">[链接]</span>
+          }
+
           // 各类型名称映射
           const typeLabels: Record<string, string> = {
             '3': '图片', '34': '语音', '43': '视频',
-            '49': '链接', '50': '通话', '10000': '系统消息', '10002': '撤回消息',
+            '50': '通话', '10000': '系统消息', '10002': '撤回消息',
           }
           if (referType && typeLabels[referType]) {
             return <span className="quoted-type-label">[{typeLabels[referType]}]</span>
@@ -10129,9 +11499,29 @@ function MessageBubble({
             } catch { /* 解析失败降级 */ }
             return <span className="quoted-type-label">[动画表情]</span>
           }
+          // 链接类消息：需区分真正的链接和嵌套引用
+          // 当一个引用了别的消息的消息被引用（B引用A，C又引用B），那么 B 在 C 的 refermsg 里 type=49
+          // 与此同时，一个链接的 type 也是 49，这可能意味着 49 是一个更高级别的分类
+          // 因此，不能将 type=49 的引用信息一律视为链接，它也可能是嵌套引用。那么怎么区分呢？
+          // 答：嵌套引用的 referContent 中 xmlType=57，真正的链接 xmlType=49 或 5
+          // 对于更多层的嵌套引用，微信不会保存所有层的信息，因此和两层的情况差不多
+          // 注意：需从原始 XML 获取 refermsg > content，而非后端处理过的 quotedContent
+          if (referType === '49') {
+            try {
+              const rawReferContent = parsedDoc?.querySelector('refermsg > content')?.textContent?.trim() || ''
+              const innerDoc = new DOMParser().parseFromString(rawReferContent, 'text/xml')
+              const innerXmlType = innerDoc.querySelector('appmsg > type')?.textContent?.trim()
+              if (innerXmlType === '57') {
+                const innerTitle = innerDoc.querySelector('title')?.textContent?.trim() || ''
+                if (innerTitle) return <>{renderTextWithEmoji(cleanMessageContent(innerTitle))}</>
+              }
+            } catch { /* 解析失败降级 */ }
+            return <span className="quoted-type-label">[链接]</span>
+          }
+          // 各类型名称映射
           const typeLabels: Record<string, string> = {
             '3': '图片', '34': '语音', '43': '视频',
-            '49': '链接', '50': '通话', '10000': '系统消息', '10002': '撤回消息',
+            '50': '通话', '10000': '系统消息', '10002': '撤回消息',
           }
           if (referType && typeLabels[referType]) {
             return <span className="quoted-type-label">[{typeLabels[referType]}]</span>
@@ -10429,115 +11819,59 @@ function MessageBubble({
     return <div className="bubble-content">{renderTextWithEmoji(cleanedParsedContent)}</div>
   }
 
-  return (
-    <>
-      {showTime && (
-        <div className="time-divider">
-          <span>{formatTime(message.createTime)}</span>
+  const systemAlertPortal = systemAlert ? createPortal(
+    <div className="modal-overlay" onClick={() => setSystemAlert(null)} style={{ zIndex: 99999 }}>
+      <div className="delete-confirm-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px' }}>
+        <div className="confirm-icon">
+          <AlertCircle size={32} color="var(--danger)" />
         </div>
-      )}
-      <div
-        className={`message-wrapper-with-selection ${isSelectionMode ? 'selectable' : ''}`}
-        style={{
-          display: 'flex',
-          alignItems: 'flex-start',
-          width: '100%',
-          justifyContent: isSent ? 'flex-end' : 'flex-start',
-          cursor: isSelectionMode ? 'pointer' : 'default'
-        }}
-        onClick={(e) => {
-          if (isSelectionMode) {
-            e.stopPropagation()
-            onToggleSelection?.(messageKey, e.shiftKey)
-          }
-        }}
-      >
-        {isSelectionMode && !isSent && (
-          <div className={`checkbox ${isSelected ? 'checked' : ''}`} style={{
-            width: '20px',
-            height: '20px',
-            borderRadius: '4px',
-            border: isSelected ? 'none' : '2px solid rgba(128,128,128,0.5)',
-            backgroundColor: isSelected ? 'var(--primary)' : 'transparent',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: 'white',
-            marginRight: '12px',
-            marginTop: '10px', // Align with avatar top
-            flexShrink: 0
-          }}>
-            {isSelected && <Check size={14} strokeWidth={3} />}
-          </div>
-        )}
-
-        <div className={`message-bubble ${bubbleClass} ${isEmoji && message.emojiCdnUrl && !emojiError ? 'emoji' : ''} ${isImage ? 'image' : ''} ${isVoice ? 'voice' : ''}`}
-          onContextMenu={(e) => onContextMenu?.(e, message)}
-        >
-          <div className="bubble-avatar">
-            <Avatar
-              src={avatarUrl}
-              name={!isSent ? (isGroupChat ? (resolvedSenderName || '?') : (session.displayName || session.username)) : '我'}
-              size={36}
-              className="bubble-avatar"
-            />
-          </div>
-          <div className="bubble-body">
-            {/* 群聊中显示发送者名称 */}
-            {isGroupChat && !isSent && (
-              <div className="sender-name">
-                {resolvedSenderName || '群成员'}
-              </div>
-            )}
-            {renderContent()}
-          </div>
+        <div className="confirm-content">
+          <h3>{systemAlert.title}</h3>
+          <p style={{ marginTop: '12px', lineHeight: '1.6', fontSize: '14px', color: 'var(--text-secondary)' }}>
+            {systemAlert.message}
+          </p>
         </div>
-
-        {isSelectionMode && isSent && (
-          <div className={`checkbox ${isSelected ? 'checked' : ''}`} style={{
-            width: '20px',
-            height: '20px',
-            borderRadius: '4px',
-            border: isSelected ? 'none' : '2px solid rgba(128,128,128,0.5)',
-            backgroundColor: isSelected ? 'var(--primary)' : 'transparent',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: 'white',
-            marginLeft: '12px',
-            marginTop: '10px',
-            flexShrink: 0
-          }}>
-            {isSelected && <Check size={14} strokeWidth={3} />}
-          </div>
-        )}
-        {systemAlert && createPortal(
-            <div className="modal-overlay" onClick={() => setSystemAlert(null)} style={{ zIndex: 99999 }}>
-              <div className="delete-confirm-card" onClick={(e) => e.stopPropagation()} style={{ maxWidth: '400px' }}>
-                <div className="confirm-icon">
-                  <AlertCircle size={32} color="var(--danger)" />
-                </div>
-                <div className="confirm-content">
-                  <h3>{systemAlert.title}</h3>
-                  <p style={{ marginTop: '12px', lineHeight: '1.6', fontSize: '14px', color: 'var(--text-secondary)' }}>
-                    {systemAlert.message}
-                  </p>
-                </div>
-                <div className="confirm-actions" style={{ justifyContent: 'center', marginTop: '24px' }}>
-                  <button
-                      className="btn-primary"
-                      onClick={() => setSystemAlert(null)}
-                      style={{ padding: '8px 32px' }}
-                  >
-                    确认
-                  </button>
-                </div>
-              </div>
-            </div>,
-            document.body
-        )}
+        <div className="confirm-actions" style={{ justifyContent: 'center', marginTop: '24px' }}>
+          <button
+            className="btn-primary"
+            onClick={() => setSystemAlert(null)}
+            style={{ padding: '8px 32px' }}
+          >
+            确认
+          </button>
+        </div>
       </div>
-    </>
+    </div>,
+    document.body
+  ) : null
+
+  return (
+    <ChatMessageBubble
+      message={message}
+      messageKey={messageKey}
+      session={session}
+      showTime={showTime}
+      timeText={formatTime(message.createTime)}
+      isSent={isSent}
+      isSystem={isSystem}
+      isEmoji={isEmoji}
+      isImage={isImage}
+      isVideo={isVideo}
+      isVoice={isVoice}
+      emojiHasAsset={Boolean(message.emojiCdnUrl || message.emojiLocalPath)}
+      emojiError={emojiError}
+      avatarUrl={avatarUrl}
+      isGroupChat={isGroupChat}
+      resolvedSenderName={resolvedSenderName}
+      isSelectionMode={isSelectionMode}
+      isSelected={isSelected}
+      onContextMenu={onContextMenu}
+      onToggleSelection={onToggleSelection}
+      actionNode={messageInsightControl}
+      portal={systemAlertPortal}
+    >
+      {renderContent()}
+    </ChatMessageBubble>
   )
 }
 
@@ -10548,12 +11882,16 @@ const MemoMessageBubble = React.memo(MessageBubble, (prevProps, nextProps) => {
   if (prevProps.myAvatarUrl !== nextProps.myAvatarUrl) return false
   if (prevProps.myWxid !== nextProps.myWxid) return false
   if (prevProps.isGroupChat !== nextProps.isGroupChat) return false
+  if (prevProps.quoteLayout !== nextProps.quoteLayout) return false
   if (prevProps.autoTranscribeVoiceEnabled !== nextProps.autoTranscribeVoiceEnabled) return false
   if (prevProps.isSelectionMode !== nextProps.isSelectionMode) return false
   if (prevProps.isSelected !== nextProps.isSelected) return false
   if (prevProps.onRequireModelDownload !== nextProps.onRequireModelDownload) return false
   if (prevProps.onContextMenu !== nextProps.onContextMenu) return false
+  if (prevProps.onJumpToQuotedMessage !== nextProps.onJumpToQuotedMessage) return false
   if (prevProps.onToggleSelection !== nextProps.onToggleSelection) return false
+  if (prevProps.aiMessageInsightEnabled !== nextProps.aiMessageInsightEnabled) return false
+  if (prevProps.aiMessageInsightContextCount !== nextProps.aiMessageInsightContextCount) return false
 
   return (
     prevProps.session.username === nextProps.session.username &&

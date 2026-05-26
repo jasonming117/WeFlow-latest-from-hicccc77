@@ -25,9 +25,7 @@ export class WcdbService {
   private logEnabled = false
   private monitorListener: ((type: string, json: string) => void) | null = null
 
-  constructor() {
-    this.initWorker()
-  }
+  constructor() {}
 
   /**
    * 初始化 Worker 线程
@@ -94,6 +92,9 @@ export class WcdbService {
         this.setPaths(this.resourcesPath, this.userDataPath)
       }
       this.setLogEnabled(this.logEnabled)
+      if (this.monitorListener) {
+        this.callWorker<{ success?: boolean }>('setMonitor').catch(() => { })
+      }
 
     } catch (e) {
       // Failed to create worker
@@ -153,15 +154,17 @@ export class WcdbService {
   /**
    * 测试数据库连接
    */
-  async testConnection(dbPath: string, hexKey: string, wxid: string): Promise<{ success: boolean; error?: string; sessionCount?: number }> {
-    return this.callWorker('testConnection', { dbPath, hexKey, wxid })
+  async testConnection(accountDir: string, hexKey: string): Promise<{ success: boolean; error?: string; sessionCount?: number }> {
+    return this.callWorker('testConnection', { accountDir, hexKey })
   }
 
   /**
    * 打开数据库
+   * @param accountDir 账号目录的完整路径
+   * @param hexKey 解密密钥
    */
-  async open(dbPath: string, hexKey: string, wxid: string): Promise<boolean> {
-    return this.callWorker('open', { dbPath, hexKey, wxid })
+  async open(accountDir: string, hexKey: string): Promise<boolean> {
+    return this.callWorker('open', { accountDir, hexKey })
   }
 
   async getLastInitError(): Promise<string | null> {
@@ -201,6 +204,10 @@ export class WcdbService {
     return this.callWorker('getSessions')
   }
 
+  async markAllSessionsRead(): Promise<{ success: boolean; error?: string }> {
+    return this.callWorker('markAllSessionsRead')
+  }
+
   /**
    * 获取消息列表
    */
@@ -220,6 +227,13 @@ export class WcdbService {
    */
   async getMessageCount(sessionId: string): Promise<{ success: boolean; count?: number; error?: string }> {
     return this.callWorker('getMessageCount', { sessionId })
+  }
+
+  /**
+   * 根据 server_id 查询单条消息
+   */
+  async getMessageByServerId(sessionId: string, svrid: string): Promise<{ success: boolean; row?: any; error?: string }> {
+    return this.callWorker('getMessageByServerId', { sessionId, svrid })
   }
 
   async getMessageCounts(sessionIds: string[]): Promise<{ success: boolean; counts?: Record<string, number>; error?: string }> {
@@ -366,6 +380,26 @@ export class WcdbService {
 
   async getMessageTableColumns(dbPath: string, tableName: string): Promise<{ success: boolean; columns?: string[]; error?: string }> {
     return this.callWorker('getMessageTableColumns', { dbPath, tableName })
+  }
+
+  async listTables(kind: string, dbPath: string = ''): Promise<{ success: boolean; tables?: string[]; error?: string }> {
+    return this.callWorker('listTables', { kind, dbPath })
+  }
+
+  async getTableSchema(kind: string, dbPath: string, tableName: string): Promise<{ success: boolean; schema?: string; error?: string }> {
+    return this.callWorker('getTableSchema', { kind, dbPath, tableName })
+  }
+
+  async exportTableSnapshot(kind: string, dbPath: string, tableName: string, outputPath: string): Promise<{ success: boolean; rows?: number; columns?: number; error?: string }> {
+    return this.callWorker('exportTableSnapshot', { kind, dbPath, tableName, outputPath })
+  }
+
+  async importTableSnapshot(kind: string, dbPath: string, tableName: string, inputPath: string): Promise<{ success: boolean; rows?: number; inserted?: number; ignored?: number; malformed?: number; columns?: number; error?: string }> {
+    return this.callWorker('importTableSnapshot', { kind, dbPath, tableName, inputPath })
+  }
+
+  async importTableSnapshotWithSchema(kind: string, dbPath: string, tableName: string, inputPath: string, createTableSql: string): Promise<{ success: boolean; rows?: number; inserted?: number; ignored?: number; malformed?: number; columns?: number; error?: string }> {
+    return this.callWorker('importTableSnapshotWithSchema', { kind, dbPath, tableName, inputPath, createTableSql })
   }
 
   async getMessageTableTimeRange(dbPath: string, tableName: string): Promise<{ success: boolean; data?: any; error?: string }> {

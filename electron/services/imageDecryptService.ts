@@ -81,6 +81,7 @@ export class ImageDecryptService {
   private pending = new Map<string, Promise<DecryptResult>>()
   private updateFlags = new Map<string, boolean>()
   private nativeLogged = false
+  private runtimeConfig: { dbPath?: string; myWxid?: string; imageXorKey?: unknown; imageAesKey?: string } | null = null
   private datNameScanMissAt = new Map<string, number>()
   private readonly datNameScanMissTtlMs = 1200
   private readonly accountDirCache = new Map<string, string>()
@@ -99,13 +100,37 @@ export class ImageDecryptService {
     return this.shouldEmitImageEvents(payload)
   }
 
+  setRuntimeConfig(config: { dbPath?: string; myWxid?: string; imageXorKey?: unknown; imageAesKey?: string } | null): void {
+    this.runtimeConfig = config
+  }
+
+  private getConfiguredDbPath(): string {
+    return String(this.runtimeConfig?.dbPath || this.configService.get('dbPath') || '').trim()
+  }
+
+  private getConfiguredMyWxid(): string {
+    return String(this.runtimeConfig?.myWxid || this.configService.getMyWxidCleaned() || '').trim()
+  }
+
+  private getConfiguredImageKeys(): { xorKey: unknown; aesKey: string } {
+    const runtimeImageXorKey = this.runtimeConfig?.imageXorKey
+    const hasRuntimeXorKey = runtimeImageXorKey !== undefined && runtimeImageXorKey !== null && String(runtimeImageXorKey).trim() !== ''
+    const runtimeAesKey = String(this.runtimeConfig?.imageAesKey || '').trim()
+    if (hasRuntimeXorKey || runtimeAesKey) {
+      const fallback = this.configService.getImageKeysForCurrentWxid()
+      return {
+        xorKey: hasRuntimeXorKey ? runtimeImageXorKey : fallback.xorKey,
+        aesKey: runtimeAesKey || fallback.aesKey
+      }
+    }
+    return this.configService.getImageKeysForCurrentWxid()
+  }
+
   private logInfo(message: string, meta?: Record<string, unknown>): void {
     if (!this.configService.get('logEnabled')) return
     const timestamp = new Date().toISOString()
     const metaStr = meta ? ` ${JSON.stringify(meta)}` : ''
     const logLine = `[${timestamp}] [ImageDecrypt] ${message}${metaStr}\n`
-
-    // 只写入文件，不输出到控制台
     this.writeLog(logLine)
   }
 
@@ -115,11 +140,7 @@ export class ImageDecryptService {
     const errorStr = error ? ` Error: ${String(error)}` : ''
     const metaStr = meta ? ` ${JSON.stringify(meta)}` : ''
     const logLine = `[${timestamp}] [ImageDecrypt] ERROR: ${message}${errorStr}${metaStr}\n`
-
-    // 同时输出到控制台
     console.error(message, error, meta)
-
-    // 写入日志文件
     this.writeLog(logLine)
   }
 
@@ -143,7 +164,7 @@ export class ImageDecryptService {
     }
     for (const key of cacheKeys) {
       const cached = this.resolvedCache.get(key)
-      if (cached && existsSync(cached) && this.isImageFile(cached)) {
+      if (cached && existsSync(cached) && this.isUsableImageCacheFile(cached)) {
         const upgraded = !this.isHdPath(cached)
           ? await this.tryPromoteThumbnailCache(payload, key, cached)
           : null
@@ -161,7 +182,7 @@ export class ImageDecryptService {
         this.emitCacheResolved(payload, key, this.resolveEmitPath(finalPath, payload.preferFilePath))
         return { success: true, localPath, hasUpdate }
       }
-      if (cached && !this.isImageFile(cached)) {
+      if (cached && !this.isUsableImageCacheFile(cached)) {
         this.resolvedCache.delete(key)
       }
     }
@@ -219,7 +240,7 @@ export class ImageDecryptService {
     if (payload.force) {
       for (const key of cacheKeys) {
         const cached = this.resolvedCache.get(key)
-        if (cached && existsSync(cached) && this.isImageFile(cached) && this.isHdPath(cached)) {
+        if (cached && existsSync(cached) && this.isUsableImageCacheFile(cached) && this.isHdPath(cached)) {
           this.cacheResolvedPaths(cacheKey, payload.imageMd5, payload.imageDatName, cached)
           this.clearUpdateFlags(cacheKey, payload.imageMd5, payload.imageDatName)
           const localPath = this.resolveLocalPathForPayload(cached, payload.preferFilePath)
@@ -227,7 +248,7 @@ export class ImageDecryptService {
           this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
           return { success: true, localPath }
         }
-        if (cached && !this.isImageFile(cached)) {
+        if (cached && !this.isUsableImageCacheFile(cached)) {
           this.resolvedCache.delete(key)
         }
       }
@@ -236,7 +257,7 @@ export class ImageDecryptService {
 
     if (!payload.force) {
       const cached = this.resolvedCache.get(cacheKey)
-      if (cached && existsSync(cached) && this.isImageFile(cached)) {
+      if (cached && existsSync(cached) && this.isUsableImageCacheFile(cached)) {
         const upgraded = !this.isHdPath(cached)
           ? await this.tryPromoteThumbnailCache(payload, cacheKey, cached)
           : null
@@ -246,7 +267,7 @@ export class ImageDecryptService {
         this.emitDecryptProgress(payload, cacheKey, 'done', 100, 'done')
         return { success: true, localPath }
       }
-      if (cached && !this.isImageFile(cached)) {
+      if (cached && !this.isUsableImageCacheFile(cached)) {
         this.resolvedCache.delete(cacheKey)
       }
     }
@@ -272,8 +293,8 @@ export class ImageDecryptService {
     )
     if (normalizedList.length === 0) return
 
-    const wxid = this.configService.get('myWxid')
-    const dbPath = this.configService.get('dbPath')
+    const wxid = this.getConfiguredMyWxid()
+    const dbPath = this.getConfiguredDbPath()
     if (!wxid || !dbPath) return
 
     const accountDir = this.resolveAccountDir(dbPath, wxid)
@@ -300,8 +321,8 @@ export class ImageDecryptService {
     this.logInfo('开始解密图片', { md5: payload.imageMd5, datName: payload.imageDatName, force: payload.force, hardlinkOnly: payload.hardlinkOnly === true })
     this.emitDecryptProgress(payload, cacheKey, 'locating', 14, 'running')
     try {
-      const wxid = this.configService.get('myWxid')
-      const dbPath = this.configService.get('dbPath')
+      const wxid = this.getConfiguredMyWxid()
+      const dbPath = this.getConfiguredDbPath()
       if (!wxid || !dbPath) {
         this.logError('配置缺失', undefined, { wxid: !!wxid, dbPath: !!dbPath })
         this.emitDecryptProgress(payload, cacheKey, 'failed', 100, 'error', '配置缺失')
@@ -410,7 +431,7 @@ export class ImageDecryptService {
       }
 
       // 优先使用当前 wxid 对应的密钥，找不到则回退到全局配置
-      const imageKeys = this.configService.getImageKeysForCurrentWxid()
+      const imageKeys = this.getConfiguredImageKeys()
       const xorKeyRaw = imageKeys.xorKey
       // 支持十六进制格式（如 0x53）和十进制格式
       let xorKey: number
@@ -433,7 +454,7 @@ export class ImageDecryptService {
       const aesKeyText = typeof aesKeyRaw === 'string' ? aesKeyRaw.trim() : ''
       const aesKeyForNative = aesKeyText || undefined
 
-      this.logInfo('开始解密DAT文件(仅Rust原生)', { datPath, xorKey, hasAesKey: Boolean(aesKeyForNative) })
+      this.logInfo('开始解密DAT文件', { datPath, xorKey, hasAesKey: Boolean(aesKeyForNative) })
       this.emitDecryptProgress(payload, cacheKey, 'decrypting', 58, 'running')
       const nativeResult = this.tryDecryptDatWithNative(datPath, xorKey, aesKeyForNative)
       if (!nativeResult) {
@@ -493,50 +514,11 @@ export class ImageDecryptService {
   }
 
   private resolveAccountDir(dbPath: string, wxid: string): string | null {
-    const cleanedWxid = this.cleanAccountDirName(wxid)
-    const normalized = dbPath.replace(/[\\/]+$/, '')
-    const cacheKey = `${normalized}|${cleanedWxid.toLowerCase()}`
-    const cached = this.accountDirCache.get(cacheKey)
-    if (cached && existsSync(cached)) return cached
-    if (cached && !existsSync(cached)) {
-      this.accountDirCache.delete(cacheKey)
-    }
-
-    const direct = join(normalized, cleanedWxid)
-    if (existsSync(direct)) {
-      this.accountDirCache.set(cacheKey, direct)
-      return direct
-    }
-
-    if (this.isAccountDir(normalized)) {
-      this.accountDirCache.set(cacheKey, normalized)
-      return normalized
-    }
-
-    try {
-      const entries = readdirSync(normalized)
-      const lowerWxid = cleanedWxid.toLowerCase()
-      for (const entry of entries) {
-        const entryPath = join(normalized, entry)
-        if (!this.isDirectory(entryPath)) continue
-        const lowerEntry = entry.toLowerCase()
-        if (lowerEntry === lowerWxid || lowerEntry.startsWith(`${lowerWxid}_`)) {
-          if (this.isAccountDir(entryPath)) {
-            this.accountDirCache.set(cacheKey, entryPath)
-            return entryPath
-          }
-        }
-      }
-    } catch { }
-
-    return null
+    return this.configService.getAccountDir(dbPath, wxid)
   }
 
   private resolveCurrentAccountDir(): string | null {
-    const wxid = this.configService.get('myWxid')
-    const dbPath = this.configService.get('dbPath')
-    if (!wxid || !dbPath) return null
-    return this.resolveAccountDir(dbPath, wxid)
+    return this.configService.getAccountDir()
   }
 
   /**
@@ -1239,8 +1221,9 @@ export class ImageDecryptService {
     const decryptKey = this.configService.get('decryptKey')
     const wxid = this.configService.get('myWxid')
     if (!dbPath || !decryptKey || !wxid) return false
-    const cleanedWxid = this.cleanAccountDirName(wxid)
-    return await wcdbService.open(dbPath, decryptKey, cleanedWxid)
+    const accountDir = this.configService.getAccountDir(dbPath, wxid)
+    if (!accountDir) return false
+    return await wcdbService.open(accountDir, decryptKey)
   }
 
   private getRowValue(row: any, column: string): any {
@@ -1404,7 +1387,8 @@ export class ImageDecryptService {
   private findCachedOutputByDatPath(datPath: string, sessionId?: string, preferHd = false): string | null {
     const candidates = this.buildCacheOutputCandidatesFromDat(datPath, sessionId, preferHd)
     for (const candidate of candidates) {
-      if (existsSync(candidate)) return candidate
+      if (!existsSync(candidate)) continue
+      if (this.isUsableImageCacheFile(candidate)) return candidate
     }
     return null
   }
@@ -1556,7 +1540,117 @@ export class ImageDecryptService {
         })
       }
     }
-    return result
+    if (result) return result
+    const fallback = this.tryDecryptDatWithJs(datPath, xorKey, aesKey)
+    if (fallback) {
+      this.logInfo('JS DAT 解密 fallback 已启用', { datPath, ext: fallback.ext })
+    }
+    return fallback
+  }
+
+  private tryDecryptDatWithJs(
+    datPath: string,
+    xorKey: number,
+    aesKey?: string
+  ): { data: Buffer; ext: string; isWxgf: boolean } | null {
+    try {
+      const encrypted = readFileSync(datPath)
+      const directExt = this.detectImageExtension(encrypted)
+      if (directExt) return { data: encrypted, ext: directExt, isWxgf: false }
+
+      const candidates: Buffer[] = []
+      const aesKeyText = String(aesKey || '').trim()
+      const datVersion = this.getDatVersion(encrypted)
+      if (datVersion === 2 && aesKeyText.length >= 16) {
+        try {
+          candidates.push(this.decryptDatV4WithJs(encrypted, xorKey, Buffer.from(aesKeyText, 'ascii').subarray(0, 16)))
+        } catch { }
+      }
+      if (datVersion !== 2) {
+        candidates.push(this.decryptDatV3WithJs(encrypted, xorKey))
+      }
+
+      for (const candidate of candidates) {
+        const ext = this.detectImageExtension(candidate)
+        if (ext) return { data: candidate, ext, isWxgf: false }
+      }
+    } catch (error) {
+      this.logError('JS DAT 解密 fallback 失败', error, { datPath })
+    }
+    return null
+  }
+
+  private decryptDatV3WithJs(data: Buffer, xorKey: number): Buffer {
+    const output = Buffer.allocUnsafe(data.length)
+    for (let i = 0; i < data.length; i += 1) {
+      output[i] = data[i] ^ xorKey
+    }
+    return output
+  }
+
+  private decryptDatV4WithJs(data: Buffer, xorKey: number, aesKey: Buffer): Buffer {
+    if (data.length < 0x0f) {
+      throw new Error('dat file too small')
+    }
+    const header = data.subarray(0, 0x0f)
+    const payload = data.subarray(0x0f)
+    const aesSize = this.readInt32LeSafe(header, 6)
+    const xorSize = this.readInt32LeSafe(header, 10)
+    const remainder = ((aesSize % 16) + 16) % 16
+    const alignedAesSize = aesSize + (16 - remainder)
+    if (alignedAesSize > payload.length) throw new Error('invalid aes size')
+
+    const aesData = payload.subarray(0, alignedAesSize)
+
+    let plainAes = Buffer.alloc(0)
+    if (aesData.length > 0) {
+      const decipher = crypto.createDecipheriv('aes-128-ecb', aesKey, Buffer.alloc(0))
+      decipher.setAutoPadding(false)
+      plainAes = this.strictRemovePkcs7Padding(Buffer.concat([decipher.update(aesData), decipher.final()]))
+    }
+
+    const remaining = payload.subarray(alignedAesSize)
+    if (xorSize < 0 || xorSize > remaining.length) throw new Error('invalid xor size')
+
+    let rawData = Buffer.alloc(0)
+    let decodedXor = Buffer.alloc(0)
+    if (xorSize > 0) {
+      const rawLength = remaining.length - xorSize
+      if (rawLength < 0) throw new Error('invalid raw size')
+      rawData = remaining.subarray(0, rawLength)
+      const xorData = remaining.subarray(rawLength)
+      decodedXor = Buffer.allocUnsafe(xorData.length)
+      for (let i = 0; i < xorData.length; i += 1) {
+        decodedXor[i] = xorData[i] ^ xorKey
+      }
+    } else {
+      rawData = remaining
+    }
+    return Buffer.concat([plainAes, rawData, decodedXor])
+  }
+
+  private getDatVersion(data: Buffer): number {
+    if (data.length < 6) return 0
+    const sigV1 = Buffer.from([0x07, 0x08, 0x56, 0x31, 0x08, 0x07])
+    const sigV2 = Buffer.from([0x07, 0x08, 0x56, 0x32, 0x08, 0x07])
+    if (data.subarray(0, 6).equals(sigV1)) return 1
+    if (data.subarray(0, 6).equals(sigV2)) return 2
+    return 0
+  }
+
+  private readInt32LeSafe(buffer: Buffer, offset: number): number {
+    if (offset < 0 || offset + 4 > buffer.length) throw new Error('invalid int32 offset')
+    return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16) | (buffer[offset + 3] << 24)
+  }
+
+  private strictRemovePkcs7Padding(data: Buffer): Buffer {
+    if (data.length === 0) throw new Error('empty decrypted data')
+    const pad = data[data.length - 1]
+    if (pad <= 0 || pad > 16 || pad > data.length) throw new Error('invalid pkcs7 padding')
+    for (let i = data.length - pad; i < data.length; i += 1) {
+      if (data[i] !== pad) throw new Error('invalid pkcs7 padding')
+    }
+    return data.subarray(0, data.length - pad)
   }
 
   private detectImageExtension(buffer: Buffer): string | null {
@@ -1630,6 +1724,73 @@ export class ImageDecryptService {
     return ext === '.gif' || ext === '.png' || ext === '.jpg' || ext === '.jpeg' || ext === '.webp'
   }
 
+  private isUsableImageCacheFile(filePath: string): boolean {
+    if (!this.isImageFile(filePath)) return false
+    if (!existsSync(filePath)) return false
+    if (this.isLikelyCorruptedDecodedImage(filePath)) {
+      this.logInfo('[ImageDecrypt] 跳过疑似损坏缓存文件', { filePath })
+      void rm(filePath, { force: true }).catch(() => { })
+      return false
+    }
+    return true
+  }
+
+  private isLikelyCorruptedDecodedImage(filePath: string): boolean {
+    try {
+      const ext = extname(filePath).toLowerCase()
+      if (ext !== '.jpg' && ext !== '.jpeg') return false
+      const data = readFileSync(filePath)
+      return this.isLikelyCorruptedJpegBuffer(data)
+    } catch {
+      return false
+    }
+  }
+
+  private isLikelyCorruptedJpegBuffer(data: Buffer): boolean {
+    if (data.length < 4096) return false
+    let zeroCount = 0
+    for (let i = 0; i < data.length; i += 1) {
+      if (data[i] === 0x00) zeroCount += 1
+    }
+    const zeroRatio = zeroCount / data.length
+    if (zeroRatio >= 0.985) return true
+
+    const hasLavcTag = data.length >= 24 && data.subarray(0, 24).includes(Buffer.from('Lavc'))
+    if (!hasLavcTag) return false
+
+    // JPEG 扫描段若几乎全是 0，通常表示解码失败但被编码器强行输出。
+    let sosPos = -1
+    for (let i = 2; i < data.length - 1; i += 1) {
+      if (data[i] === 0xff && data[i + 1] === 0xda) {
+        sosPos = i
+        break
+      }
+    }
+    if (sosPos < 0 || sosPos + 4 >= data.length) return zeroRatio >= 0.95
+
+    const sosLength = (data[sosPos + 2] << 8) | data[sosPos + 3]
+    const scanStart = sosPos + 2 + sosLength
+    if (scanStart >= data.length - 2) return zeroRatio >= 0.95
+
+    let eoiPos = -1
+    for (let i = data.length - 2; i >= scanStart; i -= 1) {
+      if (data[i] === 0xff && data[i + 1] === 0xd9) {
+        eoiPos = i
+        break
+      }
+    }
+    if (eoiPos < 0 || eoiPos <= scanStart) return zeroRatio >= 0.95
+
+    const scanData = data.subarray(scanStart, eoiPos)
+    if (scanData.length < 1024) return zeroRatio >= 0.95
+    let scanZeroCount = 0
+    for (let i = 0; i < scanData.length; i += 1) {
+      if (scanData[i] === 0x00) scanZeroCount += 1
+    }
+    const scanZeroRatio = scanZeroCount / scanData.length
+    return scanZeroRatio >= 0.985
+  }
+
   /**
    * 解包 wxgf 格式
    * wxgf 是微信的图片格式，内部使用 HEVC 编码
@@ -1653,41 +1814,96 @@ export class ImageDecryptService {
       }
     }
 
-    // 提取 HEVC NALU 裸流
-    const hevcData = this.extractHevcNalu(buffer)
-    // 优先用提取的 NALU 裸流，提取失败则跳过 wxgf 头部直接用原始数据
-    const feedData = (hevcData && hevcData.length >= 100) ? hevcData : buffer.subarray(4)
+    const hevcCandidates = this.buildWxgfHevcCandidates(buffer)
     this.logInfo('unwrapWxgf: 准备 ffmpeg 转换', {
-      naluExtracted: !!(hevcData && hevcData.length >= 100),
-      feedSize: feedData.length
+      candidateCount: hevcCandidates.length,
+      candidates: hevcCandidates.map((item) => `${item.name}:${item.data.length}`)
     })
 
-    // 尝试用 ffmpeg 转换
-    try {
-      const jpgData = await this.convertHevcToJpg(feedData)
-      if (jpgData && jpgData.length > 0) {
+    for (const candidate of hevcCandidates) {
+      try {
+        const jpgData = await this.convertHevcToJpg(candidate.data)
+        if (!jpgData || jpgData.length === 0) continue
         return { data: jpgData, isWxgf: false }
+      } catch (e) {
+        this.logError('unwrapWxgf: 候选流转换失败', e, { candidate: candidate.name })
       }
-    } catch (e) {
-      this.logError('unwrapWxgf: ffmpeg 转换失败', e)
     }
 
-    return { data: feedData, isWxgf: true }
+    const fallback = hevcCandidates[0]?.data || buffer.subarray(4)
+    return { data: fallback, isWxgf: true }
   }
 
-  /**
-   * 从 wxgf 数据中提取 HEVC NALU 裸流
-   */
-  private extractHevcNalu(buffer: Buffer): Buffer | null {
+  private buildWxgfHevcCandidates(buffer: Buffer): Array<{ name: string; data: Buffer }> {
+    const units = this.extractHevcNaluUnits(buffer)
+    const candidates: Array<{ name: string; data: Buffer }> = []
+
+    const addCandidate = (name: string, data: Buffer | null | undefined): void => {
+      if (!data || data.length < 100) return
+      if (candidates.some((item) => item.data.equals(data))) return
+      candidates.push({ name, data })
+    }
+
+    // 1) 优先尝试按 VPS(32) 分组后的候选流
+    const vpsStarts: number[] = []
+    for (let i = 0; i < units.length; i += 1) {
+      const unit = units[i]
+      if (!unit || unit.length < 2) continue
+      const type = (unit[0] >> 1) & 0x3f
+      if (type === 32) vpsStarts.push(i)
+    }
+    const groups: Array<{ index: number; data: Buffer; size: number }> = []
+    for (let i = 0; i < vpsStarts.length; i += 1) {
+      const start = vpsStarts[i]
+      const end = i + 1 < vpsStarts.length ? vpsStarts[i + 1] : units.length
+      const groupUnits = units.slice(start, end)
+      if (groupUnits.length === 0) continue
+      let hasVcl = false
+      for (const unit of groupUnits) {
+        if (!unit || unit.length < 2) continue
+        const type = (unit[0] >> 1) & 0x3f
+        if (type === 19 || type === 20 || type === 1) {
+          hasVcl = true
+          break
+        }
+      }
+      if (!hasVcl) continue
+      const merged = this.mergeHevcNaluUnits(groupUnits)
+      groups.push({ index: i, data: merged, size: merged.length })
+    }
+    groups.sort((a, b) => b.size - a.size)
+    for (const group of groups) {
+      addCandidate(`group_${group.index}`, group.data)
+    }
+
+    // 2) 全量扫描提取流
+    addCandidate('scan_all_nalus', this.mergeHevcNaluUnits(units))
+
+    // 3) 兜底：直接跳过 wxgf 头喂 ffmpeg
+    addCandidate('raw_skip4', buffer.subarray(4))
+
+    return candidates
+  }
+
+  private mergeHevcNaluUnits(units: Buffer[]): Buffer {
+    if (!Array.isArray(units) || units.length === 0) return Buffer.alloc(0)
+    const merged: Buffer[] = []
+    for (const unit of units) {
+      if (!unit || unit.length < 2) continue
+      merged.push(Buffer.from([0x00, 0x00, 0x00, 0x01]))
+      merged.push(unit)
+    }
+    return Buffer.concat(merged)
+  }
+
+  private extractHevcNaluUnits(buffer: Buffer): Buffer[] {
     const starts: number[] = []
     let i = 4
-
     while (i < buffer.length - 3) {
       const hasPrefix4 = buffer[i] === 0x00 && buffer[i + 1] === 0x00 &&
         buffer[i + 2] === 0x00 && buffer[i + 3] === 0x01
       const hasPrefix3 = buffer[i] === 0x00 && buffer[i + 1] === 0x00 &&
         buffer[i + 2] === 0x01
-
       if (hasPrefix4 || hasPrefix3) {
         starts.push(i)
         i += hasPrefix4 ? 4 : 3
@@ -1695,10 +1911,11 @@ export class ImageDecryptService {
       }
       i += 1
     }
+    if (starts.length === 0) return []
 
-    if (starts.length === 0) return null
-
-    const nalUnits: Buffer[] = []
+    const units: Buffer[] = []
+    let keptUnits = 0
+    let droppedUnits = 0
     for (let index = 0; index < starts.length; index += 1) {
       const start = starts[index]
       const end = index + 1 < starts.length ? starts[index + 1] : buffer.length
@@ -1707,12 +1924,29 @@ export class ImageDecryptService {
       const prefixLength = hasPrefix4 ? 4 : 3
       const payloadStart = start + prefixLength
       if (payloadStart >= end) continue
-      nalUnits.push(Buffer.from([0x00, 0x00, 0x00, 0x01]))
-      nalUnits.push(buffer.subarray(payloadStart, end))
+      const payload = buffer.subarray(payloadStart, end)
+      if (payload.length < 2) {
+        droppedUnits += 1
+        continue
+      }
+      if ((payload[0] & 0x80) !== 0) {
+        droppedUnits += 1
+        continue
+      }
+      units.push(payload)
+      keptUnits += 1
     }
+    return units
+  }
 
-    if (nalUnits.length === 0) return null
-    return Buffer.concat(nalUnits)
+  /**
+   * 从 wxgf 数据中提取 HEVC NALU 裸流
+   */
+  private extractHevcNalu(buffer: Buffer): Buffer | null {
+    const units = this.extractHevcNaluUnits(buffer)
+    if (units.length === 0) return null
+    const merged = this.mergeHevcNaluUnits(units)
+    return merged.length > 0 ? merged : null
   }
 
   /**
@@ -1747,18 +1981,26 @@ export class ImageDecryptService {
       await writeFile(tmpInput, hevcData)
 
       // 依次尝试: 1) -f hevc 裸流  2) 不指定格式让 ffmpeg 自动检测
-      const attempts: { label: string; inputArgs: string[] }[] = [
-        { label: 'hevc raw', inputArgs: ['-f', 'hevc', '-i', tmpInput] },
-        { label: 'h265 raw', inputArgs: ['-f', 'h265', '-i', tmpInput] },
-        { label: 'auto detect', inputArgs: ['-i', tmpInput] },
+      const attempts: { label: string; inputArgs: string[]; outputArgs?: string[] }[] = [
+        { label: 'hevc raw frame0', inputArgs: ['-f', 'hevc', '-i', tmpInput] },
+        { label: 'hevc raw frame1', inputArgs: ['-f', 'hevc', '-i', tmpInput], outputArgs: ['-vf', 'select=eq(n\\,1)'] },
+        { label: 'hevc raw frame5', inputArgs: ['-f', 'hevc', '-i', tmpInput], outputArgs: ['-vf', 'select=eq(n\\,5)'] },
+        { label: 'h265 raw frame0', inputArgs: ['-f', 'h265', '-i', tmpInput] },
+        { label: 'h265 raw frame1', inputArgs: ['-f', 'h265', '-i', tmpInput], outputArgs: ['-vf', 'select=eq(n\\,1)'] },
+        { label: 'h265 raw frame5', inputArgs: ['-f', 'h265', '-i', tmpInput], outputArgs: ['-vf', 'select=eq(n\\,5)'] },
+        { label: 'auto detect frame0', inputArgs: ['-i', tmpInput] },
+        { label: 'auto detect frame1', inputArgs: ['-i', tmpInput], outputArgs: ['-vf', 'select=eq(n\\,1)'] },
+        { label: 'auto detect frame5', inputArgs: ['-i', tmpInput], outputArgs: ['-vf', 'select=eq(n\\,5)'] },
       ]
 
       for (const attempt of attempts) {
         // 清理上一轮的输出
         try { if (existsSync(tmpOutput)) require('fs').unlinkSync(tmpOutput) } catch {}
 
-        const result = await this.runFfmpegConvert(ffmpeg, attempt.inputArgs, tmpOutput, attempt.label)
-        if (result) return result
+        const result = await this.runFfmpegConvert(ffmpeg, attempt.inputArgs, tmpOutput, attempt.label, attempt.outputArgs)
+        if (!result) continue
+        if (this.isLikelyCorruptedJpegBuffer(result)) continue
+        return result
       }
 
       return null
@@ -1771,7 +2013,13 @@ export class ImageDecryptService {
     }
   }
 
-  private runFfmpegConvert(ffmpeg: string, inputArgs: string[], tmpOutput: string, label: string): Promise<Buffer | null> {
+  private runFfmpegConvert(
+    ffmpeg: string,
+    inputArgs: string[],
+    tmpOutput: string,
+    label: string,
+    outputArgs?: string[]
+  ): Promise<Buffer | null> {
     return new Promise((resolve) => {
       const { spawn } = require('child_process')
       const errChunks: Buffer[] = []
@@ -1780,6 +2028,7 @@ export class ImageDecryptService {
         '-hide_banner', '-loglevel', 'error',
         '-y',
         ...inputArgs,
+        ...(outputArgs || []),
         '-vframes', '1', '-q:v', '2', '-f', 'image2', tmpOutput
       ]
       this.logInfo(`ffmpeg 尝试 [${label}]`, { args: args.join(' ') })

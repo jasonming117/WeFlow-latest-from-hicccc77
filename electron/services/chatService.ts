@@ -1,5 +1,6 @@
 import { join, dirname, basename, extname } from 'path'
 import { existsSync, mkdirSync, readdirSync, statSync, readFileSync, writeFileSync, copyFileSync, unlinkSync, watch, promises as fsPromises } from 'fs'
+import { createRequire } from 'module'
 import * as path from 'path'
 import * as fs from 'fs'
 import * as https from 'https'
@@ -198,6 +199,8 @@ interface ExportSessionStatsOptions {
   allowStaleCache?: boolean
   preferAccurateSpecialTypes?: boolean
   cacheOnly?: boolean
+  beginTimestamp?: number
+  endTimestamp?: number
 }
 
 interface ExportSessionStatsCacheMeta {
@@ -342,11 +345,13 @@ const FRIEND_EXCLUDE_USERNAMES = new Set(['medianote', 'floatbottle', 'qmessage'
 
 class ChatService {
   private configService: ConfigService
+  private runtimeConfig?: { dbPath?: string; decryptKey?: string; myWxid?: string }
   private connected = false
   private readonly dbMonitorListeners = new Set<(type: string, json: string) => void>()
   private messageCursors: Map<string, { cursor: number; fetched: number; batchSize: number; startTime?: number; endTime?: number; ascending?: boolean; bufferedMessages?: any[] }> = new Map()
   private messageCursorMutex: boolean = false
   private readonly messageBatchDefault = 50
+  private readonly messageCursorSessionLimit = 8
   private avatarCache: Map<string, ContactCacheEntry>
   private readonly avatarCacheTtlMs = 10 * 60 * 1000
   private readonly defaultV1AesKey = 'cfcd208495d565ef'
@@ -425,6 +430,9 @@ class ChatService {
   private contactExtendedSelectableColumns: string[] | null = null
   private contactLabelNameMapCache: Map<number, string> | null = null
   private contactLabelNameMapCacheAt = 0
+  private readonly visibilityAnomalyLogWindowMs = 30000
+  private readonly visibilityAnomalyLogBurst = 3
+  private visibilityAnomalyLogState = new Map<string, { windowStart: number; total: number; suppressed: number }>()
   private readonly contactLabelNameMapCacheTtlMs = 10 * 60 * 1000
   private contactsLoadInFlight: { mode: 'lite' | 'full'; promise: Promise<{ success: boolean; contacts?: ContactInfo[]; error?: string }> } | null = null
   private contactsMemoryCache = new Map<'lite' | 'full', { scope: string; updatedAt: number; contacts: ContactInfo[] }>()
@@ -444,6 +452,10 @@ class ChatService {
     // 初始化LRU缓存，限制大小防止内存泄漏
     this.voiceWavCache = new LRUCache(this.voiceWavCacheMaxEntries)
     this.voiceTranscriptCache = new LRUCache(1000) // 最多缓存1000条转写记录
+  }
+
+  setRuntimeConfig(config: { dbPath?: string; decryptKey?: string; myWxid?: string; resourcesPath?: string; appPath?: string; isPackaged?: boolean }): void {
+    this.runtimeConfig = config
   }
 
   /**
@@ -477,7 +489,7 @@ class ChatService {
     return true
   }
 
-  private extractErrorCode(message?: string): number | null {
+  private extractErrorCode(message?: string | null): number | null {
     const text = String(message || '').trim()
     if (!text) return null
     const match = text.match(/(?:错误码\s*[:：]\s*|\()(-?\d{2,6})(?:\)|\b)/)
@@ -531,12 +543,9 @@ class ChatService {
    */
   async connect(): Promise<{ success: boolean; error?: string }> {
     try {
-      if (this.connected && wcdbService.isReady()) {
-        return { success: true }
-      }
-      const wxid = this.configService.get('myWxid')
-      const dbPath = this.configService.get('dbPath')
-      const decryptKey = this.configService.get('decryptKey')
+      const wxid = String(this.runtimeConfig?.myWxid || this.configService.get('myWxid') || '').trim()
+      const dbPath = String(this.runtimeConfig?.dbPath || this.configService.get('dbPath') || '').trim()
+      const decryptKey = String(this.runtimeConfig?.decryptKey || this.configService.get('decryptKey') || '').trim()
       if (!wxid) {
         return { success: false, error: '请先在设置页面配置微信ID' }
       }
@@ -547,8 +556,17 @@ class ChatService {
         return { success: false, error: '请先在设置页面配置解密密钥' }
       }
 
-      const cleanedWxid = this.cleanAccountDirName(wxid)
-      const openOk = await wcdbService.open(dbPath, decryptKey, cleanedWxid)
+      if (this.connected && wcdbService.isReady()) {
+        return { success: true }
+      }
+
+      // 使用 ConfigService 统一解析账号目录
+      const accountDir = this.configService.getAccountDir(dbPath, wxid)
+      if (!accountDir) {
+        return { success: false, error: '未找到账号目录，请检查数据库路径和微信ID配置' }
+      }
+
+      const openOk = await wcdbService.open(accountDir, decryptKey)
       if (!openOk) {
         const detailedError = this.toCodeOnlyMessage(await wcdbService.getLastInitError())
         await this.maybeShowInitFailureDialog(detailedError)
@@ -660,6 +678,9 @@ class ChatService {
     if (this.connected && wcdbService.isReady()) {
       return { success: true }
     }
+    if (!wcdbService.isReady()) {
+      this.monitorSetup = false
+    }
     const result = await this.connect()
     if (!result.success) {
       this.connected = false
@@ -671,6 +692,27 @@ class ChatService {
   /**
    * 关闭数据库连接
    */
+  private async closeMessageCursorBySession(sessionId: string): Promise<void> {
+    const state = this.messageCursors.get(sessionId)
+    if (!state) return
+    try {
+      await wcdbService.closeMessageCursor(state.cursor)
+    } catch (error) {
+      console.warn(`[ChatService] 关闭消息游标失败: ${sessionId}`, error)
+    } finally {
+      this.messageCursors.delete(sessionId)
+    }
+  }
+
+  private async trimMessageCursorStates(activeSessionId: string): Promise<void> {
+    if (this.messageCursors.size <= this.messageCursorSessionLimit) return
+    for (const [sessionId] of this.messageCursors) {
+      if (this.messageCursors.size <= this.messageCursorSessionLimit) break
+      if (sessionId === activeSessionId) continue
+      await this.closeMessageCursorBySession(sessionId)
+    }
+  }
+
   close(): void {
     try {
       for (const state of this.messageCursors.values()) {
@@ -682,6 +724,7 @@ class ChatService {
       console.error('ChatService: 关闭数据库失败:', e)
     }
     this.connected = false
+    this.monitorSetup = false
   }
 
   /**
@@ -718,8 +761,12 @@ class ChatService {
     try {
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) return { success: false, error: connectResult.error }
-      const normalizedIds = Array.from(new Set((sessionIds || []).map((id) => String(id || '').trim()).filter(Boolean)))
-      return await wcdbService.checkMessageAntiRevokeTriggers(normalizedIds)
+      const { validIds, invalidRows } = await this.filterAntiRevokeSessionIds(sessionIds)
+      const result = validIds.length > 0
+        ? await wcdbService.checkMessageAntiRevokeTriggers(validIds)
+        : { success: true, rows: [] }
+      if (!result.success) return result
+      return { success: true, rows: [...(result.rows || []), ...invalidRows] }
     } catch (e) {
       return { success: false, error: String(e) }
     }
@@ -733,8 +780,12 @@ class ChatService {
     try {
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) return { success: false, error: connectResult.error }
-      const normalizedIds = Array.from(new Set((sessionIds || []).map((id) => String(id || '').trim()).filter(Boolean)))
-      return await wcdbService.installMessageAntiRevokeTriggers(normalizedIds)
+      const { validIds, invalidRows } = await this.filterAntiRevokeSessionIds(sessionIds)
+      const result = validIds.length > 0
+        ? await wcdbService.installMessageAntiRevokeTriggers(validIds)
+        : { success: true, rows: [] }
+      if (!result.success) return result
+      return { success: true, rows: [...(result.rows || []), ...invalidRows] }
     } catch (e) {
       return { success: false, error: String(e) }
     }
@@ -748,8 +799,12 @@ class ChatService {
     try {
       const connectResult = await this.ensureConnected()
       if (!connectResult.success) return { success: false, error: connectResult.error }
-      const normalizedIds = Array.from(new Set((sessionIds || []).map((id) => String(id || '').trim()).filter(Boolean)))
-      return await wcdbService.uninstallMessageAntiRevokeTriggers(normalizedIds)
+      const { validIds, invalidRows } = await this.filterAntiRevokeSessionIds(sessionIds)
+      const result = validIds.length > 0
+        ? await wcdbService.uninstallMessageAntiRevokeTriggers(validIds)
+        : { success: true, rows: [] }
+      if (!result.success) return result
+      return { success: true, rows: [...(result.rows || []), ...invalidRows] }
     } catch (e) {
       return { success: false, error: String(e) }
     }
@@ -780,10 +835,24 @@ class ChatService {
         return { success: false, error: `会话表异常: ${detail}${tableInfo}${tables}${columns}` }
       }
 
+      const openimLocalTypeMap = await this.loadContactLocalTypeMapForEnterpriseOpenim(rows.map((row) =>
+        String(
+          row.username ||
+          row.user_name ||
+          row.userName ||
+          row.usrName ||
+          row.UsrName ||
+          row.talker ||
+          row.talker_id ||
+          row.talkerId ||
+          ''
+        ).trim()
+      ))
+
       // 转换为 ChatSession（先加载缓存，但不等待额外状态查询）
       const sessions: ChatSession[] = []
       const now = Date.now()
-      const myWxid = this.configService.get('myWxid')
+      const myWxid = this.configService.getMyWxidCleaned()
 
       for (const row of rows) {
         const username =
@@ -797,7 +866,11 @@ class ChatService {
           row.talkerId ||
           ''
 
-        if (!this.shouldKeepSession(username)) continue
+        let sessionLocalType = this.getSessionLocalType(row)
+        if (!Number.isFinite(sessionLocalType) && this.isEnterpriseOpenimUsername(username)) {
+          sessionLocalType = openimLocalTypeMap.get(username)
+        }
+        if (!this.shouldKeepSession(username, sessionLocalType)) continue
 
         const sortTs = parseInt(
           row.sort_timestamp ||
@@ -889,6 +962,208 @@ class ChatService {
     }
   }
 
+  async getAntiRevokeSessions(): Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }> {
+    try {
+      const result = await this.getSessions()
+      if (!result.success || !Array.isArray(result.sessions)) {
+        return { success: false, error: result.error || '获取会话失败' }
+      }
+
+      return {
+        success: true,
+        sessions: result.sessions.filter((session) => !String(session.username || '').startsWith('gh_'))
+      }
+    } catch (e) {
+      console.error('ChatService: 获取防撤回会话列表失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  async markAllSessionsRead(): Promise<{ success: boolean; error?: string }> {
+    try {
+      const connectResult = await this.ensureConnected()
+      if (!connectResult.success) {
+        return { success: false, error: connectResult.error }
+      }
+      const result = await wcdbService.markAllSessionsRead()
+      if (result.success) {
+        this.syntheticUnreadState.clear()
+      }
+      return result
+    } catch (e) {
+      console.error('ChatService: 一键已读失败:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  private getSessionUsername(row: Record<string, any>): string {
+    return String(
+      row.username ||
+      row.user_name ||
+      row.userName ||
+      row.usrName ||
+      row.UsrName ||
+      row.talker ||
+      row.talker_id ||
+      row.talkerId ||
+      ''
+    ).trim()
+  }
+
+  private isAntiRevokeContactRow(username: string, row: Record<string, any>): boolean {
+    if (!username) return false
+    if (username.endsWith('@chatroom')) return true
+    if (username.startsWith('gh_')) return false
+
+    const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], Number.NaN)
+    const lowered = username.toLowerCase()
+    if (this.isEnterpriseOpenimUsername(username)) {
+      return this.isAllowedEnterpriseOpenimByLocalType(username, localType)
+    }
+    if (lowered.startsWith('weixin') && lowered !== 'weixin') return true
+    return localType === 1 && !FRIEND_EXCLUDE_USERNAMES.has(username)
+  }
+
+  private async loadAntiRevokeContactMap(usernames: string[]): Promise<Map<string, { displayName?: string }>> {
+    const targets = Array.from(new Set((usernames || []).map((value) => String(value || '').trim()).filter(Boolean)))
+    const map = new Map<string, { displayName?: string }>()
+    if (targets.length === 0) return map
+
+    try {
+      const contactResult = await wcdbService.getContactsCompact(targets)
+      if (!contactResult.success || !Array.isArray(contactResult.contacts)) return map
+
+      for (const row of contactResult.contacts as Record<string, any>[]) {
+        const username = String(row.username || '').trim()
+        if (!username || !this.isAntiRevokeContactRow(username, row)) continue
+        map.set(username, {
+          displayName: String(row.remark || row.nick_name || row.nickName || row.alias || username).trim()
+        })
+      }
+    } catch {
+      return map
+    }
+
+    return map
+  }
+
+  private async hasAntiRevokeMessageTables(sessionId: string): Promise<boolean> {
+    try {
+      const tableStatsResult = await wcdbService.getMessageTableStats(sessionId)
+      if (!tableStatsResult.success || !Array.isArray(tableStatsResult.tables)) return false
+      return tableStatsResult.tables.some((row: Record<string, any>) => {
+        const tableName = String(row.table_name || row.tableName || '').trim()
+        return tableName.length > 0
+      })
+    } catch {
+      return false
+    }
+  }
+
+  private async buildAntiRevokeSessionsFromRows(rows: Record<string, any>[]): Promise<ChatSession[]> {
+    if (rows.length > 0 && (rows[0]._error || rows[0]._info)) return []
+
+    const candidateRows: Array<{ username: string; row: Record<string, any> }> = []
+    const privateCandidateIds: string[] = []
+    const openimLocalTypeMap = await this.loadContactLocalTypeMapForEnterpriseOpenim(rows.map((row) => this.getSessionUsername(row)))
+
+    for (const row of rows) {
+      const username = this.getSessionUsername(row)
+      if (!username) continue
+
+      let sessionLocalType = this.getSessionLocalType(row)
+      if (!Number.isFinite(sessionLocalType) && this.isEnterpriseOpenimUsername(username)) {
+        sessionLocalType = openimLocalTypeMap.get(username)
+      }
+      if (!this.shouldKeepSession(username, sessionLocalType)) continue
+
+      if (username.endsWith('@chatroom')) {
+        candidateRows.push({ username, row })
+      } else {
+        privateCandidateIds.push(username)
+        candidateRows.push({ username, row })
+      }
+    }
+
+    const contactMap = await this.loadAntiRevokeContactMap(privateCandidateIds)
+    const sessions: ChatSession[] = []
+    const myWxid = this.configService.getMyWxidCleaned()
+    const now = Date.now()
+
+    for (const { username, row } of candidateRows) {
+      const isGroup = username.endsWith('@chatroom')
+      if (!isGroup && !contactMap.has(username)) continue
+      if (!await this.hasAntiRevokeMessageTables(username)) continue
+
+      const sortTs = parseInt(
+        row.sort_timestamp ||
+        row.sortTimestamp ||
+        row.sort_time ||
+        row.sortTime ||
+        '0',
+        10
+      )
+      const lastTs = parseInt(
+        row.last_timestamp ||
+        row.lastTimestamp ||
+        row.last_msg_time ||
+        row.lastMsgTime ||
+        String(sortTs),
+        10
+      )
+      const summary = this.cleanString(row.summary || row.digest || row.last_msg || row.lastMsg || '')
+      const lastMsgType = parseInt(row.last_msg_type || row.lastMsgType || '0', 10)
+      const cached = this.avatarCache.get(username)
+      const contact = contactMap.get(username)
+
+      const session: ChatSession = {
+        username,
+        type: parseInt(row.type || '0', 10),
+        unreadCount: parseInt(row.unread_count || row.unreadCount || row.unreadcount || '0', 10),
+        summary: summary || this.getMessageTypeLabel(lastMsgType),
+        sortTimestamp: sortTs,
+        lastTimestamp: lastTs,
+        lastMsgType,
+        displayName: contact?.displayName || cached?.displayName || username,
+        avatarUrl: cached?.avatarUrl,
+        lastMsgSender: row.last_msg_sender,
+        lastSenderDisplayName: row.last_sender_display_name,
+        selfWxid: myWxid
+      }
+
+      const cachedStatus = this.sessionStatusCache.get(username)
+      if (cachedStatus && now - cachedStatus.updatedAt <= this.sessionStatusCacheTtlMs) {
+        session.isFolded = cachedStatus.isFolded
+        session.isMuted = cachedStatus.isMuted
+      }
+
+      sessions.push(session)
+    }
+
+    return sessions
+  }
+
+  private async filterAntiRevokeSessionIds(sessionIds: string[]): Promise<{
+    validIds: string[]
+    invalidRows: Array<{ sessionId: string; success: false; error: string }>
+  }> {
+    const normalizedIds = Array.from(new Set((sessionIds || []).map((id) => String(id || '').trim()).filter(Boolean)))
+    if (normalizedIds.length === 0) return { validIds: [], invalidRows: [] }
+
+    const sessionsResult = await this.getAntiRevokeSessions()
+    const allowedIds = new Set((sessionsResult.sessions || []).map((session) => session.username))
+    const validIds = normalizedIds.filter((sessionId) => allowedIds.has(sessionId))
+    const invalidRows = normalizedIds
+      .filter((sessionId) => !allowedIds.has(sessionId))
+      .map((sessionId) => ({
+        sessionId,
+        success: false as const,
+        error: '该会话不是联系人或群聊，或不存在可安装防撤回的消息表'
+      }))
+
+    return { validIds, invalidRows }
+  }
+
   private async addMissingOfficialSessions(sessions: ChatSession[], myWxid?: string): Promise<void> {
     const existing = new Set(sessions.map((session) => String(session.username || '').trim()).filter(Boolean))
     try {
@@ -897,13 +1172,19 @@ class ChatService {
 
       for (const row of contactResult.contacts as Record<string, any>[]) {
         const username = String(row.username || '').trim()
-        if (!username.startsWith('gh_') || existing.has(username)) continue
+        if (!username || existing.has(username)) continue
+        const lowered = username.toLowerCase()
+        const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], Number.NaN)
+        const isOfficial = username.startsWith('gh_')
+        const isSpecialWeixin = lowered.startsWith('weixin') && lowered !== 'weixin'
+        const isSpecialOpenim = this.isAllowedEnterpriseOpenimByLocalType(username, localType)
+        if (!isOfficial && !isSpecialWeixin && !isSpecialOpenim) continue
 
         sessions.push({
           username,
           type: 0,
           unreadCount: 0,
-          summary: '查看公众号历史消息',
+          summary: isOfficial ? '查看公众号历史消息' : '暂无会话记录',
           sortTimestamp: 0,
           lastTimestamp: 0,
           lastMsgType: 0,
@@ -1747,7 +2028,7 @@ class ChatService {
 
   private getContactsCacheScope(): string {
     const dbPath = String(this.configService.get('dbPath') || '').trim()
-    const myWxid = String(this.configService.get('myWxid') || '').trim()
+    const myWxid = String(this.configService.getMyWxidCleaned() || '').trim()
     return `${dbPath}::${myWxid}`
   }
 
@@ -1851,11 +2132,21 @@ class ChatService {
         let type: 'friend' | 'group' | 'official' | 'former_friend' | 'other' = 'other'
         const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], 0)
         const quanPin = String(this.getRowField(row, ['quan_pin', 'quanPin', 'WCDB_CT_quan_pin']) || '').trim()
+        const loweredUsername = username.toLowerCase()
+        const isOpenimEnterprise = this.isEnterpriseOpenimUsername(username)
+        if (isOpenimEnterprise && !this.isAllowedEnterpriseOpenimByLocalType(username, localType)) {
+          continue
+        }
+        const isVisibleWeixinContact = loweredUsername.startsWith('weixin') && loweredUsername !== 'weixin'
 
         if (username.endsWith('@chatroom')) {
           type = 'group'
         } else if (username.startsWith('gh_')) {
           type = 'official'
+        } else if (isOpenimEnterprise) {
+          type = 'friend'
+        } else if (isVisibleWeixinContact) {
+          type = 'friend'
         } else if (localType === 1 && !FRIEND_EXCLUDE_USERNAMES.has(username)) {
           type = 'friend'
         } else if (localType === 0 && quanPin) {
@@ -1941,7 +2232,7 @@ class ChatService {
         return { success: false, error: connectResult.error || '数据库未连接' }
       }
 
-      const batchSize = Math.max(1, limit || this.messageBatchDefault)
+      const requestLimit = Math.max(1, Math.floor(limit || this.messageBatchDefault))
 
       // 使用互斥锁保护游标状态访问
       while (this.messageCursorMutex) {
@@ -1956,16 +2247,22 @@ class ChatService {
       }
 
       let state = this.messageCursors.get(sessionId)
+      if (state) {
+        // refresh insertion order so Map iteration approximates LRU
+        this.messageCursors.delete(sessionId)
+        this.messageCursors.set(sessionId, state)
+      }
 
       // 只在以下情况重新创建游标:
       // 1. 没有游标状态
-      // 2. offset 为 0 (重新加载会话)
-      // 3. batchSize 改变
-      // 4. startTime/endTime 改变（视为全新查询）
-      // 5. ascending 改变
+      // 2. offset 变化导致游标位置不一致
+      // 3. startTime/endTime 改变（视为全新查询）
+      // 4. ascending 改变
+      //
+      // 注意：requestLimit 允许动态变化（前端可按“越往上拉批次越大”策略请求），
+      // 不应触发游标重建，否则会造成额外 reopen/skip 开销与抖动。
       const needNewCursor = !state ||
         offset !== state.fetched || // Offset mismatch -> must reset cursor
-        state.batchSize !== batchSize ||
         state.startTime !== startTime ||
         state.endTime !== endTime ||
         state.ascending !== ascending
@@ -1974,7 +2271,7 @@ class ChatService {
         // 关闭旧游标
         if (state) {
           try {
-            await wcdbService.closeMessageCursor(state.cursor)
+            await this.closeMessageCursorBySession(sessionId)
           } catch (e) {
             console.warn('[ChatService] 关闭旧游标失败:', e)
           }
@@ -1982,16 +2279,18 @@ class ChatService {
 
         // 创建新游标
         // 注意：WeFlow 数据库中的 create_time 是以秒为单位的
+        const cursorBatchSize = Math.max(1, Math.floor(state?.batchSize || requestLimit || this.messageBatchDefault))
         const beginTimestamp = startTime > 10000000000 ? Math.floor(startTime / 1000) : startTime
         const endTimestamp = endTime > 10000000000 ? Math.floor(endTime / 1000) : endTime
-        const cursorResult = await wcdbService.openMessageCursor(sessionId, batchSize, ascending, beginTimestamp, endTimestamp)
+        const cursorResult = await wcdbService.openMessageCursor(sessionId, cursorBatchSize, ascending, beginTimestamp, endTimestamp)
         if (!cursorResult.success || !cursorResult.cursor) {
           console.error('[ChatService] 打开消息游标失败:', cursorResult.error)
           return { success: false, error: cursorResult.error || '打开消息游标失败' }
         }
 
-        state = { cursor: cursorResult.cursor, fetched: 0, batchSize, startTime, endTime, ascending }
+        state = { cursor: cursorResult.cursor, fetched: 0, batchSize: cursorBatchSize, startTime, endTime, ascending }
         this.messageCursors.set(sessionId, state)
+        await this.trimMessageCursorStates(sessionId)
 
         // 如果需要跳过消息(offset > 0),逐批获取但不返回
         // 注意：仅在 offset === 0 时重建游标最安全；
@@ -2000,19 +2299,53 @@ class ChatService {
         if (offset > 0) {
           console.warn(`[ChatService] 新游标需跳过 ${offset} 条消息（startTime=${startTime}, endTime=${endTime}）`)
           let skipped = 0
-          const maxSkipAttempts = Math.ceil(offset / batchSize) + 5 // 防止无限循环
+          const maxSkipAttempts = Math.ceil(offset / cursorBatchSize) + 5 // 防止无限循环
           let attempts = 0
+          let emptySkipBatchStreak = 0
           while (skipped < offset && attempts < maxSkipAttempts) {
             attempts++
             const skipBatch = await wcdbService.fetchMessageBatch(state.cursor)
             if (!skipBatch.success) {
               console.error('[ChatService] 跳过消息批次失败:', skipBatch.error)
+              await this.closeMessageCursorBySession(sessionId)
               return { success: false, error: skipBatch.error || '跳过消息失败' }
             }
             if (!skipBatch.rows || skipBatch.rows.length === 0) {
+              if (skipBatch.hasMore && emptySkipBatchStreak < 2) {
+                emptySkipBatchStreak += 1
+                console.warn(
+                  `[ChatService] 跳过遇到空批次，继续重试: streak=${emptySkipBatchStreak}, skipped=${skipped}/${offset}`
+                )
+                continue
+              }
+
+              // 部分会话在“新游标 + offset 跳过”路径会出现首批空数据但实际仍有消息，
+              // 回退到稳定的 direct-offset 路径避免误判到底。
+              if (skipped === 0 && startTime === 0 && endTime === 0 && !ascending) {
+                const fallbackResult = await this.getMessagesByOffsetStable(sessionId, offset, requestLimit)
+                if (fallbackResult.success && Array.isArray(fallbackResult.messages)) {
+                  await this.closeMessageCursorBySession(sessionId)
+                  releaseMessageCursorMutex?.()
+                  this.messageCacheService.set(sessionId, fallbackResult.messages)
+                  console.warn(
+                    `[ChatService] 游标跳过异常，已切换 direct-offset 兜底: session=${sessionId}, offset=${offset}, returned=${fallbackResult.messages.length}, hasMore=${fallbackResult.hasMore === true}`
+                  )
+                  return {
+                    success: true,
+                    messages: fallbackResult.messages,
+                    hasMore: fallbackResult.hasMore === true,
+                    nextOffset: Number.isFinite(fallbackResult.nextOffset)
+                      ? Math.floor(fallbackResult.nextOffset as number)
+                      : offset + fallbackResult.messages.length
+                  }
+                }
+              }
+
               console.warn(`[ChatService] 跳过时数据耗尽: skipped=${skipped}/${offset}`)
+              await this.closeMessageCursorBySession(sessionId)
               return { success: true, messages: [], hasMore: false, nextOffset: skipped }
             }
+            emptySkipBatchStreak = 0
 
             const count = skipBatch.rows.length
             // Check if we overshot the offset
@@ -2030,6 +2363,7 @@ class ChatService {
 
             if (!skipBatch.hasMore) {
               console.warn(`[ChatService] 跳过后无更多数据: skipped=${skipped}/${offset}`)
+              await this.closeMessageCursorBySession(sessionId)
               return { success: true, messages: [], hasMore: false, nextOffset: skipped }
             }
           }
@@ -2050,7 +2384,7 @@ class ChatService {
       const collected = await this.collectVisibleMessagesFromCursor(
         sessionId,
         state.cursor,
-        limit,
+        requestLimit,
         state.bufferedMessages as Record<string, any>[] | undefined
       )
       state.bufferedMessages = collected.bufferedRows
@@ -2062,6 +2396,8 @@ class ChatService {
       const filtered = collected.messages || []
       const hasMore = collected.hasMore === true
       state.fetched += rawRowsConsumed
+      this.messageCursors.delete(sessionId)
+      this.messageCursors.set(sessionId, state)
       releaseMessageCursorMutex?.()
 
       this.messageCacheService.set(sessionId, filtered)
@@ -2170,6 +2506,55 @@ class ChatService {
     return null
   }
 
+  private async getMessagesByOffsetStable(
+    sessionId: string,
+    offset: number,
+    limit: number
+  ): Promise<{
+    success: boolean
+    messages?: Message[]
+    hasMore?: boolean
+    nextOffset?: number
+    rawRows?: number
+    filteredOut?: number
+    error?: string
+  }> {
+    const pageLimit = Math.max(1, Math.floor(limit || this.messageBatchDefault))
+    const safeOffset = Math.max(0, Math.floor(offset || 0))
+    const probeLimit = Math.min(500, pageLimit + 1)
+
+    const result = await wcdbService.getMessages(sessionId, probeLimit, safeOffset)
+    if (!result.success || !Array.isArray(result.messages)) {
+      return { success: false, error: result.error || '获取消息失败' }
+    }
+
+    const rawRows = result.messages as Record<string, any>[]
+    const hasMore = rawRows.length > pageLimit
+    const selectedRows = hasMore ? rawRows.slice(0, pageLimit) : rawRows
+    const mapped = this.mapRowsToMessages(selectedRows, sessionId)
+    const visible = mapped.filter((msg) => this.isMessageVisibleForSession(sessionId, msg))
+    const outputMessages = (visible.length === 0 && mapped.length > 0)
+      ? mapped
+      : visible
+    if (visible.length === 0 && mapped.length > 0) {
+      console.warn(`[ChatService] getMessagesByOffsetStable 可见性过滤回退: session=${sessionId} mapped=${mapped.length}`)
+    }
+    const normalized = this.normalizeMessageOrder(outputMessages)
+    if (normalized.length > 0) {
+      await this.repairEmojiMessages(normalized)
+      await this.resolveQuotedMessages(normalized, sessionId)
+    }
+
+    return {
+      success: true,
+      messages: normalized,
+      hasMore,
+      nextOffset: safeOffset + selectedRows.length,
+      rawRows: selectedRows.length,
+      filteredOut: Math.max(0, mapped.length - visible.length)
+    }
+  }
+
 
   async getLatestMessages(sessionId: string, limit: number = this.messageBatchDefault): Promise<{ success: boolean; messages?: Message[]; hasMore?: boolean; nextOffset?: number; error?: string }> {
     try {
@@ -2178,32 +2563,113 @@ class ChatService {
         return { success: false, error: connectResult.error || '数据库未连接' }
       }
 
-      const batchSize = Math.max(1, limit)
-      const cursorResult = await wcdbService.openMessageCursor(sessionId, batchSize, false, 0, 0)
-      if (!cursorResult.success || !cursorResult.cursor) {
-        return { success: false, error: cursorResult.error || '打开消息游标失败' }
+      // 聊天页首屏优先走稳定路径：固定 offset=0 的 direct-offset 读取。
+      const stableResult = await this.getMessagesByOffsetStable(sessionId, 0, limit)
+      if (!stableResult.success || !Array.isArray(stableResult.messages)) {
+        return { success: false, error: stableResult.error || '获取最新消息失败' }
       }
 
-      try {
-        const collected = await this.collectVisibleMessagesFromCursor(sessionId, cursorResult.cursor, limit)
-        if (!collected.success) {
-          return { success: false, error: collected.error || '获取消息失败' }
-        }
-        console.log(
-          `[ChatService] getLatestMessages session=${sessionId} rawRowsConsumed=${collected.rawRowsConsumed || 0} visibleMessagesReturned=${collected.messages?.length || 0} filteredOut=${collected.filteredOut || 0} nextOffset=${collected.rawRowsConsumed || 0} hasMore=${collected.hasMore === true}`
-        )
-        return {
-          success: true,
-          messages: collected.messages,
-          hasMore: collected.hasMore,
-          nextOffset: collected.rawRowsConsumed || 0
-        }
-      } finally {
-        await wcdbService.closeMessageCursor(cursorResult.cursor)
+      console.log(
+        `[ChatService] getLatestMessages(stable) session=${sessionId} rawRows=${stableResult.rawRows || 0} visibleMessagesReturned=${stableResult.messages.length} filteredOut=${stableResult.filteredOut || 0} nextOffset=${stableResult.nextOffset || 0} hasMore=${stableResult.hasMore === true}`
+      )
+      return {
+        success: true,
+        messages: stableResult.messages,
+        hasMore: stableResult.hasMore === true,
+        nextOffset: Number.isFinite(stableResult.nextOffset)
+          ? Math.floor(stableResult.nextOffset as number)
+          : stableResult.messages.length
       }
     } catch (e) {
       console.error('ChatService: 获取最新消息失败:', e)
       return { success: false, error: String(e) }
+    }
+  }
+
+  async getMessagesAround(
+    sessionId: string,
+    target: { localId?: number; createTime: number; messageKey?: string },
+    totalContextCount: number = 50
+  ): Promise<{
+    success: boolean
+    before: Message[]
+    after: Message[]
+    requested: number
+    error?: string
+  }> {
+    const requested = Math.max(1, Math.min(200, Math.floor(Number(totalContextCount) || 50)))
+    const targetCreateTime = Math.floor(Number(target?.createTime || 0))
+    if (!sessionId || targetCreateTime <= 0) {
+      return { success: false, before: [], after: [], requested, error: '无效的目标消息' }
+    }
+
+    const collect = async (ascending: boolean): Promise<Message[]> => {
+      let cursor: number | undefined
+      try {
+        const cursorResult = await wcdbService.openMessageCursorLite(
+          sessionId,
+          Math.min(240, Math.max(60, requested + 20)),
+          ascending,
+          ascending ? targetCreateTime : 0,
+          ascending ? 0 : targetCreateTime + 1
+        )
+        if (!cursorResult.success || !cursorResult.cursor) {
+          throw new Error(cursorResult.error || '打开消息游标失败')
+        }
+        cursor = cursorResult.cursor
+        const collected = await this.collectVisibleMessagesFromCursor(sessionId, cursor, requested + 1)
+        if (!collected.success) {
+          throw new Error(collected.error || '读取上下文消息失败')
+        }
+        const targetLocalId = Math.floor(Number(target?.localId || 0))
+        const targetMessageKey = String(target?.messageKey || '').trim()
+        return (collected.messages || []).filter((message) => {
+          const sameLocalId = targetLocalId > 0 && Number(message.localId || 0) === targetLocalId
+          const sameCreateTime = Number(message.createTime || 0) === targetCreateTime
+          const sameKey = Boolean(targetMessageKey && message.messageKey === targetMessageKey)
+          return !(sameKey || (sameLocalId && sameCreateTime))
+        })
+      } finally {
+        if (cursor) {
+          await wcdbService.closeMessageCursor(cursor).catch(() => {})
+        }
+      }
+    }
+
+    try {
+      const [beforeCandidatesRaw, afterCandidatesRaw] = await Promise.all([
+        collect(false),
+        collect(true)
+      ])
+      const beforeCandidates = beforeCandidatesRaw
+        .filter((message) => Number(message.createTime || 0) <= targetCreateTime)
+        .sort((a, b) => (a.createTime - b.createTime) || (a.sortSeq - b.sortSeq))
+      const afterCandidates = afterCandidatesRaw
+        .filter((message) => Number(message.createTime || 0) >= targetCreateTime)
+        .sort((a, b) => (a.createTime - b.createTime) || (a.sortSeq - b.sortSeq))
+
+      const baseBefore = Math.floor(requested / 2)
+      const baseAfter = requested - baseBefore
+      const takeAfter = Math.min(baseAfter, afterCandidates.length)
+      const takeBefore = Math.min(requested - takeAfter, beforeCandidates.length)
+      const remainingAfter = Math.max(0, requested - takeBefore - takeAfter)
+      const finalAfter = Math.min(afterCandidates.length, takeAfter + remainingAfter)
+      const finalBefore = Math.min(beforeCandidates.length, requested - finalAfter)
+
+      return {
+        success: true,
+        before: beforeCandidates.slice(Math.max(0, beforeCandidates.length - finalBefore)),
+        after: afterCandidates.slice(0, finalAfter),
+        requested
+      }
+    } catch (error) {
+      return {
+        success: false,
+        before: [],
+        after: [],
+        requested,
+        error: (error as Error).message || String(error)
+      }
     }
   }
 
@@ -2220,7 +2686,7 @@ class ChatService {
       }
 
       // 转换为 Message 对象
-      const messages = this.mapRowsToMessages(res.messages as Record<string, any>[])
+      const messages = this.mapRowsToMessages(res.messages as Record<string, any>[], sessionId)
       const normalized = this.normalizeMessageOrder(messages)
 
       // 并发检查并修复缺失 CDN URL 的表情包
@@ -2241,16 +2707,59 @@ class ChatService {
     }
   }
 
+  private compareMessagesByTimeline(a: Message, b: Message): number {
+    const aSortSeq = Math.max(0, Number(a.sortSeq || 0))
+    const bSortSeq = Math.max(0, Number(b.sortSeq || 0))
+    const aCreateTime = Math.max(0, Number(a.createTime || 0))
+    const bCreateTime = Math.max(0, Number(b.createTime || 0))
+    const aLocalId = Math.max(0, Number(a.localId || 0))
+    const bLocalId = Math.max(0, Number(b.localId || 0))
+    const aServerId = Math.max(0, Number(a.serverId || 0))
+    const bServerId = Math.max(0, Number(b.serverId || 0))
+
+    // 与 C++ 侧归并规则一致：当两侧都有 sortSeq 时优先 sortSeq，否则先看 createTime。
+    if (aSortSeq > 0 && bSortSeq > 0 && aSortSeq !== bSortSeq) {
+      return aSortSeq - bSortSeq
+    }
+    if (aCreateTime !== bCreateTime) {
+      return aCreateTime - bCreateTime
+    }
+    if (aSortSeq !== bSortSeq) {
+      return aSortSeq - bSortSeq
+    }
+    if (aLocalId !== bLocalId) {
+      return aLocalId - bLocalId
+    }
+    if (aServerId !== bServerId) {
+      return aServerId - bServerId
+    }
+
+    const aKey = String(a.messageKey || '')
+    const bKey = String(b.messageKey || '')
+    if (aKey < bKey) return -1
+    if (aKey > bKey) return 1
+    return 0
+  }
+
   private normalizeMessageOrder(messages: Message[]): Message[] {
     if (messages.length < 2) return messages
-    const first = messages[0]
-    const last = messages[messages.length - 1]
-    const firstKey = first.sortSeq || first.createTime || first.localId || 0
-    const lastKey = last.sortSeq || last.createTime || last.localId || 0
-    if (firstKey > lastKey) {
-      return [...messages].reverse()
+
+    const withIndex = messages.map((msg, index) => ({ msg, index }))
+    withIndex.sort((left, right) => {
+      const diff = this.compareMessagesByTimeline(left.msg, right.msg)
+      if (diff !== 0) return diff
+      return left.index - right.index
+    })
+
+    let changed = false
+    for (let index = 0; index < withIndex.length; index += 1) {
+      if (withIndex[index].msg !== messages[index]) {
+        changed = true
+        break
+      }
     }
-    return messages
+    if (!changed) return messages
+    return withIndex.map((entry) => entry.msg)
   }
 
   private encodeMessageKeySegment(value: unknown): string {
@@ -2287,18 +2796,55 @@ class ChatService {
     const sortSeq = Number.isFinite(input.sortSeq) ? Math.max(0, Math.floor(input.sortSeq)) : 0
     const localType = Number.isFinite(input.localType) ? Math.floor(input.localType) : 0
     const senderUsername = this.encodeMessageKeySegment(input.senderUsername || '')
+    const dbPath = String(input.dbPath || '').trim()
     const dbName = String(input.dbName || '').trim() || (input.dbPath ? basename(input.dbPath, extname(input.dbPath)) : '')
     const tableName = String(input.tableName || '').trim()
+    const sourceScope = dbPath || dbName
 
-    if (localId > 0 && dbName && tableName) {
-      return `${this.encodeMessageKeySegment(dbName)}:${this.encodeMessageKeySegment(tableName)}:${localId}`
+    if (localId > 0 && sourceScope && tableName) {
+      return `${this.encodeMessageKeySegment(sourceScope)}:${this.encodeMessageKeySegment(tableName)}:${localId}`
+    }
+
+    if (localId > 0 && sourceScope) {
+      // 当底层未返回 table_name 时，避免使用 db:_:localId（会误并同库不同表的消息）。
+      return `local:${this.encodeMessageKeySegment(sourceScope)}:${localId}:${createTime}:${sortSeq}:${senderUsername}:${localType}`
     }
 
     if (serverId > 0) {
-      return `server:${serverId}:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
+      const scopedServer = sourceScope ? `${this.encodeMessageKeySegment(sourceScope)}:${serverId}` : String(serverId)
+      return `server:${scopedServer}:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
     }
 
-    return `fallback:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
+    return `fallback:${this.encodeMessageKeySegment(sourceScope)}:${createTime}:${sortSeq}:${localId}:${senderUsername}:${localType}`
+  }
+
+  private logVisibilityAnomaly(sessionId: string, msg: Message): void {
+    const key = String(sessionId || '').trim() || '__unknown__'
+    const now = Date.now()
+    let state = this.visibilityAnomalyLogState.get(key)
+    if (!state || (now - state.windowStart) > this.visibilityAnomalyLogWindowMs) {
+      if (state && state.suppressed > 0) {
+        console.warn(
+          `[ChatService] 会话可见性异常日志已抑制: sessionId=${key}, suppressed=${state.suppressed}, windowMs=${this.visibilityAnomalyLogWindowMs}`
+        )
+      }
+      state = { windowStart: now, total: 0, suppressed: 0 }
+      this.visibilityAnomalyLogState.set(key, state)
+      if (this.visibilityAnomalyLogState.size > 256) {
+        const oldest = this.visibilityAnomalyLogState.keys().next()
+        if (!oldest.done) {
+          this.visibilityAnomalyLogState.delete(oldest.value)
+        }
+      }
+    }
+
+    state.total += 1
+    if (state.total <= this.visibilityAnomalyLogBurst) {
+      console.warn(`[ChatService] 检测到异常消息: sessionId=${sessionId}, senderUsername=${msg.senderUsername}, localId=${msg.localId}`)
+      return
+    }
+
+    state.suppressed += 1
   }
 
   private isMessageVisibleForSession(sessionId: string, msg: Message): boolean {
@@ -2312,7 +2858,7 @@ class ChatService {
     if (msg.isSend === 1) {
       return true
     }
-    console.warn(`[ChatService] 检测到异常消息: sessionId=${sessionId}, senderUsername=${msg.senderUsername}, localId=${msg.localId}`)
+    this.logVisibilityAnomaly(sessionId, msg)
     return false
   }
 
@@ -2343,10 +2889,12 @@ class ChatService {
     bufferedRows?: Record<string, any>[]
   }> {
     const visibleMessages: Message[] = []
+    const filteredCandidates: Message[] = []
     let queuedRows = Array.isArray(initialRows) ? initialRows.slice() : []
     let rawRowsConsumed = 0
     let filteredOut = 0
     let cursorMayHaveMore = queuedRows.length > 0
+    let emptyBatchStreak = 0
 
     while (visibleMessages.length < limit) {
       if (queuedRows.length === 0) {
@@ -2363,14 +2911,19 @@ class ChatService {
         const batchRows = Array.isArray(batch.rows) ? batch.rows as Record<string, any>[] : []
         cursorMayHaveMore = batch.hasMore === true
         if (batchRows.length === 0) {
+          if (cursorMayHaveMore && emptyBatchStreak < 2) {
+            emptyBatchStreak += 1
+            continue
+          }
           break
         }
+        emptyBatchStreak = 0
         queuedRows = batchRows
       }
 
       const rowsToProcess = queuedRows
       queuedRows = []
-      const mappedMessages = this.mapRowsToMessages(rowsToProcess)
+      const mappedMessages = this.mapRowsToMessages(rowsToProcess, sessionId)
       for (let index = 0; index < mappedMessages.length; index += 1) {
         const msg = mappedMessages[index]
         rawRowsConsumed += 1
@@ -2384,6 +2937,9 @@ class ChatService {
           }
         } else {
           filteredOut += 1
+          if (visibleMessages.length === 0 && filteredCandidates.length < limit) {
+            filteredCandidates.push(msg)
+          }
         }
       }
 
@@ -2400,8 +2956,19 @@ class ChatService {
       console.warn(`[ChatService] 过滤了 ${filteredOut} 条异常消息`)
     }
 
-    const normalized = this.normalizeMessageOrder(visibleMessages)
-    await this.repairEmojiMessages(normalized)
+    let outputMessages = visibleMessages
+    if (outputMessages.length === 0 && filteredCandidates.length > 0) {
+      // 回退策略：某些会话 sender_username 与 sessionId 可能不一致，避免整批被误过滤为 0 条。
+      outputMessages = filteredCandidates
+      console.warn(
+        `[ChatService] 会话可见性过滤触发回退: session=${sessionId} fallbackCount=${filteredCandidates.length}`
+      )
+    }
+
+    const normalized = this.normalizeMessageOrder(outputMessages)
+    if (normalized.length > 0) {
+      await this.repairEmojiMessages(normalized)
+    }
     return {
       success: true,
       messages: normalized,
@@ -2434,6 +3001,95 @@ class ChatService {
     if (raw === undefined || raw === null || raw === '') return fallback
     const parsed = this.coerceRowNumber(raw)
     return Number.isFinite(parsed) ? parsed : fallback
+  }
+
+  private parseCompactDateTimeDigitsToSeconds(raw: string): number {
+    const text = String(raw || '').trim()
+    if (!/^\d{8}(?:\d{4}(?:\d{2})?)?$/.test(text)) return 0
+
+    const year = Number.parseInt(text.slice(0, 4), 10)
+    const month = Number.parseInt(text.slice(4, 6), 10)
+    const day = Number.parseInt(text.slice(6, 8), 10)
+    const hour = text.length >= 12 ? Number.parseInt(text.slice(8, 10), 10) : 0
+    const minute = text.length >= 12 ? Number.parseInt(text.slice(10, 12), 10) : 0
+    const second = text.length >= 14 ? Number.parseInt(text.slice(12, 14), 10) : 0
+
+    if (!Number.isFinite(year) || year < 1990 || year > 2200) return 0
+    if (!Number.isFinite(month) || month < 1 || month > 12) return 0
+    if (!Number.isFinite(day) || day < 1 || day > 31) return 0
+    if (!Number.isFinite(hour) || hour < 0 || hour > 23) return 0
+    if (!Number.isFinite(minute) || minute < 0 || minute > 59) return 0
+    if (!Number.isFinite(second) || second < 0 || second > 59) return 0
+
+    const dt = new Date(year, month - 1, day, hour, minute, second)
+    if (
+      dt.getFullYear() !== year ||
+      dt.getMonth() !== month - 1 ||
+      dt.getDate() !== day ||
+      dt.getHours() !== hour ||
+      dt.getMinutes() !== minute ||
+      dt.getSeconds() !== second
+    ) {
+      return 0
+    }
+    const ts = Math.floor(dt.getTime() / 1000)
+    return Number.isFinite(ts) && ts > 0 ? ts : 0
+  }
+
+  private parseDateTimeTextToSeconds(raw: unknown): number {
+    const text = String(raw ?? '').trim()
+    if (!text) return 0
+
+    const compactDigits = this.parseCompactDateTimeDigitsToSeconds(text)
+    if (compactDigits > 0) return compactDigits
+
+    if (/[zZ]|[+-]\d{2}:?\d{2}$/.test(text)) {
+      const parsed = Date.parse(text)
+      const seconds = Math.floor(parsed / 1000)
+      if (Number.isFinite(seconds) && seconds > 0) return seconds
+    }
+
+    const normalized = text.replace('T', ' ').replace(/\.\d+$/, '').replace(/\//g, '-')
+    const match = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/)
+    if (!match) return 0
+
+    const year = Number.parseInt(match[1], 10)
+    const month = Number.parseInt(match[2], 10)
+    const day = Number.parseInt(match[3], 10)
+    const hour = Number.parseInt(match[4] || '0', 10)
+    const minute = Number.parseInt(match[5] || '0', 10)
+    const second = Number.parseInt(match[6] || '0', 10)
+    if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return 0
+    const dt = new Date(year, month - 1, day, hour, minute, second)
+    const ts = Math.floor(dt.getTime() / 1000)
+    return Number.isFinite(ts) && ts > 0 ? ts : 0
+  }
+
+  private normalizeTimestampLikeToSeconds(raw: unknown): number {
+    if (raw === undefined || raw === null || raw === '') return 0
+    const text = String(raw ?? '').trim()
+    if (!text) return 0
+
+    const compactDigits = this.parseCompactDateTimeDigitsToSeconds(text)
+    if (compactDigits > 0) return compactDigits
+
+    const parsed = this.coerceRowNumber(raw)
+    if (Number.isFinite(parsed) && parsed > 0) {
+      let normalized = Math.floor(parsed)
+      while (normalized > 10000000000) {
+        normalized = Math.floor(normalized / 1000)
+      }
+      return normalized
+    }
+
+    return this.parseDateTimeTextToSeconds(text)
+  }
+
+  private getRowTimestampSeconds(row: Record<string, any>, keys: string[], fallback = 0): number {
+    const raw = this.getRowField(row, keys)
+    if (raw === undefined || raw === null || raw === '') return fallback
+    const parsed = this.normalizeTimestampLikeToSeconds(raw)
+    return parsed > 0 ? parsed : fallback
   }
 
   private hasAnyContactExtendedFieldKey(row: Record<string, any>): boolean {
@@ -3066,13 +3722,13 @@ class ChatService {
     if (typeof raw === 'number') return raw
     if (typeof raw === 'bigint') return Number(raw)
     if (Buffer.isBuffer(raw)) {
-      return parseInt(raw.toString('utf-8'), 10)
+      return this.coerceRowNumber(raw.toString('utf-8'))
     }
     if (raw instanceof Uint8Array) {
-      return parseInt(Buffer.from(raw).toString('utf-8'), 10)
+      return this.coerceRowNumber(Buffer.from(raw).toString('utf-8'))
     }
     if (Array.isArray(raw)) {
-      return parseInt(Buffer.from(raw).toString('utf-8'), 10)
+      return this.coerceRowNumber(Buffer.from(raw).toString('utf-8'))
     }
     if (typeof raw === 'object') {
       if ('value' in raw) return this.coerceRowNumber(raw.value)
@@ -3088,13 +3744,21 @@ class ChatService {
       }
       const text = raw.toString ? String(raw) : ''
       if (text && text !== '[object Object]') {
-        const parsed = parseInt(text, 10)
-        return Number.isFinite(parsed) ? parsed : NaN
+        return this.coerceRowNumber(text)
       }
       return NaN
     }
-    const parsed = parseInt(String(raw), 10)
-    return Number.isFinite(parsed) ? parsed : NaN
+    const text = String(raw).trim()
+    if (!text) return NaN
+    if (/^[+-]?\d+$/.test(text)) {
+      const parsed = Number(text)
+      return Number.isFinite(parsed) ? parsed : NaN
+    }
+    if (/^[+-]?\d+\.\d+$/.test(text)) {
+      const parsed = Number(text)
+      return Number.isFinite(parsed) ? parsed : NaN
+    }
+    return NaN
   }
 
   private buildIdentityKeys(raw: string): string[] {
@@ -3123,7 +3787,7 @@ class ChatService {
       }
     }
 
-    const myWxid = String(this.configService.get('myWxid') || '').trim()
+    const myWxid = String(this.configService.getMyWxidCleaned() || '').trim()
     const selfKeys = this.buildIdentityKeys(myWxid)
     if (selfKeys.length === 0) {
       return {
@@ -3301,7 +3965,7 @@ class ChatService {
 
   private refreshSessionMessageCountCacheScope(): void {
     const dbPath = String(this.configService.get('dbPath') || '')
-    const myWxid = String(this.configService.get('myWxid') || '')
+    const myWxid = String(this.configService.getMyWxidCleaned() || '')
     const scope = `${dbPath}::${myWxid}`
     if (scope === this.sessionMessageCountCacheScope) {
       this.refreshSessionStatsCacheScope(scope)
@@ -3656,7 +4320,11 @@ class ChatService {
     return this.extractXmlValue(content, 'type')
   }
 
-  private async collectSpecialMessageCountsByCursorScan(sessionId: string): Promise<{
+  private async collectSpecialMessageCountsByCursorScan(
+    sessionId: string,
+    beginTimestamp: number = 0,
+    endTimestamp: number = 0
+  ): Promise<{
     transferMessages: number
     redPacketMessages: number
     callMessages: number
@@ -3667,7 +4335,7 @@ class ChatService {
       callMessages: 0
     }
 
-    const cursorResult = await wcdbService.openMessageCursorLite(sessionId, 500, false, 0, 0)
+    const cursorResult = await wcdbService.openMessageCursorLite(sessionId, 500, false, beginTimestamp, endTimestamp)
     if (!cursorResult.success || !cursorResult.cursor) {
       return counters
     }
@@ -3713,7 +4381,9 @@ class ChatService {
 
   private async collectSessionExportStatsByCursorScan(
     sessionId: string,
-    selfIdentitySet: Set<string>
+    selfIdentitySet: Set<string>,
+    beginTimestamp: number = 0,
+    endTimestamp: number = 0
   ): Promise<ExportSessionStats> {
     const stats: ExportSessionStats = {
       totalMessages: 0,
@@ -3731,7 +4401,7 @@ class ChatService {
     }
 
     const senderIdentities = new Set<string>()
-    const cursorResult = await wcdbService.openMessageCursorLite(sessionId, 500, false, 0, 0)
+    const cursorResult = await wcdbService.openMessageCursorLite(sessionId, 500, false, beginTimestamp, endTimestamp)
     if (!cursorResult.success || !cursorResult.cursor) {
       return stats
     }
@@ -3806,7 +4476,7 @@ class ChatService {
 
     if (sessionId.endsWith('@chatroom')) {
       stats.groupActiveSpeakers = senderIdentities.size
-      if (Number.isFinite(stats.groupMyMessages)) {
+      if ((beginTimestamp <= 0 && endTimestamp <= 0) && Number.isFinite(stats.groupMyMessages)) {
         this.setGroupMyMessageCountHintEntry(sessionId, stats.groupMyMessages as number)
       }
     }
@@ -3816,7 +4486,9 @@ class ChatService {
   private async collectSessionExportStats(
     sessionId: string,
     selfIdentitySet: Set<string>,
-    preferAccurateSpecialTypes: boolean = false
+    preferAccurateSpecialTypes: boolean = false,
+    beginTimestamp: number = 0,
+    endTimestamp: number = 0
   ): Promise<ExportSessionStats> {
     const stats: ExportSessionStats = {
       totalMessages: 0,
@@ -3834,9 +4506,9 @@ class ChatService {
       stats.groupActiveSpeakers = 0
     }
 
-    const nativeResult = await wcdbService.getSessionMessageTypeStats(sessionId, 0, 0)
+    const nativeResult = await wcdbService.getSessionMessageTypeStats(sessionId, beginTimestamp, endTimestamp)
     if (!nativeResult.success || !nativeResult.data) {
-      return this.collectSessionExportStatsByCursorScan(sessionId, selfIdentitySet)
+      return this.collectSessionExportStatsByCursorScan(sessionId, selfIdentitySet, beginTimestamp, endTimestamp)
     }
 
     const data = nativeResult.data as Record<string, any>
@@ -3856,7 +4528,7 @@ class ChatService {
 
     if (preferAccurateSpecialTypes) {
       try {
-        const preciseCounters = await this.collectSpecialMessageCountsByCursorScan(sessionId)
+        const preciseCounters = await this.collectSpecialMessageCountsByCursorScan(sessionId, beginTimestamp, endTimestamp)
         stats.transferMessages = preciseCounters.transferMessages
         stats.redPacketMessages = preciseCounters.redPacketMessages
         stats.callMessages = preciseCounters.callMessages
@@ -3868,14 +4540,19 @@ class ChatService {
     if (isGroup) {
       stats.groupMyMessages = Math.max(0, Math.floor(Number(data.group_my_messages || 0)))
       stats.groupActiveSpeakers = Math.max(0, Math.floor(Number(data.group_sender_count || 0)))
-      if (Number.isFinite(stats.groupMyMessages)) {
+      if ((beginTimestamp <= 0 && endTimestamp <= 0) && Number.isFinite(stats.groupMyMessages)) {
         this.setGroupMyMessageCountHintEntry(sessionId, stats.groupMyMessages as number)
       }
     }
     return stats
   }
 
-  private toExportSessionStatsFromNativeTypeRow(sessionId: string, row: Record<string, any>): ExportSessionStats {
+  private toExportSessionStatsFromNativeTypeRow(
+    sessionId: string,
+    row: Record<string, any>,
+    options?: { updateGroupHint?: boolean }
+  ): ExportSessionStats {
+    const updateGroupHint = options?.updateGroupHint !== false
     const stats: ExportSessionStats = {
       totalMessages: Math.max(0, Math.floor(Number(row?.total_messages || 0))),
       voiceMessages: Math.max(0, Math.floor(Number(row?.voice_messages || 0))),
@@ -3895,7 +4572,7 @@ class ChatService {
     if (sessionId.endsWith('@chatroom')) {
       stats.groupMyMessages = Math.max(0, Math.floor(Number(row?.group_my_messages || 0)))
       stats.groupActiveSpeakers = Math.max(0, Math.floor(Number(row?.group_sender_count || 0)))
-      if (Number.isFinite(stats.groupMyMessages)) {
+      if (updateGroupHint && Number.isFinite(stats.groupMyMessages)) {
         this.setGroupMyMessageCountHintEntry(sessionId, stats.groupMyMessages as number)
       }
     }
@@ -4025,9 +4702,17 @@ class ChatService {
     sessionId: string,
     selfIdentitySet: Set<string>,
     includeRelations: boolean,
-    preferAccurateSpecialTypes: boolean = false
+    preferAccurateSpecialTypes: boolean = false,
+    beginTimestamp: number = 0,
+    endTimestamp: number = 0
   ): Promise<ExportSessionStats> {
-    const stats = await this.collectSessionExportStats(sessionId, selfIdentitySet, preferAccurateSpecialTypes)
+    const stats = await this.collectSessionExportStats(
+      sessionId,
+      selfIdentitySet,
+      preferAccurateSpecialTypes,
+      beginTimestamp,
+      endTimestamp
+    )
     const isGroup = sessionId.endsWith('@chatroom')
 
     if (isGroup) {
@@ -4066,7 +4751,9 @@ class ChatService {
     sessionIds: string[],
     includeRelations: boolean,
     selfIdentitySet: Set<string>,
-    preferAccurateSpecialTypes: boolean = false
+    preferAccurateSpecialTypes: boolean = false,
+    beginTimestamp: number = 0,
+    endTimestamp: number = 0
   ): Promise<Record<string, ExportSessionStats>> {
     const normalizedSessionIds = Array.from(
       new Set(
@@ -4127,8 +4814,8 @@ class ChatService {
       try {
         const quickMode = !includeRelations && normalizedSessionIds.length > 1
         const nativeBatch = await wcdbService.getSessionMessageTypeStatsBatch(normalizedSessionIds, {
-          beginTimestamp: 0,
-          endTimestamp: 0,
+          beginTimestamp,
+          endTimestamp,
           quickMode,
           includeGroupSenderCount: true
         })
@@ -4136,7 +4823,9 @@ class ChatService {
           for (const sessionId of normalizedSessionIds) {
             const row = nativeBatch.data?.[sessionId] as Record<string, any> | undefined
             if (!row || typeof row !== 'object') continue
-            nativeBatchStats[sessionId] = this.toExportSessionStatsFromNativeTypeRow(sessionId, row)
+            nativeBatchStats[sessionId] = this.toExportSessionStatsFromNativeTypeRow(sessionId, row, {
+              updateGroupHint: beginTimestamp <= 0 && endTimestamp <= 0
+            })
           }
           hasNativeBatchStats = Object.keys(nativeBatchStats).length > 0
         } else {
@@ -4151,7 +4840,13 @@ class ChatService {
       try {
         const stats = hasNativeBatchStats && nativeBatchStats[sessionId]
           ? { ...nativeBatchStats[sessionId] }
-          : await this.collectSessionExportStats(sessionId, selfIdentitySet, preferAccurateSpecialTypes)
+          : await this.collectSessionExportStats(
+            sessionId,
+            selfIdentitySet,
+            preferAccurateSpecialTypes,
+            beginTimestamp,
+            endTimestamp
+          )
         if (sessionId.endsWith('@chatroom')) {
           if (shouldLoadGroupMemberCount) {
             stats.groupMemberCount = typeof memberCountMap[sessionId] === 'number'
@@ -4181,10 +4876,12 @@ class ChatService {
     sessionId: string,
     includeRelations: boolean,
     selfIdentitySet: Set<string>,
-    preferAccurateSpecialTypes: boolean = false
+    preferAccurateSpecialTypes: boolean = false,
+    beginTimestamp: number = 0,
+    endTimestamp: number = 0
   ): Promise<ExportSessionStats> {
     if (preferAccurateSpecialTypes) {
-      return this.computeSessionExportStats(sessionId, selfIdentitySet, includeRelations, true)
+      return this.computeSessionExportStats(sessionId, selfIdentitySet, includeRelations, true, beginTimestamp, endTimestamp)
     }
 
     const scopedKey = this.buildScopedSessionStatsKey(sessionId)
@@ -4199,8 +4896,13 @@ class ChatService {
       if (pendingFull) return pendingFull
     }
 
+    const shouldUsePendingPool = beginTimestamp <= 0 && endTimestamp <= 0
+    if (!shouldUsePendingPool) {
+      return this.computeSessionExportStats(sessionId, selfIdentitySet, includeRelations, false, beginTimestamp, endTimestamp)
+    }
+
     const targetMap = includeRelations ? this.sessionStatsPendingFull : this.sessionStatsPendingBasic
-    const pending = this.computeSessionExportStats(sessionId, selfIdentitySet, includeRelations, false)
+    const pending = this.computeSessionExportStats(sessionId, selfIdentitySet, includeRelations, false, beginTimestamp, endTimestamp)
     targetMap.set(scopedKey, pending)
     try {
       return await pending
@@ -4212,12 +4914,63 @@ class ChatService {
   /**
    * HTTP API 复用消息解析逻辑，确保和应用内展示一致。
    */
-  mapRowsToMessagesForApi(rows: Record<string, any>[]): Message[] {
-    return this.mapRowsToMessages(rows)
+  mapRowsToMessagesForApi(rows: Record<string, any>[], sessionId: string): Message[] {
+    return this.mapRowsToMessages(rows, sessionId)
   }
 
-  private mapRowsToMessages(rows: Record<string, any>[]): Message[] {
-    const myWxid = this.configService.get('myWxid')
+  mapRowsToMessagesLiteForApi(rows: Record<string, any>[]): Message[] {
+    const myWxid = String(this.configService.getMyWxidCleaned() || '').trim()
+    const messages: Message[] = []
+    for (const row of rows) {
+      const sourceInfo = this.getMessageSourceInfo(row)
+      const localType = this.getRowInt(row, ['local_type'], 1)
+      const createTime = this.getRowTimestampSeconds(row, ['create_time', 'createTime', 'msg_time', 'msgTime', 'time'], 0)
+      const sortSeq = this.getRowInt(row, ['sort_seq'], createTime > 0 ? createTime * 1000 : 0)
+      const localId = this.getRowInt(row, ['local_id'], 0)
+      const serverIdRaw = this.normalizeUnsignedIntegerToken(row.server_id)
+      const serverId = this.getRowInt(row, ['server_id'], 0)
+      const content = this.decodeMessageContent(row.message_content, row.compress_content)
+
+      const isSendRaw = row.computed_is_send ?? row.is_send
+      const parsedRawIsSend = isSendRaw === null || isSendRaw === undefined
+        ? null
+        : parseInt(String(isSendRaw), 10)
+      const normalizedIsSend = typeof parsedRawIsSend === 'number' && Number.isFinite(parsedRawIsSend)
+        ? parsedRawIsSend
+        : null
+      const senderFromRow = String(row.sender_username || '').trim() || this.extractSenderUsernameFromContent(content) || null
+      const { isSend } = this.resolveMessageIsSend(normalizedIsSend, senderFromRow)
+      const senderUsername = senderFromRow || (isSend === 1 && myWxid ? myWxid : null)
+
+      messages.push({
+        messageKey: this.buildMessageKey({
+          localId,
+          serverId,
+          createTime,
+          sortSeq,
+          senderUsername,
+          localType,
+          ...sourceInfo
+        }),
+        localId,
+        serverId,
+        serverIdRaw,
+        localType,
+        createTime,
+        sortSeq,
+        isSend,
+        senderUsername,
+        parsedContent: '',
+        rawContent: content,
+        content,
+        _db_path: sourceInfo.dbPath
+      })
+    }
+    return messages
+  }
+
+  private mapRowsToMessages(rows: Record<string, any>[], sessionId: string): Message[] {
+    const myWxid = this.configService.getMyWxidCleaned()
 
     const messages: Message[] = []
     for (const row of rows) {
@@ -4233,7 +4986,7 @@ class ChatService {
         || this.extractSenderUsernameFromContent(content)
         || null
       const { isSend } = this.resolveMessageIsSend(parsedRawIsSend, senderUsername)
-      const createTime = this.getRowInt(row, ['create_time'], 0)
+      const createTime = this.getRowTimestampSeconds(row, ['create_time', 'createTime', 'msg_time', 'msgTime', 'time'], 0)
 
       if (senderUsername && !myWxid) {
         // [DEBUG] Issue #34: 未配置 myWxid，无法判断是否发送
@@ -4336,11 +5089,23 @@ class ChatService {
         encrypVer = imageInfo.encrypVer
         cdnThumbUrl = imageInfo.cdnThumbUrl
         imageDatName = this.parseImageDatNameFromRow(row)
+        // 解析图片消息中的引用信息
+        const quoteInfo = this.parseMediaQuoteMessage(content, sessionId)
+        if (quoteInfo.content) quotedContent = quoteInfo.content
+        if (quoteInfo.sender) quotedSender = quoteInfo.sender
       } else if (localType === 43) {
         // 视频消息：优先从 packed_info_data 提取真实文件名（32位十六进制），再回退 XML
         videoMd5 = this.parseVideoFileNameFromRow(row, content)
+        // 解析视频消息中的引用信息
+        const quoteInfo = this.parseMediaQuoteMessage(content, sessionId)
+        if (quoteInfo.content) quotedContent = quoteInfo.content
+        if (quoteInfo.sender) quotedSender = quoteInfo.sender
       } else if (localType === 34 && content) {
         voiceDurationSeconds = this.parseVoiceDurationSeconds(content)
+        // 解析语音消息中的引用信息
+        const quoteInfo = this.parseMediaQuoteMessage(content, sessionId)
+        if (quoteInfo.content) quotedContent = quoteInfo.content
+        if (quoteInfo.sender) quotedSender = quoteInfo.sender
       } else if (localType === 42 && content) {
         // 名片消息
         const cardInfo = this.parseCardInfo(content)
@@ -5061,9 +5826,18 @@ class ChatService {
         case '47':
           displayContent = '[动画表情]'
           break
-        case '49':
-          displayContent = '[链接]'
+        case '49': {
+          // 链接类消息 (type=49)：需区分真正的链接和嵌套引用
+          // 嵌套引用的 referContent 中 xmlType=57，真正的链接 xmlType=49 或 5
+          const decodedReferContent = this.decodeHtmlEntities(referContent || '')
+          const innerInfo = this.parseType49Message(decodedReferContent)
+          if (innerInfo.xmlType === '57' && innerInfo.linkTitle) {
+            displayContent = innerInfo.linkTitle
+          } else {
+            displayContent = '[链接]'
+          }
           break
+        }
         case '42':
           displayContent = '[名片]'
           break
@@ -5085,6 +5859,116 @@ class ChatService {
     } catch {
       return {}
     }
+  }
+
+  /**
+   * 解析媒体消息(图片/视频/语音)中的引用信息
+   * 这些消息的引用信息在 <extcommoninfo><refermsg> 中
+   */
+  private parseMediaQuoteMessage(content: string, sessionId: string): { content?: string; sender?: string } {
+    try {
+      const normalizedContent = this.decodeHtmlEntities(content || '')
+      const referMsgStart = normalizedContent.indexOf('<refermsg>')
+      const referMsgEnd = normalizedContent.indexOf('</refermsg>')
+
+      if (referMsgStart === -1 || referMsgEnd === -1) {
+        return {}
+      }
+
+      const referMsgXml = normalizedContent.substring(referMsgStart, referMsgEnd + 11)
+      const svrid = this.extractXmlValue(referMsgXml, 'svrid')
+
+      console.log('[DEBUG] parseMediaQuoteMessage - svrid:', svrid)
+
+      if (!svrid) {
+        return {}
+      }
+
+      // 简化方案:返回 svrid 标记
+      console.log('[DEBUG] parseMediaQuoteMessage - 返回标记:', `__SVRID__${svrid}__`)
+      return { content: `__SVRID__${svrid}__` }
+    } catch {
+      return {}
+    }
+  }
+
+  async resolveQuotedMessages(messages: Message[], sessionId: string): Promise<void> {
+    console.log('[DEBUG] resolveQuotedMessages - 开始解析,消息数量:', messages.length)
+    const svridsToResolve: Array<{ msg: Message; svrid: string }> = []
+
+    for (const msg of messages) {
+      if (msg.quotedContent && msg.quotedContent.startsWith('__SVRID__')) {
+        const match = msg.quotedContent.match(/__SVRID__(.+?)__/)
+        if (match) {
+          console.log('[DEBUG] resolveQuotedMessages - 找到需要解析的svrid:', match[1])
+          svridsToResolve.push({ msg, svrid: match[1] })
+        }
+      }
+    }
+
+    console.log('[DEBUG] resolveQuotedMessages - 需要解析的数量:', svridsToResolve.length)
+
+    if (svridsToResolve.length === 0) return
+
+    const results = await Promise.allSettled(
+      svridsToResolve.map(({ svrid }) => {
+        console.log('[DEBUG] resolveQuotedMessages - 查询svrid:', svrid, 'sessionId:', sessionId)
+        return wcdbService.getMessageByServerId(sessionId, svrid)
+      })
+    )
+
+    console.log('[DEBUG] resolveQuotedMessages - 查询结果数量:', results.length)
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i]
+      const { msg, svrid } = svridsToResolve[i]
+
+      console.log('[DEBUG] resolveQuotedMessages - 处理结果', i, ':', {
+        status: result.status,
+        success: result.status === 'fulfilled' ? result.value.success : false,
+        hasRow: result.status === 'fulfilled' && result.value.row ? true : false,
+        error: result.status === 'fulfilled' ? result.value.error : undefined,
+        svrid
+      })
+
+      if (result.status === 'fulfilled' && result.value.success && result.value.row) {
+        const localType = parseInt(result.value.row.local_type || '0', 10)
+        const rawMessageContent = result.value.row.message_content
+        const rawCompressContent = result.value.row.compress_content
+
+        console.log('[DEBUG] resolveQuotedMessages - 原始数据:', {
+          hasMessageContent: !!rawMessageContent,
+          hasCompressContent: !!rawCompressContent,
+          messageContentType: typeof rawMessageContent,
+          messageContentLength: rawMessageContent ? rawMessageContent.length : 0
+        })
+
+        const content = this.decodeMessageContent(rawMessageContent, rawCompressContent)
+
+        console.log('[DEBUG] resolveQuotedMessages - 解码后:', { localType, contentLength: content.length, contentPreview: content.substring(0, 50) })
+
+        if (localType === 1) {
+          msg.quotedContent = this.sanitizeQuotedContent(content)
+        } else if (localType === 3) {
+          msg.quotedContent = '[图片]'
+        } else if (localType === 34) {
+          msg.quotedContent = '[语音]'
+        } else if (localType === 43) {
+          msg.quotedContent = '[视频]'
+        } else if (localType === 47) {
+          msg.quotedContent = '[动画表情]'
+        } else if (localType === 49) {
+          msg.quotedContent = '[链接]'
+        } else {
+          msg.quotedContent = '[消息]'
+        }
+        console.log('[DEBUG] resolveQuotedMessages - 更新后的quotedContent:', msg.quotedContent)
+      } else {
+        msg.quotedContent = '[引用消息]'
+        console.log('[DEBUG] resolveQuotedMessages - 查询失败,使用占位符')
+      }
+    }
+    console.log('[DEBUG] resolveQuotedMessages - 完成')
   }
 
   private extractPreferredQuotedText(referMsgXml: string): string {
@@ -6016,15 +6900,33 @@ class ChatService {
   }
 
   private cleanSystemMessage(content: string): string {
+    if (!content) return '[系统消息]'
+
+    const normalized = this.cleanUtf16(this.decodeHtmlEntities(String(content)))
+    const readableSysmsg = this.extractReadableSystemMessageText(normalized)
+    if (readableSysmsg) {
+      return readableSysmsg
+    }
+
     // 移除 XML 声明
-    let cleaned = content.replace(/<\?xml[^?]*\?>/gi, '')
+    let cleaned = normalized.replace(/<\?xml[^?]*\?>/gi, '')
     // 移除所有 XML/HTML 标签
     cleaned = cleaned.replace(/<[^>]+>/g, '')
     // 移除尾部的数字（如撤回消息后的时间戳）
     cleaned = cleaned.replace(/\d+\s*$/, '')
     // 清理多余空白
-    cleaned = cleaned.replace(/\s+/g, ' ').trim()
+    cleaned = this.stripSenderPrefix(cleaned).replace(/\s+/g, ' ').trim()
     return cleaned || '[系统消息]'
+  }
+
+  private extractReadableSystemMessageText(content: string): string {
+    const sysmsgMatch = /<sysmsg\b[^>]*>([\s\S]*?)<\/sysmsg>/i.exec(content)
+    const source = sysmsgMatch?.[1] || content
+    const text =
+      this.extractXmlValue(source, 'plain') ||
+      this.extractXmlValue(source, 'text') ||
+      ''
+    return this.stripSenderPrefix(text).replace(/\s+/g, ' ').trim()
   }
 
   private stripSenderPrefix(content: string): string {
@@ -6257,15 +7159,60 @@ class ChatService {
     return String(raw || '').replace(/\s+/g, '').trim()
   }
 
-  private shouldKeepSession(username: string): boolean {
+  private getSessionLocalType(row: Record<string, any>): number | undefined {
+    const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], Number.NaN)
+    return Number.isFinite(localType) ? Math.floor(localType) : undefined
+  }
+
+  private async loadContactLocalTypeMapForEnterpriseOpenim(usernames: string[]): Promise<Map<string, number>> {
+    const normalizedUsernames = Array.from(new Set(
+      (usernames || [])
+        .map((value) => String(value || '').trim())
+        .filter((value) => value && this.isEnterpriseOpenimUsername(value))
+    ))
+    const localTypeMap = new Map<string, number>()
+    if (normalizedUsernames.length === 0) {
+      return localTypeMap
+    }
+    try {
+      const contactResult = await wcdbService.getContactsCompact(normalizedUsernames)
+      if (!contactResult.success || !Array.isArray(contactResult.contacts)) {
+        return localTypeMap
+      }
+      for (const row of contactResult.contacts as Record<string, any>[]) {
+        const username = String(row.username || '').trim()
+        if (!username) continue
+        const localType = this.getRowInt(row, ['local_type', 'localType', 'WCDB_CT_local_type'], Number.NaN)
+        if (!Number.isFinite(localType)) continue
+        localTypeMap.set(username, Math.floor(localType))
+      }
+    } catch {
+      return localTypeMap
+    }
+    return localTypeMap
+  }
+
+  private isEnterpriseOpenimUsername(username: string): boolean {
+    const lowered = String(username || '').trim().toLowerCase()
+    return lowered.includes('@openim') && !lowered.includes('@kefu.openim')
+  }
+
+  private isAllowedEnterpriseOpenimByLocalType(username: string, localType?: number): boolean {
+    if (!this.isEnterpriseOpenimUsername(username)) return false
+    return Number.isFinite(localType) && Math.floor(localType as number) === 5
+  }
+
+  private shouldKeepSession(username: string, localType?: number): boolean {
     if (!username) return false
     const lowered = username.toLowerCase()
     // 排除所有 placeholder 会话（包括折叠群）
     if (lowered.includes('@placeholder')) return false
     if (username.startsWith('gh_')) return false
 
+    if (lowered === 'weixin') return false
+
     const excludeList = [
-      'weixin', 'qqmail', 'fmessage', 'medianote', 'floatbottle',
+      'qqmail', 'fmessage', 'medianote', 'floatbottle',
       'newsapp', 'brandsessionholder', 'brandservicesessionholder',
       'notifymessage', 'opencustomerservicemsg', 'notification_messages',
       'userexperience_alarm', 'helper_folders',
@@ -6276,7 +7223,11 @@ class ChatService {
       if (username.startsWith(prefix) || username === prefix) return false
     }
 
-    if (username.includes('@kefu.openim') || username.includes('@openim')) return false
+    if (username.includes('@kefu.openim')) return false
+    // 全局约束：企业 openim 仅允许 localType=5。
+    if (this.isEnterpriseOpenimUsername(username)) {
+      return this.isAllowedEnterpriseOpenimByLocalType(username, localType)
+    }
     if (username.includes('service_')) return false
 
     return true
@@ -6402,7 +7353,7 @@ class ChatService {
       }
 
       // 获取当前用户 wxid，用于识别"自己"
-      const myWxid = this.configService.get('myWxid')
+      const myWxid = this.configService.getMyWxidCleaned()
       const cleanedMyWxid = myWxid ? this.cleanAccountDirName(myWxid) : ''
 
       // 解析付款方名称：自己 > 群昵称 > 备注 > 昵称 > alias > wxid
@@ -6456,7 +7407,7 @@ class ChatService {
         return { success: false, error: connectResult.error }
       }
 
-      const myWxid = this.configService.get('myWxid')
+      const myWxid = this.configService.getMyWxidCleaned()
       if (!myWxid) {
         return { success: false, error: '未配置微信ID' }
       }
@@ -7042,6 +7993,9 @@ class ChatService {
       const allowStaleCache = options.allowStaleCache === true
       const preferAccurateSpecialTypes = options.preferAccurateSpecialTypes === true
       const cacheOnly = options.cacheOnly === true
+      const beginTimestamp = this.normalizeTimestampSeconds(Number(options.beginTimestamp || 0))
+      const endTimestamp = this.normalizeTimestampSeconds(Number(options.endTimestamp || 0))
+      const useRangeFilter = beginTimestamp > 0 || endTimestamp > 0
 
       const normalizedSessionIds = Array.from(
         new Set(
@@ -7065,7 +8019,7 @@ class ChatService {
           ? this.getGroupMyMessageCountHintEntry(sessionId)
           : null
         const cachedResult = this.getSessionStatsCacheEntry(sessionId)
-        const canUseCache = cacheOnly || (!forceRefresh && !preferAccurateSpecialTypes)
+        const canUseCache = !useRangeFilter && (cacheOnly || (!forceRefresh && !preferAccurateSpecialTypes))
         if (canUseCache && cachedResult && this.supportsRequestedRelation(cachedResult.entry, includeRelations)) {
           const stale = now - cachedResult.entry.updatedAt > this.sessionStatsCacheTtlMs
           if (!stale || allowStaleCache || cacheOnly) {
@@ -7097,37 +8051,22 @@ class ChatService {
       }
 
       if (pendingSessionIds.length > 0) {
-        const myWxid = this.configService.get('myWxid') || ''
+        const myWxid = this.configService.getMyWxidCleaned() || ''
         const selfIdentitySet = new Set<string>(this.buildIdentityKeys(myWxid))
         let usedBatchedCompute = false
         if (pendingSessionIds.length === 1) {
           const sessionId = pendingSessionIds[0]
           try {
-            const stats = await this.getOrComputeSessionExportStats(sessionId, includeRelations, selfIdentitySet, preferAccurateSpecialTypes)
-            resultMap[sessionId] = stats
-            const updatedAt = this.setSessionStatsCacheEntry(sessionId, stats, includeRelations)
-            cacheMeta[sessionId] = {
-              updatedAt,
-              stale: false,
-              includeRelations,
-              source: 'fresh'
-            }
-            usedBatchedCompute = true
-          } catch {
-            usedBatchedCompute = false
-          }
-        } else {
-          try {
-            const batchedStatsMap = await this.computeSessionExportStatsBatch(
-              pendingSessionIds,
+            const stats = await this.getOrComputeSessionExportStats(
+              sessionId,
               includeRelations,
               selfIdentitySet,
-              preferAccurateSpecialTypes
+              preferAccurateSpecialTypes,
+              beginTimestamp,
+              endTimestamp
             )
-            for (const sessionId of pendingSessionIds) {
-              const stats = batchedStatsMap[sessionId]
-              if (!stats) continue
-              resultMap[sessionId] = stats
+            resultMap[sessionId] = stats
+            if (!useRangeFilter) {
               const updatedAt = this.setSessionStatsCacheEntry(sessionId, stats, includeRelations)
               cacheMeta[sessionId] = {
                 updatedAt,
@@ -7140,19 +8079,56 @@ class ChatService {
           } catch {
             usedBatchedCompute = false
           }
+        } else {
+          try {
+            const batchedStatsMap = await this.computeSessionExportStatsBatch(
+              pendingSessionIds,
+              includeRelations,
+              selfIdentitySet,
+              preferAccurateSpecialTypes,
+              beginTimestamp,
+              endTimestamp
+            )
+            for (const sessionId of pendingSessionIds) {
+              const stats = batchedStatsMap[sessionId]
+              if (!stats) continue
+              resultMap[sessionId] = stats
+              if (!useRangeFilter) {
+                const updatedAt = this.setSessionStatsCacheEntry(sessionId, stats, includeRelations)
+                cacheMeta[sessionId] = {
+                  updatedAt,
+                  stale: false,
+                  includeRelations,
+                  source: 'fresh'
+                }
+              }
+            }
+            usedBatchedCompute = true
+          } catch {
+            usedBatchedCompute = false
+          }
         }
 
         if (!usedBatchedCompute) {
           await this.forEachWithConcurrency(pendingSessionIds, 3, async (sessionId) => {
             try {
-              const stats = await this.getOrComputeSessionExportStats(sessionId, includeRelations, selfIdentitySet, preferAccurateSpecialTypes)
-              resultMap[sessionId] = stats
-              const updatedAt = this.setSessionStatsCacheEntry(sessionId, stats, includeRelations)
-              cacheMeta[sessionId] = {
-                updatedAt,
-                stale: false,
+              const stats = await this.getOrComputeSessionExportStats(
+                sessionId,
                 includeRelations,
-                source: 'fresh'
+                selfIdentitySet,
+                preferAccurateSpecialTypes,
+                beginTimestamp,
+                endTimestamp
+              )
+              resultMap[sessionId] = stats
+              if (!useRangeFilter) {
+                const updatedAt = this.setSessionStatsCacheEntry(sessionId, stats, includeRelations)
+                cacheMeta[sessionId] = {
+                  updatedAt,
+                  stale: false,
+                  includeRelations,
+                  source: 'fresh'
+                }
               }
             } catch {
               resultMap[sessionId] = this.buildEmptyExportSessionStats(sessionId, includeRelations)
@@ -7382,7 +8358,7 @@ class ChatService {
 
       // 构建查找候选
       const candidates: string[] = []
-      const myWxid = this.configService.get('myWxid') as string
+      const myWxid = this.configService.getMyWxidCleaned() as string
 
       // 如果有 senderWxid，优先使用（群聊中最重要）
       if (senderWxid) {
@@ -7581,7 +8557,7 @@ class ChatService {
       if (!normalizedSessionId) return { success: true, prepared: 0 }
       if (!Array.isArray(messages) || messages.length === 0) return { success: true, prepared: 0 }
 
-      const myWxid = String(this.configService.get('myWxid') || '').trim()
+      const myWxid = String(this.configService.getMyWxidCleaned() || '').trim()
       const nowPrepared = new Set<string>()
       const pending: Array<{
         cacheKey: string
@@ -7725,13 +8701,17 @@ class ChatService {
   private async decodeSilkToPcm(silkData: Buffer, sampleRate: number): Promise<Buffer | null> {
     try {
       let wasmPath: string
-      if (app.isPackaged) {
-        wasmPath = join(process.resourcesPath, 'app.asar.unpacked', 'node_modules', 'silk-wasm', 'lib', 'silk.wasm')
+      const isPackaged = this.runtimeConfig?.isPackaged ?? app.isPackaged
+      const resourcesPath = this.runtimeConfig?.resourcesPath ?? process.resourcesPath
+      const appPath = this.runtimeConfig?.appPath ?? app.getAppPath()
+
+      if (isPackaged) {
+        wasmPath = join(resourcesPath, 'app.asar.unpacked', 'node_modules', 'silk-wasm', 'lib', 'silk.wasm')
         if (!existsSync(wasmPath)) {
-          wasmPath = join(process.resourcesPath, 'node_modules', 'silk-wasm', 'lib', 'silk.wasm')
+          wasmPath = join(resourcesPath, 'node_modules', 'silk-wasm', 'lib', 'silk.wasm')
         }
       } else {
-        wasmPath = join(app.getAppPath(), 'node_modules', 'silk-wasm', 'lib', 'silk.wasm')
+        wasmPath = join(appPath, 'node_modules', 'silk-wasm', 'lib', 'silk.wasm')
       }
 
       if (!existsSync(wasmPath)) {
@@ -7739,7 +8719,9 @@ class ChatService {
         return null
       }
 
-      const silkWasm = require('silk-wasm')
+      // 在 worker 环境中使用 createRequire 来正确加载模块
+      const requireFromApp = createRequire(join(appPath, 'package.json'))
+      const silkWasm = requireFromApp('silk-wasm')
       if (!silkWasm || !silkWasm.decode) {
         console.error('[ChatService][Voice] silk-wasm module invalid')
         return null
@@ -8027,7 +9009,7 @@ class ChatService {
         return { success: false, error: result.error || '查询语音消息失败' }
       }
 
-      let allVoiceMessages: Message[] = this.mapRowsToMessages(result.rows as Record<string, any>[])
+      let allVoiceMessages: Message[] = this.mapRowsToMessages(result.rows as Record<string, any>[], sessionId)
 
       // 按 createTime 降序排序
       allVoiceMessages.sort((a, b) => b.createTime - a.createTime)
@@ -8070,7 +9052,7 @@ class ChatService {
         return { success: false, error: result.error || '查询图片消息失败' }
       }
 
-      const mapped = this.mapRowsToMessages(result.rows as Record<string, any>[])
+      const mapped = this.mapRowsToMessages(result.rows as Record<string, any>[], sessionId)
       let allImages: Array<{ imageMd5?: string; imageDatName?: string; createTime?: number }> = mapped
         .filter(msg => msg.localType === 3)
         .map(msg => ({
@@ -8195,7 +9177,7 @@ class ChatService {
           if (!result.success || !Array.isArray(result.rows) || result.rows.length === 0) continue
           if (result.rows.length >= perTypeFetch) maybeHasMore = true
 
-          const mapped = this.mapRowsToMessages(result.rows as Record<string, any>[])
+          const mapped = this.mapRowsToMessages(result.rows as Record<string, any>[], sessionId)
           for (const message of mapped) {
             const resourceType = this.resolveResourceType(message)
             if (!resourceType || !typeSet.has(resourceType)) continue
@@ -8319,7 +9301,7 @@ class ChatService {
 
       let myWxid = String(options?.myWxid || '').trim()
       if (!myWxid) {
-        myWxid = String(this.configService.get('myWxid') || '').trim()
+        myWxid = String(this.configService.getMyWxidCleaned() || '').trim()
       }
       if (!myWxid) {
         return { success: false, error: '未识别当前账号 wxid' }
@@ -8331,6 +9313,7 @@ class ChatService {
       let groupSessionIds = Array.isArray(options?.groupSessionIds)
         ? options!.groupSessionIds!.map((value) => String(value || '').trim()).filter(Boolean)
         : []
+      const privateSessionLocalTypeMap = new Map<string, number>()
       const hasExplicitGroupScope = Array.isArray(options?.groupSessionIds)
         && options!.groupSessionIds!.some((value) => String(value || '').trim().length > 0)
 
@@ -8339,26 +9322,46 @@ class ChatService {
         if (!sessionsResult.success || !Array.isArray(sessionsResult.sessions)) {
           return { success: false, error: sessionsResult.error || '读取会话列表失败' }
         }
+        const openimLocalTypeMap = await this.loadContactLocalTypeMapForEnterpriseOpenim(
+          (sessionsResult.sessions as Array<Record<string, any>>).map((session) => String(session.username || session.user_name || '').trim())
+        )
         for (const session of sessionsResult.sessions as Array<Record<string, any>>) {
           const sessionId = String(session.username || session.user_name || '').trim()
           if (!sessionId) continue
+          let sessionLocalType = this.getSessionLocalType(session)
+          if (!Number.isFinite(sessionLocalType) && this.isEnterpriseOpenimUsername(sessionId)) {
+            sessionLocalType = openimLocalTypeMap.get(sessionId)
+          }
+          if (typeof sessionLocalType === 'number' && Number.isFinite(sessionLocalType)) {
+            privateSessionLocalTypeMap.set(sessionId, sessionLocalType)
+          }
           const sessionLastTs = this.normalizeTimestampSeconds(
             Number(session.lastTimestamp || session.sortTimestamp || 0)
           )
           if (sessionId.endsWith('@chatroom')) {
             groupSessionIds.push(sessionId)
           } else {
-            if (!this.shouldKeepSession(sessionId)) continue
+            if (!this.shouldKeepSession(sessionId, sessionLocalType)) continue
             if (begin > 0 && sessionLastTs > 0 && sessionLastTs < begin) continue
             privateSessionIds.push(sessionId)
           }
         }
       }
 
+      const unresolvedOpenimPrivateSessionIds = privateSessionIds.filter((value) =>
+        this.isEnterpriseOpenimUsername(value) && !privateSessionLocalTypeMap.has(value)
+      )
+      if (unresolvedOpenimPrivateSessionIds.length > 0) {
+        const fallbackMap = await this.loadContactLocalTypeMapForEnterpriseOpenim(unresolvedOpenimPrivateSessionIds)
+        for (const [username, localType] of fallbackMap.entries()) {
+          privateSessionLocalTypeMap.set(username, localType)
+        }
+      }
+
       privateSessionIds = Array.from(new Set(
         privateSessionIds
           .map((value) => String(value || '').trim())
-          .filter((value) => value && !value.endsWith('@chatroom') && this.shouldKeepSession(value))
+          .filter((value) => value && !value.endsWith('@chatroom') && this.shouldKeepSession(value, privateSessionLocalTypeMap.get(value)))
       ))
       groupSessionIds = Array.from(new Set(
         groupSessionIds
@@ -8547,12 +9550,13 @@ class ChatService {
 
       data = this.filterMyFootprintMentionsBySource(nativeRaw, myWxid, mentionLimit)
 
-      if (privateSessionIds.length > 0 && data.private_segments.length === 0) {
+      if (data.private_sessions.length > 0) {
+        const sessionsWithMessages = data.private_sessions.map(s => s.session_id)
         const privateSegments = await this.rebuildMyFootprintPrivateSegments({
           begin,
           end: normalizedEnd,
           myWxid,
-          privateSessionIds
+          privateSessionIds: sessionsWithMessages
         })
         if (privateSegments.length > 0) {
           data = {
@@ -8652,7 +9656,7 @@ class ChatService {
     myWxid: string
     privateSessionIds: string[]
   }): Promise<MyFootprintPrivateSegment[]> {
-    const sessionGapSeconds = 10 * 60
+    const sessionGapSeconds = 5 * 60
     const segments: MyFootprintPrivateSegment[] = []
 
     type WorkingSegment = {
@@ -8670,14 +9674,17 @@ class ChatService {
     }
 
     for (const sessionId of params.privateSessionIds) {
-      const cursorResult = await wcdbService.openMessageCursorLite(
+      const cursorResult = await wcdbService.openMessageCursor(
         sessionId,
         360,
         true,
-        params.begin,
-        params.end
+        0,
+        0
       )
-      if (!cursorResult.success || !cursorResult.cursor) continue
+      if (!cursorResult.success || !cursorResult.cursor) {
+        console.log(`[足迹分段] 打开游标失败: ${sessionId}, 原因: ${cursorResult.error || '未知'}`)
+        continue
+      }
 
       let segmentCursor = 0
       let active: WorkingSegment | null = null
@@ -8711,19 +9718,30 @@ class ChatService {
       }
 
       let hasMore = true
+      let batchCount = 0
+      let totalMessages = 0
       try {
         while (hasMore) {
           const batchResult = await wcdbService.fetchMessageBatch(cursorResult.cursor)
+          batchCount++
           if (!batchResult.success || !Array.isArray(batchResult.rows)) break
           hasMore = Boolean(batchResult.hasMore)
+          totalMessages += batchResult.rows.length
 
           for (const row of batchResult.rows as Array<Record<string, any>>) {
             const createTime = this.toSafeInt(row.create_time, 0)
             const localId = this.toSafeInt(row.local_id, 0)
             const isSend = this.resolveFootprintRowIsSend(row, params.myWxid)
 
+            // 过滤时间范围外的消息
+            if (createTime > 0 && (createTime < params.begin || createTime > params.end)) {
+              continue
+            }
+
             if (createTime > 0) {
-              const needNew = !active || (lastMessageTs > 0 && createTime - lastMessageTs > sessionGapSeconds)
+              const referenceTs = lastMessageTs > 0 ? lastMessageTs : (active ? active.end_ts : 0)
+              const timeDiff = referenceTs > 0 ? createTime - referenceTs : 0
+              const needNew = !active || (referenceTs > 0 && timeDiff > sessionGapSeconds)
               if (needNew) {
                 commit()
                 segmentCursor += 1
@@ -8892,7 +9910,11 @@ class ChatService {
   private normalizeTimestampSeconds(value: number): number {
     const numeric = Number(value || 0)
     if (!Number.isFinite(numeric) || numeric <= 0) return 0
-    return numeric > 1e12 ? Math.floor(numeric / 1000) : Math.floor(numeric)
+    let normalized = Math.floor(numeric)
+    while (normalized > 10000000000) {
+      normalized = Math.floor(normalized / 1000)
+    }
+    return normalized
   }
 
   private toSafeInt(value: unknown, fallback = 0): number {
@@ -10532,8 +11554,8 @@ class ChatService {
     const serverIdRaw = this.normalizeUnsignedIntegerToken(row.server_id)
     const serverId = this.getRowInt(row, ['server_id'], 0)
     const localType = this.getRowInt(row, ['local_type'], 0)
-    const createTime = this.getRowInt(row, ['create_time'], 0)
-    const sortSeq = this.getRowInt(row, ['sort_seq'], createTime)
+    const createTime = this.getRowTimestampSeconds(row, ['create_time', 'createTime', 'msg_time', 'msgTime', 'time'], 0)
+    const sortSeq = this.getRowInt(row, ['sort_seq'], createTime > 0 ? createTime * 1000 : 0)
     const rawIsSend = row.computed_is_send ?? row.is_send
     const senderUsername = await this.resolveSenderUsernameForMessageRow(row, rawContent)
     const sendState = this.resolveMessageIsSend(rawIsSend === null ? null : parseInt(rawIsSend, 10), senderUsername)

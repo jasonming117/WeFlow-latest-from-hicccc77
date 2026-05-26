@@ -14,6 +14,7 @@ export interface SnsLivePhoto {
     thumb: string
     md5?: string
     token?: string
+    thumbToken?: string
     key?: string
     encIdx?: string
 }
@@ -23,6 +24,7 @@ export interface SnsMedia {
     thumb: string
     md5?: string
     token?: string
+    thumbToken?: string
     key?: string
     encIdx?: string
     livePhoto?: SnsLivePhoto
@@ -126,12 +128,22 @@ const fixSnsUrl = (url: string, token?: string, isVideo: boolean = false) => {
 
     let fixedUrl = url.replace('http://', 'https://')
 
-    // 只有非视频（即图片）才需要处理 /150 变 /0
+    // 只有非视频（即图片）才需要处理路径末尾的尺寸标识（/150、/200等）变为 /0
     if (!isVideo) {
-        fixedUrl = fixedUrl.replace(/\/150($|\?)/, '/0$1')
+        const [pathPart, queryPart] = fixedUrl.split('?')
+        const fixedPath = pathPart.replace(/\/(150|200|480)($|\?)/, '/0$2')
+        fixedUrl = queryPart ? `${fixedPath}?${queryPart}` : fixedPath
     }
 
-    if (!token || fixedUrl.includes('token=')) return fixedUrl
+    // 如果没有提供新token，直接返回
+    if (!token) return fixedUrl
+
+    // 移除已有的token和idx参数
+    const [pathPart, queryPart] = fixedUrl.split('?')
+    if (queryPart) {
+        const params = queryPart.split('&').filter(p => !p.startsWith('token=') && !p.startsWith('idx='))
+        fixedUrl = params.length > 0 ? `${pathPart}?${params.join('&')}` : pathPart
+    }
 
     // 根据用户要求，视频链接组合方式为: BASE_URL + "?" + "token=" + token + "&idx=1" + 原有参数
     if (isVideo) {
@@ -324,6 +336,9 @@ class SnsService {
     private configService: ConfigService
     private contactCache: ContactCacheService
     private imageCache = new Map<string, string>()
+    private imageCacheMeta = new Map<string, number>()
+    private readonly imageCacheTtlMs = 15 * 60 * 1000
+    private readonly imageCacheMaxEntries = 120
     private exportStatsCache: { totalPosts: number; totalFriends: number; myPosts: number | null; updatedAt: number } | null = null
     private userPostCountsCache: { counts: Record<string, number>; updatedAt: number } | null = null
     private readonly exportStatsCacheTtlMs = 5 * 60 * 1000
@@ -334,6 +349,38 @@ class SnsService {
     constructor() {
         this.configService = new ConfigService()
         this.contactCache = new ContactCacheService(this.configService.get('cachePath') as string)
+    }
+
+    clearMemoryCache(): void {
+        this.imageCache.clear()
+        this.imageCacheMeta.clear()
+    }
+
+    private pruneImageCache(now: number = Date.now()): void {
+        for (const [key, updatedAt] of this.imageCacheMeta.entries()) {
+            if (now - updatedAt > this.imageCacheTtlMs) {
+                this.imageCacheMeta.delete(key)
+                this.imageCache.delete(key)
+            }
+        }
+
+        while (this.imageCache.size > this.imageCacheMaxEntries) {
+            const oldestKey = this.imageCache.keys().next().value as string | undefined
+            if (!oldestKey) break
+            this.imageCache.delete(oldestKey)
+            this.imageCacheMeta.delete(oldestKey)
+        }
+    }
+
+    private rememberImageCache(cacheKey: string, dataUrl: string): void {
+        if (!cacheKey || !dataUrl) return
+        const now = Date.now()
+        if (this.imageCache.has(cacheKey)) {
+            this.imageCache.delete(cacheKey)
+        }
+        this.imageCache.set(cacheKey, dataUrl)
+        this.imageCacheMeta.set(cacheKey, now)
+        this.pruneImageCache(now)
     }
 
     private toOptionalString(value: unknown): string | undefined {
@@ -669,6 +716,7 @@ class SnsService {
                     url: urlMatch ? urlMatch[1].trim() : '',
                     thumb: thumbMatch ? thumbMatch[1].trim() : '',
                     token: urlToken || thumbToken,
+                    thumbToken: thumbToken,
                     key: urlKey || thumbKey,
                     md5: urlMd5,
                     encIdx: urlEncIdx || thumbEncIdx
@@ -681,19 +729,24 @@ class SnsService {
                     const lpUrlTag = lx.match(/<url([^>]*)>/i)
                     const lpThumb = lx.match(/<thumb[^>]*>([^<]+)<\/thumb>/i)
                     const lpThumbTag = lx.match(/<thumb([^>]*)>/i)
-                    let lpToken: string | undefined, lpKey: string | undefined, lpEncIdx: string | undefined
+                    let lpUrlToken: string | undefined, lpThumbToken: string | undefined
+                    let lpKey: string | undefined, lpEncIdx: string | undefined
                     if (lpUrlTag?.[1]) {
                         const a = lpUrlTag[1]
-                        lpToken = a.match(/token="([^"]+)"/i)?.[1]
+                        lpUrlToken = a.match(/token="([^"]+)"/i)?.[1]
                         lpKey = a.match(/key="([^"]+)"/i)?.[1]
                         lpEncIdx = a.match(/enc_idx="([^"]+)"/i)?.[1]
                     }
-                    if (!lpToken && lpThumbTag?.[1]) lpToken = lpThumbTag[1].match(/token="([^"]+)"/i)?.[1]
-                    if (!lpKey && lpThumbTag?.[1]) lpKey = lpThumbTag[1].match(/key="([^"]+)"/i)?.[1]
+                    if (lpThumbTag?.[1]) {
+                        const a = lpThumbTag[1]
+                        lpThumbToken = a.match(/token="([^"]+)"/i)?.[1]
+                        if (!lpKey) lpKey = a.match(/key="([^"]+)"/i)?.[1]
+                    }
                     item.livePhoto = {
                         url: lpUrl ? lpUrl[1].trim() : '',
                         thumb: lpThumb ? lpThumb[1].trim() : '',
-                        token: lpToken,
+                        token: lpUrlToken || lpThumbToken,
+                        thumbToken: lpThumbToken,
                         key: lpKey,
                         encIdx: lpEncIdx
                     }
@@ -879,7 +932,7 @@ class SnsService {
         const allowTimelineFallback = options?.allowTimelineFallback ?? true
         const preferCache = options?.preferCache ?? false
         const now = Date.now()
-        const myWxid = this.toOptionalString(this.configService.get('myWxid'))
+        const myWxid = this.toOptionalString(this.configService.getMyWxidCleaned())
 
         try {
             if (preferCache && this.exportStatsCache && now - this.exportStatsCache.updatedAt <= this.exportStatsCacheTtlMs) {
@@ -1146,16 +1199,18 @@ class SnsService {
 
             const fixedMedia = (post.media || []).map((m: any) => ({
                 url: fixSnsUrl(m.url, m.token, isVideoPost),
-                thumb: fixSnsUrl(m.thumb, m.token, false),
+                thumb: fixSnsUrl(m.thumb, m.thumbToken || m.token, false),
                 md5: m.md5,
                 token: m.token,
+                thumbToken: m.thumbToken,
                 key: isVideoPost ? (videoKey || m.key) : m.key,
                 encIdx: m.encIdx || m.enc_idx,
                 livePhoto: m.livePhoto ? {
                     ...m.livePhoto,
                     url: fixSnsUrl(m.livePhoto.url, m.livePhoto.token, true),
-                    thumb: fixSnsUrl(m.livePhoto.thumb, m.livePhoto.token, false),
+                    thumb: fixSnsUrl(m.livePhoto.thumb, m.livePhoto.thumbToken || m.livePhoto.token, false),
                     token: m.livePhoto.token,
+                    thumbToken: m.livePhoto.thumbToken,
                     key: videoKey || m.livePhoto.key || m.key,
                     encIdx: m.livePhoto.encIdx || m.livePhoto.enc_idx
                 } : undefined
@@ -1239,20 +1294,27 @@ class SnsService {
         if (!url) return { success: false, error: 'url 不能为空' }
         const cacheKey = `${url}|${key ?? ''}`
 
-        if (this.imageCache.has(cacheKey)) {
-            const cachedDataUrl = this.imageCache.get(cacheKey) || ''
-            const base64Part = cachedDataUrl.split(',')[1] || ''
-            if (base64Part) {
-                try {
-                    const cachedBuf = Buffer.from(base64Part, 'base64')
-                    if (detectImageMime(cachedBuf, '').startsWith('image/')) {
-                        return { success: true, dataUrl: cachedDataUrl }
+        const cachedDataUrl = this.imageCache.get(cacheKey) || ''
+        if (cachedDataUrl) {
+            const cachedAt = this.imageCacheMeta.get(cacheKey) || 0
+            if (cachedAt > 0 && Date.now() - cachedAt <= this.imageCacheTtlMs) {
+                const base64Part = cachedDataUrl.split(',')[1] || ''
+                if (base64Part) {
+                    try {
+                        const cachedBuf = Buffer.from(base64Part, 'base64')
+                        if (detectImageMime(cachedBuf, '').startsWith('image/')) {
+                            this.imageCache.delete(cacheKey)
+                            this.imageCache.set(cacheKey, cachedDataUrl)
+                            this.imageCacheMeta.set(cacheKey, Date.now())
+                            return { success: true, dataUrl: cachedDataUrl }
+                        }
+                    } catch {
+                        // ignore and fall through to refetch
                     }
-                } catch {
-                    // ignore and fall through to refetch
                 }
             }
             this.imageCache.delete(cacheKey)
+            this.imageCacheMeta.delete(cacheKey)
         }
 
         const result = await this.fetchAndDecryptImage(url, key)
@@ -1269,7 +1331,7 @@ class SnsService {
                     return { success: false, error: '无效图片数据（可能密钥不匹配或缓存损坏）' }
                 }
                 const dataUrl = `data:${result.contentType};base64,${result.data.toString('base64')}`
-                this.imageCache.set(cacheKey, dataUrl)
+                this.rememberImageCache(cacheKey, dataUrl)
                 return { success: true, dataUrl }
             }
         }
@@ -1298,6 +1360,8 @@ class SnsService {
     }, progressCallback?: (progress: { current: number; total: number; status: string }) => void, control?: {
         shouldPause?: () => boolean
         shouldStop?: () => boolean
+        recordCreatedFile?: (filePath: string) => void
+        recordCreatedDir?: (dirPath: string) => void
     }): Promise<{ success: boolean; filePath?: string; postCount?: number; mediaCount?: number; paused?: boolean; stopped?: boolean; error?: string }> {
         const { outputDir, format, usernames, keyword, startTime, endTime } = options
         const hasExplicitMediaSelection =
@@ -1319,6 +1383,18 @@ class SnsService {
             if (control?.shouldPause?.()) return 'paused'
             return null
         }
+        const ensureExportDir = (dirPath: string) => {
+            const existed = existsSync(dirPath)
+            if (!existed) {
+                mkdirSync(dirPath, { recursive: true })
+                control?.recordCreatedDir?.(dirPath)
+            }
+        }
+        const recordCreatedFileBeforeWrite = (filePath: string) => {
+            if (!existsSync(filePath)) {
+                control?.recordCreatedFile?.(filePath)
+            }
+        }
         const buildInterruptedResult = (state: 'paused' | 'stopped', postCount: number, mediaCount: number) => (
             state === 'stopped'
                 ? { success: true, stopped: true, filePath: '', postCount, mediaCount }
@@ -1327,9 +1403,7 @@ class SnsService {
 
         try {
             // 确保输出目录存在
-            if (!existsSync(outputDir)) {
-                mkdirSync(outputDir, { recursive: true })
-            }
+            ensureExportDir(outputDir)
 
             // 1. 分页加载全部帖子
             const allPosts: SnsPost[] = []
@@ -1372,9 +1446,7 @@ class SnsService {
             const mediaDir = join(outputDir, 'media')
 
             if (shouldExportMedia) {
-                if (!existsSync(mediaDir)) {
-                    mkdirSync(mediaDir, { recursive: true })
-                }
+                ensureExportDir(mediaDir)
 
                 // 收集所有媒体下载任务
                 const mediaTasks: Array<{
@@ -1443,6 +1515,7 @@ class SnsService {
                         } else {
                             const result = await this.fetchAndDecryptImage(task.url, task.key)
                             if (result.success && result.data) {
+                                recordCreatedFileBeforeWrite(filePath)
                                 await writeFile(filePath, result.data)
                                 if (task.kind === 'livephoto') {
                                     if (media.livePhoto) (media.livePhoto as any).localPath = `media/${fileName}`
@@ -1452,6 +1525,7 @@ class SnsService {
                                 mediaCount++
                             } else if (result.success && result.cachePath) {
                                 const cachedData = await readFile(result.cachePath)
+                                recordCreatedFileBeforeWrite(filePath)
                                 await writeFile(filePath, cachedData)
                                 if (task.kind === 'livephoto') {
                                     if (media.livePhoto) (media.livePhoto as any).localPath = `media/${fileName}`
@@ -1489,7 +1563,7 @@ class SnsService {
             // 2.5 下载头像
             const avatarMap = new Map<string, string>()
             if (format === 'html') {
-                if (!existsSync(mediaDir)) mkdirSync(mediaDir, { recursive: true })
+                ensureExportDir(mediaDir)
                 const uniqueUsers = [...new Map(allPosts.filter(p => p.avatarUrl).map(p => [p.username, p])).values()]
                 let avatarDone = 0
                 const avatarQueue = [...uniqueUsers]
@@ -1506,6 +1580,7 @@ class SnsService {
                             } else {
                                 const result = await this.fetchAndDecryptImage(post.avatarUrl!)
                                 if (result.success && result.data) {
+                                    recordCreatedFileBeforeWrite(filePath)
                                     await writeFile(filePath, result.data)
                                     avatarMap.set(post.username, `media/${fileName}`)
                                 }
@@ -1560,6 +1635,7 @@ class SnsService {
                         linkUrl: (p as any).linkUrl
                     }))
                 }
+                recordCreatedFileBeforeWrite(outputFilePath)
                 await writeFile(outputFilePath, JSON.stringify(exportData, null, 2), 'utf-8')
             } else if (format === 'arkmejson') {
                 outputFilePath = join(outputDir, `朋友圈导出_${timestamp}.json`)
@@ -1647,11 +1723,13 @@ class SnsService {
                     },
                     posts
                 }
+                recordCreatedFileBeforeWrite(outputFilePath)
                 await writeFile(outputFilePath, JSON.stringify(exportData, null, 2), 'utf-8')
             } else {
                 // HTML 格式
                 outputFilePath = join(outputDir, `朋友圈导出_${timestamp}.html`)
                 const html = this.generateHtml(allPosts, { usernames, keyword }, avatarMap)
+                recordCreatedFileBeforeWrite(outputFilePath)
                 await writeFile(outputFilePath, html, 'utf-8')
             }
 
@@ -2002,6 +2080,8 @@ window.addEventListener('scroll',function(){document.getElementById('btt').class
                 const zlib = require('zlib')
                 const urlObj = new URL(url)
 
+                console.log(`[SnsService] 开始下载图片: url=${url.substring(0, 100)}..., key=${key || 'undefined'}`)
+
                 const options = {
                     hostname: urlObj.hostname,
                     path: urlObj.pathname + urlObj.search,
@@ -2016,7 +2096,9 @@ window.addEventListener('scroll',function(){document.getElementById('btt').class
                 }
 
                 const req = https.request(options, (res: any) => {
+                    console.log(`[SnsService] CDN 响应: statusCode=${res.statusCode}, x-enc=${res.headers['x-enc']}, content-type=${res.headers['content-type']}`)
                     if (res.statusCode !== 200 && res.statusCode !== 206) {
+                        console.error(`[SnsService] CDN 请求失败: HTTP ${res.statusCode}`)
                         resolve({ success: false, error: `HTTP ${res.statusCode}` })
                         return
                     }
@@ -2036,9 +2118,11 @@ window.addEventListener('scroll',function(){document.getElementById('btt').class
 
                         let decoded = raw
                         const rawMagicMime = detectImageMime(raw, '')
+                        console.log(`[SnsService] 原始数据: size=${raw.length}, mime=${rawMagicMime}, xEnc=${xEnc}`)
 
                         // 图片逻辑
                         const shouldDecrypt = (xEnc === '1' || !!key) && key !== undefined && key !== null && String(key).trim().length > 0
+                        console.log(`[SnsService] 解密判断: shouldDecrypt=${shouldDecrypt}, key=${key || 'undefined'}`)
                         if (shouldDecrypt) {
                             try {
                                 const keyStr = String(key).trim()
@@ -2054,6 +2138,7 @@ window.addEventListener('scroll',function(){document.getElementById('btt').class
                                     }
 
                                     const decryptedMagicMime = detectImageMime(decrypted, '')
+                                    console.log(`[SnsService] 解密后: mime=${decryptedMagicMime}`)
                                     if (decryptedMagicMime.startsWith('image/')) {
                                         decoded = decrypted
                                     } else if (!rawMagicMime.startsWith('image/')) {
@@ -2066,7 +2151,9 @@ window.addEventListener('scroll',function(){document.getElementById('btt').class
                         }
 
                         const decodedMagicMime = detectImageMime(decoded, '')
+                        console.log(`[SnsService] 最终结果: mime=${decodedMagicMime}, isImage=${decodedMagicMime.startsWith('image/')}`)
                         if (!decodedMagicMime.startsWith('image/')) {
+                            console.error(`[SnsService] 图片解密失败: 原始mime=${rawMagicMime}, 解密后mime=${decodedMagicMime}, key=${key}`)
                             resolve({ success: false, error: '图片解密失败：无法识别图片格式' })
                             return
                         }

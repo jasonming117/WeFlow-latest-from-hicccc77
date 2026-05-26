@@ -6,7 +6,8 @@ import { useThemeStore, themes } from '../stores/themeStore'
 import { useAnalyticsStore } from '../stores/analyticsStore'
 import { dialog } from '../services/ipc'
 import * as configService from '../services/config'
-import type { ContactInfo } from '../types/models'
+import groupSummaryPrompt from '../../shared/groupSummaryPrompt.json'
+import type { ChatSession, ContactInfo } from '../types/models'
 import {
   Eye, EyeOff, FolderSearch, FolderOpen, Search, Copy,
   RotateCcw, Trash2, Plug, Check, Sun, Moon, Monitor,
@@ -32,13 +33,17 @@ type SettingsTab =
   | 'aiCommon'
   | 'insight'
   | 'aiFootprint'
+  | 'aiGroupSummary'
+  | 'aiMessageInsight'
+  | 'autoDownload'
 
-const tabs: { id: Exclude<SettingsTab, 'insight' | 'aiFootprint'>; label: string; icon: React.ElementType }[] = [
+const tabs: { id: Exclude<SettingsTab, 'insight' | 'aiFootprint' | 'aiMessageInsight'>; label: string; icon: React.ElementType }[] = [
   { id: 'appearance', label: '外观', icon: Palette },
   { id: 'notification', label: '通知', icon: Bell },
   { id: 'antiRevoke', label: '防撤回', icon: RotateCcw },
   { id: 'database', label: '数据库连接', icon: Database },
   { id: 'models', label: '模型管理', icon: Mic },
+  { id: 'autoDownload', label: '自动下载', icon: Download },
   { id: 'cache', label: '缓存', icon: HardDrive },
   { id: 'api', label: 'API 服务', icon: Globe },
   { id: 'analytics', label: '分析', icon: BarChart2 },
@@ -47,15 +52,26 @@ const tabs: { id: Exclude<SettingsTab, 'insight' | 'aiFootprint'>; label: string
   { id: 'about', label: '关于', icon: Info }
 ]
 
-const aiTabs: Array<{ id: Extract<SettingsTab, 'aiCommon' | 'insight' | 'aiFootprint'>; label: string }> = [
+const filteredTabs = tabs.filter(tab => {
+  if (tab.id === 'autoDownload') {
+    return (window as any).electronAPI.process.platform === 'win32' && (window as any).electronAPI.process.arch === 'x64'
+  }
+  return true
+})
+
+const aiTabs: Array<{ id: Extract<SettingsTab, 'aiCommon' | 'insight' | 'aiFootprint' | 'aiGroupSummary' | 'aiMessageInsight'>; label: string }> = [
   { id: 'aiCommon', label: '基础配置' },
   { id: 'insight', label: 'AI 见解' },
-  { id: 'aiFootprint', label: 'AI 足迹' }
+  { id: 'aiFootprint', label: 'AI 足迹' },
+  { id: 'aiGroupSummary', label: '群聊总结' },
+  { id: 'aiMessageInsight', label: '消息解析' }
 ]
 
 const isMac = navigator.userAgent.toLowerCase().includes('mac')
 const isLinux = navigator.userAgent.toLowerCase().includes('linux')
 const isWindows = !isMac && !isLinux
+const MAC_KEY_FAQ_URL = 'https://github.com/hicccc77/WeFlow/blob/main/docs/MAC-KEY-FAQ.md'
+const DEFAULT_GROUP_SUMMARY_SYSTEM_PROMPT = String(groupSummaryPrompt.defaultSystemPrompt || '').trim()
 
 const dbDirName = isMac ? '2.0b4.0.9 目录' : 'xwechat_files 目录'
 const dbPathPlaceholder = isMac
@@ -75,6 +91,7 @@ interface WxidOption {
 type SessionFilterType = configService.MessagePushSessionType
 type SessionFilterTypeValue = 'all' | SessionFilterType
 type SessionFilterMode = 'all' | 'whitelist' | 'blacklist'
+type InsightSessionFilterTypeValue = 'all' | 'private' | 'group' | 'official'
 
 interface SessionFilterOption {
   username: string
@@ -89,6 +106,13 @@ const sessionFilterTypeOptions: Array<{ value: SessionFilterTypeValue; label: st
   { value: 'group', label: '群聊' },
   { value: 'official', label: '订阅号/服务号' },
   { value: 'other', label: '其他/非好友' }
+]
+
+const insightFilterTypeOptions: Array<{ value: InsightSessionFilterTypeValue; label: string }> = [
+  { value: 'all', label: '全部' },
+  { value: 'private', label: '私聊' },
+  { value: 'group', label: '群聊' },
+  { value: 'official', label: '订阅号/服务号' }
 ]
 
 interface SettingsPageProps {
@@ -140,6 +164,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [imageKeyPercent, setImageKeyPercent] = useState<number | null>(null)
 
   const [logEnabled, setLogEnabled] = useState(false)
+  const [autoDownloadHighRes, setAutoDownloadHighRes] = useState(false)
   const [whisperModelName, setWhisperModelName] = useState('base')
   const [whisperModelDir, setWhisperModelDir] = useState('')
   const [isWhisperDownloading, setIsWhisperDownloading] = useState(false)
@@ -180,12 +205,14 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [transcribeLanguages, setTranscribeLanguages] = useState<string[]>(['zh'])
 
   const [notificationEnabled, setNotificationEnabled] = useState(true)
+  const [aiInsightNotificationEnabled, setAiInsightNotificationEnabled] = useState(true)
   const [notificationPosition, setNotificationPosition] = useState<'top-right' | 'top-left' | 'bottom-right' | 'bottom-left' | 'top-center'>('top-right')
   const [notificationFilterMode, setNotificationFilterMode] = useState<'all' | 'whitelist' | 'blacklist'>('all')
   const [notificationFilterList, setNotificationFilterList] = useState<string[]>([])
   const [launchAtStartup, setLaunchAtStartup] = useState(false)
   const [launchAtStartupSupported, setLaunchAtStartupSupported] = useState(isWindows || isMac)
   const [launchAtStartupReason, setLaunchAtStartupReason] = useState('')
+  const [silentStartup, setSilentStartup] = useState(false)
   const [windowCloseBehavior, setWindowCloseBehavior] = useState<configService.WindowCloseBehavior>('ask')
   const [quoteLayout, setQuoteLayout] = useState<configService.QuoteLayout>('quote-top')
   const [updateChannel, setUpdateChannel] = useState<configService.UpdateChannel>('stable')
@@ -194,6 +221,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [filterModeDropdownOpen, setFilterModeDropdownOpen] = useState(false)
   const [positionDropdownOpen, setPositionDropdownOpen] = useState(false)
   const [closeBehaviorDropdownOpen, setCloseBehaviorDropdownOpen] = useState(false)
+  const [insightFilterModeDropdownOpen, setInsightFilterModeDropdownOpen] = useState(false)
 
   const [wordCloudExcludeWords, setWordCloudExcludeWords] = useState<string[]>([])
   const [excludeWordsInput, setExcludeWordsInput] = useState('')
@@ -212,10 +240,12 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [isFetchingImageKey, setIsFetchingImageKey] = useState(false)
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
   const [isUpdatingLaunchAtStartup, setIsUpdatingLaunchAtStartup] = useState(false)
+  const [isUpdatingSilentStartup, setIsUpdatingSilentStartup] = useState(false)
   const [appVersion, setAppVersion] = useState('')
   const [message, setMessage] = useState<{ text: string; success: boolean } | null>(null)
   const [showDecryptKey, setShowDecryptKey] = useState(false)
   const [dbKeyStatus, setDbKeyStatus] = useState('')
+  const [dbKeyError, setDbKeyError] = useState('')
   const [imageKeyStatus, setImageKeyStatus] = useState('')
   const [isManualStartPrompt, setIsManualStartPrompt] = useState(false)
   const [isClearingAnalyticsCache, setIsClearingAnalyticsCache] = useState(false)
@@ -252,6 +282,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [messagePushFilterSearchKeyword, setMessagePushFilterSearchKeyword] = useState('')
   const [messagePushTypeFilter, setMessagePushTypeFilter] = useState<SessionFilterTypeValue>('all')
   const [messagePushContactOptions, setMessagePushContactOptions] = useState<ContactInfo[]>([])
+  const [antiRevokeSessions, setAntiRevokeSessions] = useState<ChatSession[]>([])
   const [antiRevokeSearchKeyword, setAntiRevokeSearchKeyword] = useState('')
   const [antiRevokeSelectedIds, setAntiRevokeSelectedIds] = useState<Set<string>>(new Set())
   const [antiRevokeStatusMap, setAntiRevokeStatusMap] = useState<Record<string, { installed?: boolean; loading?: boolean; error?: string }>>({})
@@ -267,16 +298,20 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [aiModelApiBaseUrl, setAiModelApiBaseUrl] = useState('')
   const [aiModelApiKey, setAiModelApiKey] = useState('')
   const [aiModelApiModel, setAiModelApiModel] = useState('gpt-4o-mini')
-  const [aiModelApiMaxTokens, setAiModelApiMaxTokens] = useState(200)
+  const [aiModelApiMaxTokens, setAiModelApiMaxTokens] = useState(1024)
   const [aiInsightSilenceDays, setAiInsightSilenceDays] = useState(3)
   const [aiInsightAllowContext, setAiInsightAllowContext] = useState(false)
+  const [aiInsightAllowMomentsContext, setAiInsightAllowMomentsContext] = useState(false)
+  const [aiInsightMomentsContextCount, setAiInsightMomentsContextCount] = useState(5)
+  const [aiInsightMomentsBindings, setAiInsightMomentsBindings] = useState<Record<string, configService.AiInsightMomentsBinding>>({})
   const [isTestingInsight, setIsTestingInsight] = useState(false)
   const [insightTestResult, setInsightTestResult] = useState<{ success: boolean; message: string } | null>(null)
   const [showInsightApiKey, setShowInsightApiKey] = useState(false)
   const [isTriggeringInsightTest, setIsTriggeringInsightTest] = useState(false)
   const [insightTriggerResult, setInsightTriggerResult] = useState<{ success: boolean; message: string } | null>(null)
-  const [aiInsightWhitelistEnabled, setAiInsightWhitelistEnabled] = useState(false)
-  const [aiInsightWhitelist, setAiInsightWhitelist] = useState<Set<string>>(new Set())
+  const [aiInsightFilterMode, setAiInsightFilterMode] = useState<configService.AiInsightFilterMode>('whitelist')
+  const [aiInsightFilterList, setAiInsightFilterList] = useState<Set<string>>(new Set())
+  const [insightFilterType, setInsightFilterType] = useState<InsightSessionFilterTypeValue>('all')
   const [insightWhitelistSearch, setInsightWhitelistSearch] = useState('')
   const [aiInsightCooldownMinutes, setAiInsightCooldownMinutes] = useState(120)
   const [aiInsightScanIntervalHours, setAiInsightScanIntervalHours] = useState(4)
@@ -298,7 +333,19 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [weiboBindingLoadingSessionId, setWeiboBindingLoadingSessionId] = useState<string | null>(null)
   const [aiFootprintEnabled, setAiFootprintEnabled] = useState(false)
   const [aiFootprintSystemPrompt, setAiFootprintSystemPrompt] = useState('')
-  const [aiInsightDebugLogEnabled, setAiInsightDebugLogEnabled] = useState(false)
+  const [aiGroupSummaryEnabled, setAiGroupSummaryEnabled] = useState(false)
+  const [aiGroupSummaryIntervalHours, setAiGroupSummaryIntervalHours] = useState(4)
+  const [aiGroupSummarySystemPrompt, setAiGroupSummarySystemPrompt] = useState('')
+  const [aiGroupSummaryFilterList, setAiGroupSummaryFilterList] = useState<string[]>([])
+  const [aiGroupSummaryFilterSearchKeyword, setAiGroupSummaryFilterSearchKeyword] = useState('')
+  const [aiMessageInsightEnabled, setAiMessageInsightEnabled] = useState(false)
+  const [aiMessageInsightContextCount, setAiMessageInsightContextCount] = useState(50)
+  const [aiMessageInsightSystemPrompt, setAiMessageInsightSystemPrompt] = useState('')
+
+  // 自动下载图片
+  const [autoDownloadStatus, setAutoDownloadStatus] = useState<{ isHooked: boolean; pid: number | null; supported: boolean } | null>(null)
+  const [autoDownloadSelectedIds, setAutoDownloadSelectedIds] = useState<Set<string>>(new Set())
+  const [autoDownloadSearchKeyword, setAutoDownloadSearchKeyword] = useState('')
 
   // 检查 Hello 可用性
   useEffect(() => {
@@ -339,7 +386,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   }, [location.state])
 
   useEffect(() => {
-    if (activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint') {
+    if (activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint' || activeTab === 'aiGroupSummary' || activeTab === 'aiMessageInsight') {
       setAiGroupExpanded(true)
     }
   }, [activeTab])
@@ -397,15 +444,16 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         setPositionDropdownOpen(false)
         setCloseBehaviorDropdownOpen(false)
         setMessagePushFilterDropdownOpen(false)
+        setInsightFilterModeDropdownOpen(false)
       }
     }
-    if (filterModeDropdownOpen || positionDropdownOpen || closeBehaviorDropdownOpen || messagePushFilterDropdownOpen) {
+    if (filterModeDropdownOpen || positionDropdownOpen || closeBehaviorDropdownOpen || messagePushFilterDropdownOpen || insightFilterModeDropdownOpen) {
       document.addEventListener('click', handleClickOutside)
     }
     return () => {
       document.removeEventListener('click', handleClickOutside)
     }
-  }, [closeBehaviorDropdownOpen, filterModeDropdownOpen, messagePushFilterDropdownOpen, positionDropdownOpen])
+  }, [closeBehaviorDropdownOpen, filterModeDropdownOpen, insightFilterModeDropdownOpen, messagePushFilterDropdownOpen, positionDropdownOpen])
 
 
   const loadConfig = async () => {
@@ -424,6 +472,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       const savedAutoTranscribe = await configService.getAutoTranscribeVoice()
       const savedTranscribeLanguages = await configService.getTranscribeLanguages()
       const savedNotificationEnabled = await configService.getNotificationEnabled()
+      const savedAiInsightNotificationEnabled = await configService.getAiInsightNotificationEnabled()
       const savedNotificationPosition = await configService.getNotificationPosition()
       const savedNotificationFilterMode = await configService.getNotificationFilterMode()
       const savedNotificationFilterList = await configService.getNotificationFilterList()
@@ -432,6 +481,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       const savedMessagePushFilterList = await configService.getMessagePushFilterList()
       const contactsResult = await window.electronAPI.chat.getContacts({ lite: true })
       const savedLaunchAtStartupStatus = await window.electronAPI.app.getLaunchAtStartupStatus()
+      const savedSilentStartup = await configService.getSilentStartup()
       const savedWindowCloseBehavior = await configService.getWindowCloseBehavior()
       const savedQuoteLayout = await configService.getQuoteLayout()
       const savedUpdateChannel = await configService.getUpdateChannel()
@@ -477,6 +527,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       setTranscribeLanguages(savedTranscribeLanguages)
 
       setNotificationEnabled(savedNotificationEnabled)
+      setAiInsightNotificationEnabled(savedAiInsightNotificationEnabled)
       setNotificationPosition(savedNotificationPosition)
       setNotificationFilterMode(savedNotificationFilterMode)
       setNotificationFilterList(savedNotificationFilterList)
@@ -489,6 +540,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       setLaunchAtStartup(savedLaunchAtStartupStatus.enabled)
       setLaunchAtStartupSupported(savedLaunchAtStartupStatus.supported)
       setLaunchAtStartupReason(savedLaunchAtStartupStatus.reason || '')
+      setSilentStartup(savedSilentStartup)
       setWindowCloseBehavior(savedWindowCloseBehavior)
       setQuoteLayout(savedQuoteLayout)
       if (savedUpdateChannel) {
@@ -508,9 +560,12 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       setWordCloudExcludeWords(savedExcludeWords)
       setExcludeWordsInput(savedExcludeWords.join('\n'))
 
+      const savedAutoDownloadHighRes = await configService.getAutoDownloadHighRes()
+      const savedAutoDownloadWhitelist = await configService.getAutoDownloadWhitelist()
       const savedAnalyticsConsent = await configService.getAnalyticsConsent()
       setAnalyticsConsent(savedAnalyticsConsent ?? false)
-
+      setAutoDownloadHighRes(savedAutoDownloadHighRes)
+      setAutoDownloadSelectedIds(new Set(savedAutoDownloadWhitelist))
 
 
       // 如果语言列表为空，保存默认值
@@ -531,8 +586,11 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       const savedAiModelApiMaxTokens = await configService.getAiModelApiMaxTokens()
       const savedAiInsightSilenceDays = await configService.getAiInsightSilenceDays()
       const savedAiInsightAllowContext = await configService.getAiInsightAllowContext()
-      const savedAiInsightWhitelistEnabled = await configService.getAiInsightWhitelistEnabled()
-      const savedAiInsightWhitelist = await configService.getAiInsightWhitelist()
+      const savedAiInsightAllowMomentsContext = await configService.getAiInsightAllowMomentsContext()
+      const savedAiInsightMomentsContextCount = await configService.getAiInsightMomentsContextCount()
+      const savedAiInsightMomentsBindings = await configService.getAiInsightMomentsBindings()
+      const savedAiInsightFilterMode = await configService.getAiInsightFilterMode()
+      const savedAiInsightFilterList = await configService.getAiInsightFilterList()
       const savedAiInsightCooldownMinutes = await configService.getAiInsightCooldownMinutes()
       const savedAiInsightScanIntervalHours = await configService.getAiInsightScanIntervalHours()
       const savedAiInsightContextCount = await configService.getAiInsightContextCount()
@@ -546,7 +604,13 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       const savedAiInsightWeiboBindings = await configService.getAiInsightWeiboBindings()
       const savedAiFootprintEnabled = await configService.getAiFootprintEnabled()
       const savedAiFootprintSystemPrompt = await configService.getAiFootprintSystemPrompt()
-      const savedAiInsightDebugLogEnabled = await configService.getAiInsightDebugLogEnabled()
+      const savedAiGroupSummaryEnabled = await configService.getAiGroupSummaryEnabled()
+      const savedAiGroupSummaryIntervalHours = await configService.getAiGroupSummaryIntervalHours()
+      const savedAiGroupSummarySystemPrompt = await configService.getAiGroupSummarySystemPrompt()
+      const savedAiGroupSummaryFilterList = await configService.getAiGroupSummaryFilterList()
+      const savedAiMessageInsightEnabled = await configService.getAiMessageInsightEnabled()
+      const savedAiMessageInsightContextCount = await configService.getAiMessageInsightContextCount()
+      const savedAiMessageInsightSystemPrompt = await configService.getAiMessageInsightSystemPrompt()
 
       setAiInsightEnabled(savedAiInsightEnabled)
       setAiModelApiBaseUrl(savedAiModelApiBaseUrl)
@@ -555,8 +619,11 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       setAiModelApiMaxTokens(savedAiModelApiMaxTokens)
       setAiInsightSilenceDays(savedAiInsightSilenceDays)
       setAiInsightAllowContext(savedAiInsightAllowContext)
-      setAiInsightWhitelistEnabled(savedAiInsightWhitelistEnabled)
-      setAiInsightWhitelist(new Set(savedAiInsightWhitelist))
+      setAiInsightAllowMomentsContext(savedAiInsightAllowMomentsContext)
+      setAiInsightMomentsContextCount(savedAiInsightMomentsContextCount)
+      setAiInsightMomentsBindings(savedAiInsightMomentsBindings)
+      setAiInsightFilterMode(savedAiInsightFilterMode)
+      setAiInsightFilterList(new Set(savedAiInsightFilterList))
       setAiInsightCooldownMinutes(savedAiInsightCooldownMinutes)
       setAiInsightScanIntervalHours(savedAiInsightScanIntervalHours)
       setAiInsightContextCount(savedAiInsightContextCount)
@@ -570,7 +637,13 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       setAiInsightWeiboBindings(savedAiInsightWeiboBindings)
       setAiFootprintEnabled(savedAiFootprintEnabled)
       setAiFootprintSystemPrompt(savedAiFootprintSystemPrompt)
-      setAiInsightDebugLogEnabled(savedAiInsightDebugLogEnabled)
+      setAiGroupSummaryEnabled(savedAiGroupSummaryEnabled)
+      setAiGroupSummaryIntervalHours(savedAiGroupSummaryIntervalHours)
+      setAiGroupSummarySystemPrompt(savedAiGroupSummarySystemPrompt)
+      setAiGroupSummaryFilterList(savedAiGroupSummaryFilterList)
+      setAiMessageInsightEnabled(savedAiMessageInsightEnabled)
+      setAiMessageInsightContextCount(savedAiMessageInsightContextCount)
+      setAiMessageInsightSystemPrompt(savedAiMessageInsightSystemPrompt)
 
     } catch (e: any) {
       console.error('加载配置失败:', e)
@@ -599,6 +672,21 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       showMessage(`设置开机自启动失败: ${e?.message || String(e)}`, false)
     } finally {
       setIsUpdatingLaunchAtStartup(false)
+    }
+  }
+
+  const handleSilentStartupChange = async (enabled: boolean) => {
+    if (isUpdatingSilentStartup) return
+
+    try {
+      setIsUpdatingSilentStartup(true)
+      await configService.setSilentStartup(enabled)
+      setSilentStartup(enabled)
+      showMessage(enabled ? '已开启静默启动' : '已关闭静默启动', true)
+    } catch (e: any) {
+      showMessage(`设置静默启动失败: ${e?.message || String(e)}`, false)
+    } finally {
+      setIsUpdatingSilentStartup(false)
     }
   }
 
@@ -651,6 +739,21 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   useEffect(() => {
     void refreshWhisperStatus(whisperModelDir)
   }, [whisperModelDir])
+
+  useEffect(() => {
+    if (activeTab === 'autoDownload') {
+      fetchAutoDownloadStatus()
+
+      let interval: ReturnType<typeof setInterval> | undefined
+      if (autoDownloadHighRes) {
+        interval = setInterval(fetchAutoDownloadStatus, 2000)
+      }
+
+      return () => {
+        if (interval) clearInterval(interval)
+      }
+    }
+  }, [activeTab, autoDownloadHighRes])
 
   const getErrorMessage = (error: any): string => {
     const raw = typeof error?.message === 'string' ? error.message : String(error ?? '')
@@ -739,10 +842,10 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     Array.from(new Set((sessionIds || []).map((id) => String(id || '').trim()).filter(Boolean)))
 
   const getCurrentAntiRevokeSessionIds = (): string[] =>
-    normalizeSessionIds(chatSessions.map((session) => session.username))
+    normalizeSessionIds(antiRevokeSessions.map((session) => session.username))
 
-  const ensureAntiRevokeSessionsLoaded = async (): Promise<string[]> => {
-    const current = getCurrentAntiRevokeSessionIds()
+  const ensureChatSessionsLoaded = async (): Promise<string[]> => {
+    const current = normalizeSessionIds(chatSessions.map((session) => session.username))
     if (current.length > 0) return current
     const sessionsResult = await window.electronAPI.chat.getSessions()
     if (!sessionsResult.success || !sessionsResult.sessions) {
@@ -750,6 +853,27 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     }
     setChatSessions(sessionsResult.sessions)
     return normalizeSessionIds(sessionsResult.sessions.map((session) => session.username))
+  }
+
+  const ensureAntiRevokeSessionsLoaded = async (): Promise<string[]> => {
+    const current = getCurrentAntiRevokeSessionIds()
+    if (current.length > 0) return current
+    const sessionsResult = await window.electronAPI.chat.getAntiRevokeSessions()
+    if (!sessionsResult.success || !sessionsResult.sessions) {
+      throw new Error(sessionsResult.error || '加载会话失败')
+    }
+    const nextSessions = sessionsResult.sessions
+    const nextIds = normalizeSessionIds(nextSessions.map((session) => session.username))
+    setAntiRevokeSessions(nextSessions)
+    setAntiRevokeSelectedIds((prev) => {
+      const allowed = new Set(nextIds)
+      return new Set(Array.from(prev).filter((sessionId) => allowed.has(sessionId)))
+    })
+    setAntiRevokeStatusMap((prev) => {
+      const allowed = new Set(nextIds)
+      return Object.fromEntries(Object.entries(prev).filter(([sessionId]) => allowed.has(sessionId)))
+    })
+    return nextIds
   }
 
   const markAntiRevokeRowsLoading = (sessionIds: string[]) => {
@@ -959,15 +1083,14 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   }
 
   useEffect(() => {
-    if (activeTab !== 'antiRevoke' && activeTab !== 'insight') return
+    if (activeTab !== 'antiRevoke' && activeTab !== 'insight' && activeTab !== 'autoDownload') return
     let canceled = false
     ;(async () => {
       try {
-        // 两个 Tab 都需要会话列表；antiRevoke 还需要额外检查防撤回状态
-        const sessionIds = await ensureAntiRevokeSessionsLoaded()
-        if (canceled) return
-        if (activeTab === 'antiRevoke') {
-          await handleRefreshAntiRevokeStatus(sessionIds)
+        if (activeTab === 'antiRevoke' || activeTab === 'autoDownload') {
+          await ensureAntiRevokeSessionsLoaded()
+        } else {
+          await ensureChatSessionsLoaded()
         }
       } catch (e: any) {
         if (!canceled) {
@@ -1243,12 +1366,14 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     if (isFetchingDbKey) return
     setIsFetchingDbKey(true)
     setIsManualStartPrompt(false)
+    setDbKeyError('')
     setDbKeyStatus('正在连接微信进程...')
     try {
       const result = await window.electronAPI.key.autoGetDbKey()
       if (result.success && result.key) {
         setDecryptKey(result.key)
         setDbKeyStatus('密钥获取成功')
+        setDbKeyError('')
         showMessage('已自动获取解密密钥', true)
         await syncCurrentKeys({ decryptKey: result.key, wxid })
         const keysOverride = buildKeysFromInputs({ decryptKey: result.key })
@@ -1263,15 +1388,24 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         ) {
           setIsManualStartPrompt(true)
           setDbKeyStatus('需要手动启动微信')
+          setDbKeyError('')
         } else {
-          showMessage(result.error || '自动获取密钥失败', false)
+          const failureMessage = result.error || '自动获取密钥失败'
+          setDbKeyError(failureMessage)
+          showMessage(failureMessage, false)
         }
       }
     } catch (e: any) {
-      showMessage(`自动获取密钥失败: ${e}`, false)
+      const failureMessage = `自动获取密钥失败: ${e}`
+      setDbKeyError(failureMessage)
+      showMessage(failureMessage, false)
     } finally {
       setIsFetchingDbKey(false)
     }
+  }
+
+  const openMacKeyFaq = () => {
+    void window.electronAPI.shell.openExternal(MAC_KEY_FAQ_URL)
   }
 
   const handleManualConfirm = async () => {
@@ -1515,6 +1649,15 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     }
   }
 
+  const fetchAutoDownloadStatus = async () => {
+    try {
+      const status = await (window as any).electronAPI.image.getAutoDownloadStatus()
+      setAutoDownloadStatus(status)
+    } catch (error) {
+      console.error('获取自动下载状态失败:', error)
+    }
+  }
+
   const renderAppearanceTab = () => (
     <div className="tab-content">
       <div className="theme-mode-toggle">
@@ -1583,6 +1726,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                   if (selected) return
                   setQuoteLayout(option.value)
                   await configService.setQuoteLayout(option.value)
+                  window.dispatchEvent(new CustomEvent('quote-layout-changed', { detail: option.value }))
                   showMessage(option.successMessage, true)
                 }}
                 role="radio"
@@ -1596,16 +1740,30 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                         {isQuoteBottom ? (
                           <>
                             <div className="message-text">拍得真不错!</div>
-                            <div className="quoted-message">
-                              <span className="quoted-sender">张三</span>
-                              <span className="quoted-text">那天去爬山的照片...</span>
+                            <div className="ambient-reply-wrapper">
+                              <div className="reply-anchor">
+                                <svg className="reply-anchor-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <polyline points="9 14 4 9 9 4" />
+                                  <path d="M20 20v-7a4 4 0 0 0-4-4H4" />
+                                </svg>
+                                <span className="reply-anchor-name">张三</span>
+                                <span className="reply-anchor-sep">&middot;</span>
+                                <span className="reply-anchor-excerpt">那天去爬山的照片...</span>
+                              </div>
                             </div>
                           </>
                         ) : (
                           <>
-                            <div className="quoted-message">
-                              <span className="quoted-sender">张三</span>
-                              <span className="quoted-text">那天去爬山的照片...</span>
+                            <div className="ambient-reply-wrapper">
+                              <div className="reply-anchor">
+                                <svg className="reply-anchor-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                  <polyline points="9 14 4 9 9 4" />
+                                  <path d="M20 20v-7a4 4 0 0 0-4-4H4" />
+                                </svg>
+                                <span className="reply-anchor-name">张三</span>
+                                <span className="reply-anchor-sep">&middot;</span>
+                                <span className="reply-anchor-excerpt">那天去爬山的照片...</span>
+                              </div>
                             </div>
                             <div className="message-text">拍得真不错!</div>
                           </>
@@ -1651,6 +1809,35 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
               disabled={!launchAtStartupSupported || isUpdatingLaunchAtStartup}
               onChange={(e) => {
                 void handleLaunchAtStartupChange(e.target.checked)
+              }}
+            />
+            <span className="switch-slider" />
+          </label>
+        </div>
+      </div>
+
+      <div className="divider" />
+
+      <div className="form-group">
+        <label>静默启动</label>
+        <span className="form-hint">
+          开启后，无论手动启动还是开机自启动，都会先驻留到系统托盘，不主动显示主窗口。
+        </span>
+        <div className="log-toggle-line">
+          <span className="log-status">
+            {isUpdatingSilentStartup
+              ? '保存中...'
+              : (silentStartup ? '已开启' : '已关闭')}
+          </span>
+          <label className="switch" htmlFor="silent-startup-toggle">
+            <input
+              id="silent-startup-toggle"
+              className="switch-input"
+              type="checkbox"
+              checked={silentStartup}
+              disabled={isUpdatingSilentStartup}
+              onChange={(e) => {
+                void handleSilentStartupChange(e.target.checked)
               }}
             />
             <span className="switch-slider" />
@@ -1752,6 +1939,29 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                   setNotificationEnabled(val)
                   await configService.setNotificationEnabled(val)
                   showMessage(val ? '已开启通知' : '已关闭通知', true)
+                }}
+              />
+              <span className="switch-slider" />
+            </label>
+          </div>
+        </div>
+
+        <div className="form-group">
+          <label>AI 见解消息通知</label>
+          <span className="form-hint">仅控制 AI 见解弹窗，不影响新消息通知、会话过滤或 Telegram 推送</span>
+          <div className="log-toggle-line">
+            <span className="log-status">{aiInsightNotificationEnabled ? '已开启' : '已关闭'}</span>
+            <label className="switch" htmlFor="ai-insight-notification-enabled-toggle">
+              <input
+                id="ai-insight-notification-enabled-toggle"
+                className="switch-input"
+                type="checkbox"
+                checked={aiInsightNotificationEnabled}
+                onChange={async (e) => {
+                  const val = e.target.checked
+                  setAiInsightNotificationEnabled(val)
+                  await configService.setAiInsightNotificationEnabled(val)
+                  showMessage(val ? '已开启 AI 见解消息通知' : '已关闭 AI 见解消息通知', true)
                 }}
               />
               <span className="switch-slider" />
@@ -1958,7 +2168,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   }
 
   const renderAntiRevokeTab = () => {
-    const sortedSessions = [...chatSessions].sort((a, b) => (b.sortTimestamp || 0) - (a.sortTimestamp || 0))
+    const sortedSessions = [...antiRevokeSessions].sort((a, b) => (b.sortTimestamp || 0) - (a.sortTimestamp || 0))
     const keyword = antiRevokeSearchKeyword.trim().toLowerCase()
     const filteredSessions = sortedSessions.filter((session) => {
       if (!keyword) return true
@@ -2045,23 +2255,32 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
               />
             </div>
             <div className="anti-revoke-toolbar-actions">
-              <div className="anti-revoke-btn-group">
-                <button className="btn btn-secondary btn-sm" onClick={() => void handleRefreshAntiRevokeStatus()} disabled={busy}>
-                  <RefreshCw size={14} /> {isAntiRevokeRefreshing ? '刷新中...' : '刷新状态'}
-                </button>
-              </div>
-              <div className="anti-revoke-btn-group">
-                <button className="btn btn-secondary btn-sm" onClick={selectAllFiltered} disabled={busy || filteredSessionIds.length === 0 || allFilteredSelected}>
-                  全选
-                </button>
-                <button className="btn btn-secondary btn-sm" onClick={clearSelection} disabled={busy || selectedCount === 0}>
-                  清空选择
-                </button>
-              </div>
+              <button className="btn btn-secondary btn-sm" onClick={() => void handleRefreshAntiRevokeStatus()} disabled={busy}>
+                <RefreshCw size={14} /> {isAntiRevokeRefreshing ? '刷新中...' : '刷新状态'}
+              </button>
+            </div>
+          </div>
+
+          <div className="anti-revoke-selection-strip">
+            <div className="anti-revoke-selected-count">
+              <span>已选 <strong>{selectedCount}</strong> 个会话</span>
+              <span>筛选命中 <strong>{selectedInFilteredCount}</strong> / {filteredSessionIds.length}</span>
+            </div>
+            <div className="anti-revoke-selection-actions">
+              <button className="btn btn-secondary btn-sm" onClick={selectAllFiltered} disabled={busy || filteredSessionIds.length === 0 || allFilteredSelected}>
+                全选
+              </button>
+              <button className="btn btn-secondary btn-sm" onClick={clearSelection} disabled={busy || selectedCount === 0}>
+                清空选择
+              </button>
             </div>
           </div>
 
           <div className="anti-revoke-batch-actions">
+            <div className="anti-revoke-batch-copy">
+              <span className="anti-revoke-section-label">批量部署</span>
+              <span>对已选会话执行防撤回安装或卸载</span>
+            </div>
             <div className="anti-revoke-btn-group anti-revoke-batch-btns">
               <button className="btn btn-primary btn-sm" onClick={() => void handleInstallAntiRevokeTriggers()} disabled={busy || selectedCount === 0}>
                 {isAntiRevokeInstalling ? '安装中...' : '批量安装'}
@@ -2069,10 +2288,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
               <button className="btn btn-secondary btn-sm" onClick={() => void handleUninstallAntiRevokeTriggers()} disabled={busy || selectedCount === 0}>
                 {isAntiRevokeUninstalling ? '卸载中...' : '批量卸载'}
               </button>
-            </div>
-            <div className="anti-revoke-selected-count">
-              <span>已选 <strong>{selectedCount}</strong> 个会话</span>
-              <span>筛选命中 <strong>{selectedInFilteredCount}</strong> / {filteredSessionIds.length}</span>
             </div>
           </div>
         </div>
@@ -2196,6 +2411,11 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
           </button>
         )}
         {dbKeyStatus && <div className="form-hint status-text">{dbKeyStatus}</div>}
+        {isMac && dbKeyError && (
+          <button type="button" className="mac-key-faq-link" onClick={openMacKeyFaq}>
+            查看 macOS 获取密钥排障指引
+          </button>
+        )}
       </div>
 
       <div className="form-group">
@@ -2368,11 +2588,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const renderModelsTab = () => (
     <div className="tab-content">
       <div className="form-group">
-        <label>模型管理</label>
-        <span className="form-hint">管理语音识别模型</span>
-      </div>
-
-      <div className="form-group">
         <label>语音识别模型 (Whisper)</label>
         <span className="form-hint">用于语音消息转文字功能</span>
 
@@ -2388,12 +2603,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                   <span className="status-indicator success"><Check size={14} /> 已安装</span>
                 ) : (
                   <span className="status-indicator warning">未安装</span>
-                )}
-                {resolvedWhisperModelPath && (
-                  <div className="model-path-block">
-                    <span className="path-label">模型目录</span>
-                    <div className="path-text" title={resolvedWhisperModelPath}>{resolvedWhisperModelPath}</div>
-                  </div>
                 )}
               </div>
             </div>
@@ -2425,25 +2634,21 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 )}
               </div>
             )}
-          </div>
 
-          <div className="sub-setting">
-            <div className="sub-label">自定义模型目录</div>
-            <div className="path-selector">
+            <div className="model-directory-control">
               <input
                 type="text"
-                value={whisperModelDir}
+                value={resolvedWhisperModelPath}
                 readOnly
                 placeholder="默认目录"
+                title={resolvedWhisperModelPath || '默认目录'}
               />
-              <button className="btn-icon" onClick={handleSelectWhisperModelDir} title="选择目录">
-                <FolderOpen size={18} />
+              <button className="btn btn-secondary btn-sm" onClick={handleSelectWhisperModelDir} title="选择自定义目录">
+                <FolderOpen size={14} /> 选择自定义目录
               </button>
-              {whisperModelDir && (
-                <button className="btn-icon danger" onClick={handleResetWhisperModelDir} title="重置为默认">
-                  <RotateCcw size={18} />
-                </button>
-              )}
+              <button className="btn btn-secondary btn-sm" onClick={handleResetWhisperModelDir} disabled={!whisperModelDir} title="恢复默认">
+                <RotateCcw size={14} /> 恢复默认
+              </button>
             </div>
           </div>
         </div>
@@ -2726,6 +2931,15 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     messagePushFilterSearchKeyword
   )
 
+  const groupSummaryFilterOptions = sessionFilterOptions.filter((session) => session.type === 'group')
+  const groupSummaryAvailableSessions = groupSummaryFilterOptions.filter((session) => {
+    const keyword = aiGroupSummaryFilterSearchKeyword.trim().toLowerCase()
+    if (aiGroupSummaryFilterList.includes(session.username)) return false
+    if (!keyword) return true
+    return String(session.displayName || '').toLowerCase().includes(keyword) ||
+      session.username.toLowerCase().includes(keyword)
+  })
+
   const handleAddAllNotificationFilterSessions = async () => {
     const usernames = notificationAvailableSessions.map(session => session.username)
     if (usernames.length === 0) return
@@ -2853,18 +3067,18 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       <div className="form-group">
         <label>通用 Max Tokens</label>
         <span className="form-hint">
-          设置单次请求的最大输出 token 数量，见解与足迹共享该值。默认 <code>200</code>。
+          设置单次请求的最大输出 token 数量，见解与足迹共享该值。默认 <code>1024</code>。
         </span>
         <input
           type="number"
           className="field-input"
           value={aiModelApiMaxTokens}
           min={1}
-          max={65535}
+          max={2000000}
           step={1}
           onChange={(e) => {
             const parsed = parseInt(e.target.value, 10)
-            const val = Math.min(65535, Math.max(1, Number.isFinite(parsed) ? parsed : 200))
+            const val = Math.min(2000000, Math.max(1, Number.isFinite(parsed) ? parsed : 1024))
             setAiModelApiMaxTokens(val)
             scheduleConfigSave('aiModelApiMaxTokens', () => configService.setAiModelApiMaxTokens(val))
           }}
@@ -2983,6 +3197,24 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     })
   }
 
+  const isMomentsEnabledForSession = (sessionId: string): boolean => {
+    return aiInsightMomentsBindings[sessionId]?.enabled === true
+  }
+
+  const handleToggleMomentsBinding = async (sessionId: string, enabled: boolean) => {
+    const nextBindings = { ...aiInsightMomentsBindings }
+    if (enabled) {
+      nextBindings[sessionId] = {
+        enabled: true,
+        updatedAt: Date.now()
+      }
+    } else {
+      delete nextBindings[sessionId]
+    }
+    setAiInsightMomentsBindings(nextBindings)
+    await configService.setAiInsightMomentsBindings(nextBindings)
+  }
+
   const handleSaveWeiboBinding = async (sessionId: string, displayName: string) => {
     const draftUid = getWeiboBindingDraftValue(sessionId)
     setWeiboBindingLoadingSessionId(sessionId)
@@ -3042,7 +3274,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
       <div className="form-group">
         <label>AI 见解</label>
         <span className="form-hint">
-          开启后，AI 会在后台默默分析聊天数据，在合适的时机通过右下角弹窗送出一针见血的见解——例如提醒你久未联系的朋友，或对你刚刚的对话提出回复建议。默认关闭，所有分析均在本地发起请求，不经过任何第三方中间服务。
+          开启后，AI 会在后台默默分析聊天数据，在合适的时机通过应用通知送出一针见血的见解——例如提醒你久未联系的朋友，或对你刚刚的对话提出回复建议。默认关闭，所有分析均在本地发起请求，不经过任何第三方中间服务。
         </span>
         <div className="log-toggle-line">
           <span className="log-status">{aiInsightEnabled ? '已开启' : '已关闭'}</span>
@@ -3176,7 +3408,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         <span className="form-hint">
           开启后，触发见解时会将该联系人最近 N 条聊天记录发送给 AI，分析质量显著提升。
           <br />
-          <strong>关闭时</strong>：AI 仅知道统计摘要（沉默天数等），输出质量较低。
+          <strong>关闭时</strong>：不会发送聊天原文，输出质量较低。
           <br />
           <strong>开启时</strong>：聊天文本内容（不含图片、语音）会通过你配置的 API 发送给模型提供商。请确认你信任该服务商。
         </span>
@@ -3197,27 +3429,79 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         </div>
       </div>
 
-      {aiInsightAllowContext && (
-        <div className="form-group">
-          <label>发送近期对话条数</label>
-          <span className="form-hint">
-            发送给 AI 的聊天记录最大条数。条数越多分析越准确，token 消耗也越多。
-          </span>
-          <input
-            type="number"
-            className="field-input"
-            value={aiInsightContextCount}
-            min={1}
-            max={200}
-            onChange={(e) => {
-              const val = Math.max(1, Math.min(200, parseInt(e.target.value, 10) || 40))
-              setAiInsightContextCount(val)
-              scheduleConfigSave('aiInsightContextCount', () => configService.setAiInsightContextCount(val))
-            }}
-            style={{ width: 100 }}
-          />
+      <div className={`insight-collapsible-setting ${aiInsightAllowContext ? 'expanded' : 'collapsed'}`} aria-hidden={!aiInsightAllowContext}>
+        <div className="insight-collapsible-setting-inner">
+          <div className="form-group">
+            <label>发送近期对话条数</label>
+            <span className="form-hint">
+              发送给 AI 的聊天记录最大条数。条数越多分析越准确，token 消耗也越多。
+            </span>
+            <input
+              type="number"
+              className="field-input"
+              value={aiInsightContextCount}
+              min={1}
+              max={200}
+              disabled={!aiInsightAllowContext}
+              onChange={(e) => {
+                const val = Math.max(1, Math.min(200, parseInt(e.target.value, 10) || 40))
+                setAiInsightContextCount(val)
+                scheduleConfigSave('aiInsightContextCount', () => configService.setAiInsightContextCount(val))
+              }}
+              style={{ width: 100 }}
+            />
+          </div>
         </div>
-      )}
+      </div>
+
+      <div className="divider" />
+
+      <div className="form-group">
+        <label>允许发送近期朋友圈内容用于分析（实验性）</label>
+        <span className="form-hint">
+          开启后，可在下方列表为私聊联系人单独允许朋友圈补充分析。程序只会在触发见解时按需读取，不会做后台持续扫描。
+        </span>
+        <div className="log-toggle-line">
+          <span className="log-status">{aiInsightAllowMomentsContext ? '已开启' : '已关闭'}</span>
+          <label className="switch">
+            <input
+              type="checkbox"
+              checked={aiInsightAllowMomentsContext}
+              onChange={async (e) => {
+                const val = e.target.checked
+                setAiInsightAllowMomentsContext(val)
+                await configService.setAiInsightAllowMomentsContext(val)
+              }}
+            />
+            <span className="switch-slider" />
+          </label>
+        </div>
+      </div>
+
+      <div className={`insight-collapsible-setting ${aiInsightAllowMomentsContext ? 'expanded' : 'collapsed'}`} aria-hidden={!aiInsightAllowMomentsContext}>
+        <div className="insight-collapsible-setting-inner">
+          <div className="form-group">
+            <label>发送近期朋友圈条数</label>
+            <span className="form-hint">
+              发送给 AI 的朋友圈最大条数。条数越多上下文越充分，token 消耗也越多。
+            </span>
+            <input
+              type="number"
+              className="field-input"
+              value={aiInsightMomentsContextCount}
+              min={1}
+              max={20}
+              disabled={!aiInsightAllowMomentsContext}
+              onChange={(e) => {
+                const val = Math.max(1, Math.min(20, parseInt(e.target.value, 10) || 5))
+                setAiInsightMomentsContextCount(val)
+                scheduleConfigSave('aiInsightMomentsContextCount', () => configService.setAiInsightMomentsContextCount(val))
+              }}
+              style={{ width: 100 }}
+            />
+          </div>
+        </div>
+      </div>
 
       <div className="divider" />
 
@@ -3256,29 +3540,32 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         )}
       </div>
 
-      {aiInsightAllowSocialContext && (
-        <div className="form-group">
-          <label>发送近期社交平台内容条数</label>
-          <span className="form-hint">
-            当前仅支持微博最近发帖。
-            <br />
-            <strong>不建议超过 5，避免触发平台风控。</strong>
-          </span>
-          <input
-            type="number"
-            className="field-input"
-            value={aiInsightSocialContextCount}
-            min={1}
-            max={5}
-            onChange={(e) => {
-              const val = Math.max(1, Math.min(5, parseInt(e.target.value, 10) || 3))
-              setAiInsightSocialContextCount(val)
-              scheduleConfigSave('aiInsightSocialContextCount', () => configService.setAiInsightSocialContextCount(val))
-            }}
-            style={{ width: 100 }}
-          />
+      <div className={`insight-collapsible-setting ${aiInsightAllowSocialContext ? 'expanded' : 'collapsed'}`} aria-hidden={!aiInsightAllowSocialContext}>
+        <div className="insight-collapsible-setting-inner">
+          <div className="form-group">
+            <label>发送近期社交平台内容条数</label>
+            <span className="form-hint">
+              当前仅支持微博最近发帖。
+              <br />
+              <strong>不建议超过 5，避免触发平台风控。</strong>
+            </span>
+            <input
+              type="number"
+              className="field-input"
+              value={aiInsightSocialContextCount}
+              min={1}
+              max={5}
+              disabled={!aiInsightAllowSocialContext}
+              onChange={(e) => {
+                const val = Math.max(1, Math.min(5, parseInt(e.target.value, 10) || 3))
+                setAiInsightSocialContextCount(val)
+                scheduleConfigSave('aiInsightSocialContextCount', () => configService.setAiInsightSocialContextCount(val))
+              }}
+              style={{ width: 100 }}
+            />
+          </div>
         </div>
-      )}
+      </div>
 
       <div className="divider" />
       {/* 自定义 System Prompt */}
@@ -3390,98 +3677,129 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
       <div className="divider" />
 
-      {/* 对话白名单 */}
+      {/* 对话过滤名单 */}
       {(() => {
-        const sortedSessions = [...chatSessions].sort((a, b) => (b.sortTimestamp || 0) - (a.sortTimestamp || 0))
+        const selectableSessions = sessionFilterOptions.filter((session) =>
+          session.type === 'private' || session.type === 'group' || session.type === 'official'
+        )
         const keyword = insightWhitelistSearch.trim().toLowerCase()
-        const filteredSessions = sortedSessions.filter((s) => {
-          const id = s.username?.trim() || ''
-          if (!id || id.endsWith('@chatroom') || id.toLowerCase().includes('placeholder')) return false
+        const filteredSessions = selectableSessions.filter((session) => {
+          if (insightFilterType !== 'all' && session.type !== insightFilterType) return false
+          const id = session.username?.trim() || ''
+          if (!id || id.toLowerCase().includes('placeholder')) return false
           if (!keyword) return true
           return (
-            String(s.displayName || '').toLowerCase().includes(keyword) ||
+            String(session.displayName || '').toLowerCase().includes(keyword) ||
             id.toLowerCase().includes(keyword)
           )
         })
-        const filteredIds = filteredSessions.map((s) => s.username)
-        const selectedCount = aiInsightWhitelist.size
-        const selectedInFilteredCount = filteredIds.filter((id) => aiInsightWhitelist.has(id)).length
+        const filteredIds = filteredSessions.map((session) => session.username)
+        const selectedCount = aiInsightFilterList.size
+        const selectedInFilteredCount = filteredIds.filter((id) => aiInsightFilterList.has(id)).length
         const allFilteredSelected = filteredIds.length > 0 && selectedInFilteredCount === filteredIds.length
 
-        const toggleSession = (id: string) => {
-          setAiInsightWhitelist((prev) => {
-            const next = new Set(prev)
-            if (next.has(id)) next.delete(id)
-            else next.add(id)
-            return next
-          })
+        const saveFilterList = async (next: Set<string>) => {
+          await configService.setAiInsightFilterList(Array.from(next))
         }
 
-        const saveWhitelist = async (next: Set<string>) => {
-          await configService.setAiInsightWhitelist(Array.from(next))
+        const saveFilterMode = async (mode: configService.AiInsightFilterMode) => {
+          setAiInsightFilterMode(mode)
+          setInsightFilterModeDropdownOpen(false)
+          await configService.setAiInsightFilterMode(mode)
+          showMessage(mode === 'whitelist' ? '已切换为白名单模式' : '已切换为黑名单模式', true)
         }
 
         const selectAllFiltered = () => {
-          setAiInsightWhitelist((prev) => {
+          setAiInsightFilterList((prev) => {
             const next = new Set(prev)
             for (const id of filteredIds) next.add(id)
-            void saveWhitelist(next)
+            void saveFilterList(next)
             return next
           })
         }
 
         const clearSelection = () => {
           const next = new Set<string>()
-          setAiInsightWhitelist(next)
-          void saveWhitelist(next)
+          setAiInsightFilterList(next)
+          void saveFilterList(next)
         }
 
         return (
           <div className="anti-revoke-tab insight-social-tab">
             <div className="anti-revoke-hero">
               <div className="anti-revoke-hero-main">
-                <h3>对话白名单</h3>
+                <h3>对话黑白名单</h3>
                 <p>
-                  开启后，AI 见解仅对勾选的私聊对话生效，未勾选的对话将被完全忽略。关闭时对所有私聊均生效。中间可填写微博 UID。
+                  白名单模式下仅对已选会话触发见解；黑名单模式下会跳过已选会话。默认白名单且不选择任何会话。支持私聊、群聊、订阅号/服务号分类筛选后批量选择。
                 </p>
               </div>
               <div className="anti-revoke-metrics">
                 <div className="anti-revoke-metric is-total">
-                  <span className="label">私聊总数</span>
-                  <span className="value">{filteredIds.length + (keyword ? 0 : 0)}</span>
+                  <span className="label">可选会话总数</span>
+                  <span className="value">{selectableSessions.length}</span>
                 </div>
                 <div className="anti-revoke-metric is-installed">
-                  <span className="label">已选中</span>
+                  <span className="label">已加入名单</span>
                   <span className="value">{selectedCount}</span>
                 </div>
               </div>
             </div>
 
-            <div className="log-toggle-line" style={{ marginBottom: 12 }}>
-              <span className="log-status" style={{ fontWeight: 600 }}>
-                {aiInsightWhitelistEnabled ? '白名单已启用（仅对勾选对话生效）' : '白名单未启用（对所有私聊生效）'}
-              </span>
-              <label className="switch">
-                <input
-                  type="checkbox"
-                  checked={aiInsightWhitelistEnabled}
-                  onChange={async (e) => {
-                    const val = e.target.checked
-                    setAiInsightWhitelistEnabled(val)
-                    await configService.setAiInsightWhitelistEnabled(val)
-                  }}
-                />
-                <span className="switch-slider" />
-              </label>
+            <div className="form-group" style={{ marginBottom: 12 }}>
+              <div className="log-toggle-line">
+                <span className="log-status" style={{ fontWeight: 600 }}>
+                  {aiInsightFilterMode === 'whitelist'
+                    ? '白名单模式（仅对名单内会话生效）'
+                    : '黑名单模式（名单内会话将被忽略）'}
+                </span>
+                <div className="custom-select" style={{ minWidth: 210 }}>
+                  <div
+                    className={`custom-select-trigger ${insightFilterModeDropdownOpen ? 'open' : ''}`}
+                    onClick={() => setInsightFilterModeDropdownOpen(!insightFilterModeDropdownOpen)}
+                  >
+                    <span className="custom-select-value">
+                      {aiInsightFilterMode === 'whitelist' ? '白名单模式' : '黑名单模式'}
+                    </span>
+                    <ChevronDown size={14} className={`custom-select-arrow ${insightFilterModeDropdownOpen ? 'rotate' : ''}`} />
+                  </div>
+                  <div className={`custom-select-dropdown ${insightFilterModeDropdownOpen ? 'open' : ''}`}>
+                    {[
+                      { value: 'whitelist', label: '白名单模式' },
+                      { value: 'blacklist', label: '黑名单模式' }
+                    ].map(option => (
+                      <div
+                        key={option.value}
+                        className={`custom-select-option ${aiInsightFilterMode === option.value ? 'selected' : ''}`}
+                        onClick={() => { void saveFilterMode(option.value as configService.AiInsightFilterMode) }}
+                      >
+                        {option.label}
+                        {aiInsightFilterMode === option.value && <Check size={14} />}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div className="anti-revoke-control-card">
+              <div className="push-filter-type-tabs" style={{ marginBottom: 10 }}>
+                {insightFilterTypeOptions.map(option => (
+                  <button
+                    key={option.value}
+                    type="button"
+                    className={`push-filter-type-tab ${insightFilterType === option.value ? 'active' : ''}`}
+                    onClick={() => setInsightFilterType(option.value)}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
               <div className="anti-revoke-toolbar">
                 <div className="filter-search-box anti-revoke-search">
                   <Search size={14} />
                   <input
                     type="text"
-                    placeholder="搜索私聊对话..."
+                    placeholder="搜索对话..."
                     value={insightWhitelistSearch}
                     onChange={(e) => setInsightWhitelistSearch(e.target.value)}
                   />
@@ -3517,17 +3835,20 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
             <div className="anti-revoke-list">
               {filteredSessions.length === 0 ? (
                 <div className="anti-revoke-empty">
-                  {insightWhitelistSearch ? '没有匹配的对话' : '暂无私聊对话'}
+                  {insightWhitelistSearch || insightFilterType !== 'all' ? '没有匹配的对话' : '暂无可选对话'}
                 </div>
               ) : (
                 <>
                   <div className="anti-revoke-list-header">
                     <span>对话（{filteredSessions.length}）</span>
+                    <span className="insight-moments-column-title">朋友圈</span>
                     <span className="insight-social-column-title">社交平台（微博）</span>
-                    <span>状态</span>
+                    <span className="anti-revoke-status-column-title">状态</span>
                   </div>
                   {filteredSessions.map((session) => {
-                    const isSelected = aiInsightWhitelist.has(session.username)
+                    const isSelected = aiInsightFilterList.has(session.username)
+                    const isPrivateSession = session.type === 'private'
+                    const isMomentsEnabled = isMomentsEnabledForSession(session.username)
                     const weiboBinding = aiInsightWeiboBindings[session.username]
                     const weiboDraftValue = getWeiboBindingDraftValue(session.username)
                     const isBindingLoading = weiboBindingLoadingSessionId === session.username
@@ -3543,11 +3864,11 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                               type="checkbox"
                               checked={isSelected}
                               onChange={async () => {
-                                setAiInsightWhitelist((prev) => {
+                                setAiInsightFilterList((prev) => {
                                   const next = new Set(prev)
                                   if (next.has(session.username)) next.delete(session.username)
                                   else next.add(session.username)
-                                  void configService.setAiInsightWhitelist(Array.from(next))
+                                  void configService.setAiInsightFilterList(Array.from(next))
                                   return next
                                 })
                               }}
@@ -3563,54 +3884,81 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                           />
                           <div className="anti-revoke-row-text">
                             <span className="name">{session.displayName || session.username}</span>
+                            <span className="desc">{getSessionFilterTypeLabel(session.type)}</span>
                           </div>
                         </label>
+                        <div className="insight-moments-cell">
+                          {isPrivateSession ? (
+                            <label className="insight-moments-toggle">
+                              <input
+                                type="checkbox"
+                                checked={isMomentsEnabled}
+                                onChange={(e) => { void handleToggleMomentsBinding(session.username, e.target.checked) }}
+                              />
+                              <span className="check-indicator" aria-hidden="true">
+                                <Check size={12} />
+                              </span>
+                            </label>
+                          ) : (
+                            <span className="binding-feedback muted">-</span>
+                          )}
+                        </div>
                         <div className="insight-social-binding-cell">
-                          <div className="insight-social-binding-input-wrap">
-                            <span className="binding-platform-chip">微博</span>
-                            <input
-                              type="text"
-                              className="insight-social-binding-input"
-                              value={weiboDraftValue}
-                              placeholder="填写数字 UID"
-                              onChange={(e) => updateWeiboBindingDraft(session.username, e.target.value)}
-                            />
-                          </div>
-                          <div className="insight-social-binding-actions">
-                            <button
-                              type="button"
-                              className="btn btn-secondary btn-sm"
-                              onClick={() => void handleSaveWeiboBinding(session.username, session.displayName || session.username)}
-                              disabled={isBindingLoading || !weiboDraftValue.trim()}
-                            >
-                              {isBindingLoading ? '绑定中...' : (weiboBinding ? '更新' : '绑定')}
-                            </button>
-                            {weiboBinding && (
-                              <button
-                                type="button"
-                                className="btn btn-secondary btn-sm"
-                                onClick={() => void handleClearWeiboBinding(session.username)}
-                              >
-                                清除
-                              </button>
-                            )}
-                          </div>
-                          <div className="insight-social-binding-feedback">
-                            {weiboBindingError ? (
-                              <span className="binding-feedback error">{weiboBindingError}</span>
-                            ) : weiboBinding?.screenName ? (
-                              <span className="binding-feedback">@{weiboBinding.screenName}</span>
-                            ) : weiboBinding?.uid ? (
-                              <span className="binding-feedback">已绑定 UID：{weiboBinding.uid}</span>
-                            ) : (
-                              <span className="binding-feedback muted">仅支持手动填写数字 UID</span>
-                            )}
-                          </div>
+                          {isPrivateSession ? (
+                            <>
+                              <div className="insight-social-binding-input-wrap">
+                                <span className="binding-platform-chip">微博</span>
+                                <input
+                                  type="text"
+                                  className="insight-social-binding-input"
+                                  value={weiboDraftValue}
+                                  placeholder="填写数字 UID"
+                                  onChange={(e) => updateWeiboBindingDraft(session.username, e.target.value)}
+                                />
+                              </div>
+                              <div className="insight-social-binding-actions">
+                                <button
+                                  type="button"
+                                  className="btn btn-secondary btn-sm"
+                                  onClick={() => void handleSaveWeiboBinding(session.username, session.displayName || session.username)}
+                                  disabled={isBindingLoading || !weiboDraftValue.trim()}
+                                >
+                                  {isBindingLoading ? '绑定中...' : (weiboBinding ? '更新' : '绑定')}
+                                </button>
+                                {weiboBinding && (
+                                  <button
+                                    type="button"
+                                    className="btn btn-secondary btn-sm"
+                                    onClick={() => void handleClearWeiboBinding(session.username)}
+                                  >
+                                    清除
+                                  </button>
+                                )}
+                              </div>
+                              <div className="insight-social-binding-feedback">
+                                {weiboBindingError ? (
+                                  <span className="binding-feedback error">{weiboBindingError}</span>
+                                ) : weiboBinding?.screenName ? (
+                                  <span className="binding-feedback">@{weiboBinding.screenName}</span>
+                                ) : weiboBinding?.uid ? (
+                                  <span className="binding-feedback">已绑定 UID：{weiboBinding.uid}</span>
+                                ) : (
+                                  <span className="binding-feedback muted">仅支持手动填写数字 UID</span>
+                                )}
+                              </div>
+                            </>
+                          ) : (
+                            <div className="insight-social-binding-feedback">
+                              <span className="binding-feedback muted">仅私聊支持微博绑定</span>
+                            </div>
+                          )}
                         </div>
                         <div className="anti-revoke-row-status">
                           <span className={`status-badge ${isSelected ? 'installed' : 'not-installed'}`}>
                             <i className="status-dot" aria-hidden="true" />
-                            {isSelected ? '已加入' : '未加入'}
+                            {isSelected
+                              ? (aiInsightFilterMode === 'whitelist' ? '已允许' : '已屏蔽')
+                              : (aiInsightFilterMode === 'whitelist' ? '未允许' : '允许')}
                           </span>
                         </div>
                       </div>
@@ -3631,38 +3979,12 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
         <div className="api-docs">
           <div className="api-item">
             <p className="api-desc" style={{ lineHeight: 1.7 }}>
-              <strong>触发方式一：活跃会话分析</strong> — 每当微信数据库变化（即你收到新消息）时，经过 500ms 防抖后，对最近活跃的私聊会话进行分析。<br />
+              <strong>触发方式一：活跃会话分析</strong> — 每当微信数据库变化（即你收到新消息）时，经过约 2 秒防抖后，对符合黑白名单规则的活跃会话进行分析。<br />
               <strong>触发方式二：沉默扫描</strong> — 每 4 小时独立扫描一次，对超过阈值天数无消息的联系人发出提醒。<br />
-              <strong>时间观念</strong> — 每次调用时，AI 会收到今天已向该联系人和全局发出过多少次见解，由 AI 自行决定是否需要克制。<br />
+              <strong>频率控制</strong> — 冷却期、沉默间隔、黑白名单均在本地判断，不额外发送给模型。<br />
               <strong>隐私</strong> — 所有分析请求均直接从你的电脑发往你填写的 API 地址，不经过任何 WeFlow 服务器。
             </p>
           </div>
-        </div>
-      </div>
-
-      <div className="divider" />
-
-      <div className="form-group">
-        <label>调试日志导出</label>
-        <span className="form-hint">
-          开启后，AI 见解链路会额外把完整调试日志写到桌面上的 <code>weflow-ai-insight-debug-YYYY-MM-DD.log</code>。
-          其中会包含发送给 AI 的完整提示词原文、近期对话上下文原文和模型输出原文，但不会记录 API Key。
-        </span>
-        <div className="log-toggle-line">
-          <span className="log-status">{aiInsightDebugLogEnabled ? '已开启' : '已关闭'}</span>
-          <label className="switch">
-            <input
-              type="checkbox"
-              checked={aiInsightDebugLogEnabled}
-              onChange={async (e) => {
-                const val = e.target.checked
-                setAiInsightDebugLogEnabled(val)
-                await configService.setAiInsightDebugLogEnabled(val)
-                showMessage(val ? '已开启 AI 见解调试日志，后续日志将写入桌面' : '已关闭 AI 见解调试日志', true)
-              }}
-            />
-            <span className="switch-slider" />
-          </label>
         </div>
       </div>
 
@@ -3729,6 +4051,320 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                   scheduleConfigSave('aiFootprintSystemPrompt', () => configService.setAiFootprintSystemPrompt(val))
                 }}
               />
+            </div>
+          </>
+        )
+      })()}
+    </div>
+  )
+
+  const renderAiGroupSummaryTab = () => {
+    const groupSummaryPromptDisplayValue = aiGroupSummarySystemPrompt || DEFAULT_GROUP_SUMMARY_SYSTEM_PROMPT
+
+    const addToFilterList = async (username: string) => {
+      if (!username.endsWith('@chatroom') || aiGroupSummaryFilterList.includes(username)) return
+      const next = [...aiGroupSummaryFilterList, username]
+      setAiGroupSummaryFilterList(next)
+      await configService.setAiGroupSummaryFilterList(next)
+      showMessage('已添加到群聊总结作用域', true)
+    }
+
+    const removeFromFilterList = async (username: string) => {
+      const next = aiGroupSummaryFilterList.filter((item) => item !== username)
+      setAiGroupSummaryFilterList(next)
+      await configService.setAiGroupSummaryFilterList(next)
+      showMessage('已从群聊总结作用域移除', true)
+    }
+
+    const addAllFiltered = async () => {
+      const usernames = groupSummaryAvailableSessions.map((session) => session.username)
+      if (usernames.length === 0) return
+      const next = Array.from(new Set([...aiGroupSummaryFilterList, ...usernames]))
+      setAiGroupSummaryFilterList(next)
+      await configService.setAiGroupSummaryFilterList(next)
+      showMessage(`已添加 ${usernames.length} 个群聊`, true)
+    }
+
+    const clearFilterList = async () => {
+      if (aiGroupSummaryFilterList.length === 0) return
+      setAiGroupSummaryFilterList([])
+      await configService.setAiGroupSummaryFilterList([])
+      showMessage('已清空群聊总结作用域', true)
+    }
+
+    return (
+      <div className="tab-content">
+        <div className="form-group">
+          <label>AI 群聊总结</label>
+          <span className="form-hint">
+            开启后，群聊页顶部会显示 AI 总结按钮；自动总结只对下面作用域内的群聊生效。未选择任何群聊时不会自动消耗 token。
+          </span>
+          <div className="log-toggle-line">
+            <span className="log-status">{aiGroupSummaryEnabled ? '已开启' : '已关闭'}</span>
+            <label className="switch">
+              <input
+                type="checkbox"
+                checked={aiGroupSummaryEnabled}
+                onChange={async (e) => {
+                  const val = e.target.checked
+                  setAiGroupSummaryEnabled(val)
+                  await configService.setAiGroupSummaryEnabled(val)
+                  showMessage(val ? 'AI 群聊总结已开启' : 'AI 群聊总结已关闭', true)
+                }}
+              />
+              <span className="switch-slider" />
+            </label>
+          </div>
+        </div>
+
+        <div className="divider" />
+
+        <div className="form-group">
+          <label>自动总结间隔</label>
+          <span className="form-hint">
+            按本地系统时间从当天 00:00 开始切分完整时间段，到点总结上一段。时段内可总结消息少于 5 条时会跳过。
+          </span>
+          <div className="push-filter-type-tabs" style={{ marginTop: 10 }}>
+            {[1, 2, 4, 8, 12, 24].map((hours) => (
+              <button
+                key={hours}
+                type="button"
+                className={`push-filter-type-tab ${aiGroupSummaryIntervalHours === hours ? 'active' : ''}`}
+                onClick={() => {
+                  setAiGroupSummaryIntervalHours(hours)
+                  scheduleConfigSave('aiGroupSummaryIntervalHours', () => configService.setAiGroupSummaryIntervalHours(hours))
+                }}
+              >
+                {hours} 小时
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="form-group">
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12 }}>
+            <label style={{ marginBottom: 0 }}>群聊总结提示词</label>
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              onClick={async () => {
+                setAiGroupSummarySystemPrompt('')
+                await configService.setAiGroupSummarySystemPrompt('')
+              }}
+            >
+              恢复默认
+            </button>
+          </div>
+          <span className="form-hint">
+            群聊总结专用提示词。留空时使用内置默认提示词。
+          </span>
+          <textarea
+            className="field-input ai-prompt-textarea"
+            rows={10}
+            style={{ width: '100%', resize: 'vertical', marginTop: 8 }}
+            value={groupSummaryPromptDisplayValue}
+            onChange={(e) => {
+              const val = e.target.value
+              setAiGroupSummarySystemPrompt(val)
+              scheduleConfigSave('aiGroupSummarySystemPrompt', () => configService.setAiGroupSummarySystemPrompt(val))
+            }}
+          />
+          <span className="form-hint" style={{ color: 'var(--danger, #ef4444)', marginTop: 8, display: 'block' }}>
+            该提示词控制 JSON 输出结构和总结解析路径，不建议随意修改，否则可能导致总结失败或内容错位。
+          </span>
+        </div>
+
+        <div className="divider" />
+
+        <div className="form-group">
+          <label>自动总结作用域群聊</label>
+          <span className="form-hint">
+            仅控制自动总结范围。手动点击群聊页 AI 总结按钮不受作用域限制；未选择任何群聊时自动总结不会运行。
+          </span>
+
+          {aiGroupSummaryFilterList.length === 0 && (
+            <div className="api-docs" style={{ marginTop: 12 }}>
+              <div className="api-item">
+                <p className="api-desc">当前未选择作用域群聊，自动群聊总结不会触发。</p>
+              </div>
+            </div>
+          )}
+
+          <div className="notification-filter-container" style={{ marginTop: 12 }}>
+            <div className="filter-panel">
+              <div className="filter-panel-header">
+                <span>可选群聊</span>
+                {groupSummaryAvailableSessions.length > 0 && (
+                  <button type="button" className="filter-panel-action" onClick={() => { void addAllFiltered() }}>
+                    全选当前
+                  </button>
+                )}
+                <div className="filter-search-box">
+                  <Search size={14} />
+                  <input
+                    type="text"
+                    placeholder="搜索群聊..."
+                    value={aiGroupSummaryFilterSearchKeyword}
+                    onChange={(e) => setAiGroupSummaryFilterSearchKeyword(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="filter-panel-list">
+                {groupSummaryAvailableSessions.length > 0 ? (
+                  groupSummaryAvailableSessions.map(session => (
+                    <div
+                      key={session.username}
+                      className="filter-panel-item"
+                      onClick={() => { void addToFilterList(session.username) }}
+                    >
+                      <Avatar src={session.avatarUrl} name={session.displayName || session.username} size={28} />
+                      <span className="filter-item-name">{session.displayName || session.username}</span>
+                      <span className="filter-item-type">群聊</span>
+                      <span className="filter-item-action">+</span>
+                    </div>
+                  ))
+                ) : (
+                  <div className="filter-panel-empty">
+                    {aiGroupSummaryFilterSearchKeyword ? '没有匹配的群聊' : '暂无可添加的群聊'}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="filter-panel">
+              <div className="filter-panel-header">
+                <span>作用域群聊</span>
+                {aiGroupSummaryFilterList.length > 0 && (
+                  <span className="filter-panel-count">{aiGroupSummaryFilterList.length}</span>
+                )}
+                {aiGroupSummaryFilterList.length > 0 && (
+                  <button type="button" className="filter-panel-action" onClick={() => { void clearFilterList() }}>
+                    全不选
+                  </button>
+                )}
+              </div>
+              <div className="filter-panel-list">
+                {aiGroupSummaryFilterList.length > 0 ? (
+                  aiGroupSummaryFilterList.map(username => {
+                    const info = getSessionFilterOptionInfo(username)
+                    return (
+                      <div
+                        key={username}
+                        className="filter-panel-item selected"
+                        onClick={() => { void removeFromFilterList(username) }}
+                      >
+                        <Avatar src={info.avatarUrl} name={info.displayName} size={28} />
+                        <span className="filter-item-name">{info.displayName}</span>
+                        <span className="filter-item-type">群聊</span>
+                        <span className="filter-item-action">×</span>
+                      </div>
+                    )
+                  })
+                ) : (
+                  <div className="filter-panel-empty">尚未添加任何群聊</div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  const renderAiMessageInsightTab = () => (
+    <div className="tab-content">
+      {(() => {
+        const DEFAULT_MESSAGE_INSIGHT_PROMPT = `你是一个克制、准确的聊天语义分析助手。你的任务是把用户选中的一句聊天消息做深度解析，帮助用户理解对方未明说的含义。
+
+严格要求：
+1. 必须且只能输出合法的纯 JSON。
+2. 禁止输出解释说明、前言后语，禁止使用 Markdown 或代码块。
+3. 不要编造上下文没有支持的信息；不确定时用谨慎表述。
+4. explicit_text 用自然中文说明这句话可能想表达的真实含义，80字以内。
+5. emotion、intent、topic 必须是短标签。
+
+JSON 输出格式：
+{
+  "explicit_text": "暗示转明示，80字以内",
+  "emotion": "2-6字情绪标签",
+  "intent": "2-8字意图标签",
+  "topic": "2-8字话题标签"
+}`
+        const displayValue = aiMessageInsightSystemPrompt || DEFAULT_MESSAGE_INSIGHT_PROMPT
+        return (
+          <>
+            <div className="form-group">
+              <label>消息深度解析</label>
+              <span className="form-hint">
+                开启后，在聊天页悬停对方文本消息时显示深度解析入口。点击后按需调用 AI，解析结果会保存到灵感信箱。
+              </span>
+              <div className="log-toggle-line">
+                <span className="log-status">{aiMessageInsightEnabled ? '已开启' : '已关闭'}</span>
+                <label className="switch">
+                  <input
+                    type="checkbox"
+                    checked={aiMessageInsightEnabled}
+                    onChange={async (e) => {
+                      const val = e.target.checked
+                      setAiMessageInsightEnabled(val)
+                      await configService.setAiMessageInsightEnabled(val)
+                    }}
+                  />
+                  <span className="switch-slider" />
+                </label>
+              </div>
+            </div>
+
+            <div className="form-group">
+              <label>发送上下文对话条数</label>
+              <span className="form-hint">
+                围绕选中消息向前、向后各取一半；一侧不足时自动由另一侧补齐。条数越多分析越准确，token 消耗也越多。
+              </span>
+              <input
+                type="number"
+                className="field-input"
+                value={aiMessageInsightContextCount}
+                min={1}
+                max={200}
+                onChange={(e) => {
+                  const val = Math.max(1, Math.min(200, parseInt(e.target.value, 10) || 50))
+                  setAiMessageInsightContextCount(val)
+                  scheduleConfigSave('aiMessageInsightContextCount', () => configService.setAiMessageInsightContextCount(val))
+                }}
+                style={{ width: 100 }}
+              />
+            </div>
+
+            <div className="form-group">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <label style={{ marginBottom: 0 }}>消息解析提示词</label>
+                <button
+                  className="btn btn-secondary btn-sm"
+                  onClick={async () => {
+                    setAiMessageInsightSystemPrompt('')
+                    await configService.setAiMessageInsightSystemPrompt('')
+                  }}
+                >
+                  恢复默认
+                </button>
+              </div>
+              <span className="form-hint">
+                消息解析专用提示词。留空时使用内置默认提示词。
+              </span>
+              <textarea
+                className="field-input ai-prompt-textarea"
+                rows={10}
+                style={{ width: '100%', resize: 'vertical' }}
+                value={displayValue}
+                onChange={(e) => {
+                  const val = e.target.value
+                  setAiMessageInsightSystemPrompt(val)
+                  scheduleConfigSave('aiMessageInsightSystemPrompt', () => configService.setAiMessageInsightSystemPrompt(val))
+                }}
+              />
+              <span className="form-hint" style={{ color: 'var(--danger, #ef4444)', marginTop: 8, display: 'block' }}>
+                该提示词控制 JSON 输出结构和解析口径，不建议随意修改，否则可能导致解析失败或内容错位。
+              </span>
             </div>
           </>
         )
@@ -4049,16 +4685,16 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
       <div className="form-group">
         <label>推送内容</label>
-        <span className="form-hint">SSE 事件名为 `message.new`；私聊推送 `avatarUrl/sourceName/content`，群聊额外附带 `groupName`</span>
+        <span className="form-hint">SSE 事件名包含 `message.new` 和 `message.revoke`；私聊推送 `rawid/avatarUrl/sourceName/content/timestamp`，群聊额外附带 `groupName`，其中 `timestamp` 为秒级 Unix 时间戳</span>
         <div className="api-docs">
           <div className="api-item">
             <div className="api-endpoint">
               <span className="method get">GET</span>
               <code>{`http://${httpApiHost}:${httpApiPort}/api/v1/push/messages`}</code>
             </div>
-            <p className="api-desc">通过 SSE 长连接接收消息事件，建议接收端按 `messageKey` 去重。</p>
+            <p className="api-desc">通过 SSE 长连接接收消息事件，建议接收端按 `event + rawid` 去重。</p>
             <div className="api-params">
-              {['event', 'sessionId', 'sessionType', 'messageKey', 'avatarUrl', 'sourceName', 'groupName?', 'content'].map((param) => (
+              {['event', 'sessionId', 'sessionType', 'rawid', 'avatarUrl', 'sourceName', 'groupName?', 'content', 'timestamp'].map((param) => (
                 <span key={param} className="param">
                   <code>{param}</code>
                 </span>
@@ -4417,6 +5053,203 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
     </div>
   )
 
+  const renderAutoDownloadTab = () => {
+    const sortedSessions = [...antiRevokeSessions].sort((a, b) => (b.sortTimestamp || 0) - (a.sortTimestamp || 0))
+    const keyword = autoDownloadSearchKeyword.trim().toLowerCase()
+    const filteredSessions = sortedSessions.filter((session) => {
+      if (!keyword) return true
+      const displayName = String(session.displayName || '').toLowerCase()
+      const username = String(session.username || '').toLowerCase()
+      return displayName.includes(keyword) || username.includes(keyword)
+    })
+    const filteredSessionIds = filteredSessions.map((session) => session.username)
+    const selectedCount = autoDownloadSelectedIds.size
+    const selectedInFilteredCount = filteredSessionIds.filter((id) => autoDownloadSelectedIds.has(id)).length
+    const allFilteredSelected = filteredSessionIds.length > 0 && selectedInFilteredCount === filteredSessionIds.length
+    const isHooked = autoDownloadStatus?.isHooked
+
+    const persistWhitelist = (ids: Set<string>) => {
+      const whitelistArr = Array.from(ids)
+      configService.setAutoDownloadWhitelist(whitelistArr)
+      if (autoDownloadHighRes) {
+        const whitelistStr = whitelistArr.length > 0 ? (whitelistArr.join('\0') + '\0\0') : '';
+        (window as any).electronAPI.image.startAutoDownload(whitelistStr)
+      }
+    }
+
+    const toggleSelection = (id: string) => {
+      const next = new Set(autoDownloadSelectedIds)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      setAutoDownloadSelectedIds(next)
+      persistWhitelist(next)
+    }
+
+    const selectAllFiltered = () => {
+      const next = new Set(autoDownloadSelectedIds)
+      filteredSessionIds.forEach(id => next.add(id))
+      setAutoDownloadSelectedIds(next)
+      persistWhitelist(next)
+    }
+
+    const clearSelection = () => {
+      const next = new Set<string>()
+      setAutoDownloadSelectedIds(next)
+      persistWhitelist(next)
+    }
+
+    return (
+        <div className="tab-content anti-revoke-tab">
+          {/* 顶部 Hero 区域保持不变 */}
+          <div className="anti-revoke-hero" style={{ background: 'linear-gradient(110deg, var(--bg-primary) 0%, rgba(245, 158, 11, 0.1) 100%)', borderColor: 'rgba(245, 158, 11, 0.3)' }}>
+            <div className="anti-revoke-hero-main">
+              <span className="updates-chip" style={{ color: '#f59e0b', background: 'rgba(245, 158, 11, 0.15)', width: 'fit-content' }}>测试功能 (Test)</span>
+              <h2 style={{ marginTop: '8px' }}>自动下载原图</h2>
+              <p>强制微信在接收图片时下载高清原图。建议仅在必要会话中开启以节省流量和空间。</p>
+            </div>
+            <div className="anti-revoke-metrics">
+              <div className={`anti-revoke-metric ${isHooked ? 'is-installed' : 'is-pending'}`}>
+                <span className="label">服务状态</span>
+                <span className="value" style={{ fontSize: '14px' }}>
+              {isHooked ? '正在监控' : autoDownloadHighRes ? '等待连接' : '未启用'}
+            </span>
+              </div>
+              <div className="anti-revoke-metric">
+                <span className="label">已选会话</span>
+                <span className="value">{selectedCount}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="anti-revoke-control-card">
+            <div className="anti-revoke-toolbar">
+              <div className="filter-search-box anti-revoke-search">
+                <Search size={14} />
+                <input
+                    type="text"
+                    placeholder="搜索联系人或群聊..."
+                    value={autoDownloadSearchKeyword}
+                    onChange={(e) => setAutoDownloadSearchKeyword(e.target.value)}
+                />
+              </div>
+              <div className="anti-revoke-toolbar-actions">
+                <div className="anti-revoke-btn-group">
+                  <button className="btn btn-secondary btn-sm" onClick={selectAllFiltered} disabled={filteredSessionIds.length === 0 || allFilteredSelected}>
+                    全选
+                  </button>
+                  <button className="btn btn-secondary btn-sm" onClick={clearSelection} disabled={selectedCount === 0}>
+                    清空选择
+                  </button>
+                </div>
+                <div className="anti-revoke-btn-group" style={{ marginLeft: '12px', paddingLeft: '12px', borderLeft: '1px solid var(--border-color)' }}>
+                  <label className="switch switch-md">
+                    <input
+                        type="checkbox"
+                        checked={autoDownloadHighRes}
+                        onChange={() => handleToggleAutoDownload(Array.from(autoDownloadSelectedIds))}
+                    />
+                    <span className="switch-slider" />
+                  </label>
+                  <span style={{ fontSize: '12px', color: 'var(--text-secondary)', marginLeft: '8px' }}>
+                {autoDownloadHighRes ? '服务已开启' : '服务已关闭'}
+              </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="anti-revoke-batch-actions">
+              <div className="anti-revoke-selected-count">
+                <span>已选 <strong>{selectedCount}</strong> 个目标会话</span>
+                <span style={{ opacity: 0.6 }}>（若不选则默认对所有聊天生效）</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="anti-revoke-list">
+            <div className="anti-revoke-list-header">
+              <span>会话（{filteredSessions.length}）</span>
+              <span>状态</span>
+            </div>
+            {filteredSessions.length === 0 ? (
+                <div className="anti-revoke-empty">{autoDownloadSearchKeyword ? '没有匹配的会话' : '暂无会话'}</div>
+            ) : (
+                filteredSessions.map((session) => {
+                  const isSelected = autoDownloadSelectedIds.has(session.username)
+                  return (
+                      <div key={session.username} className={`anti-revoke-row ${isSelected ? 'selected' : ''}`}>
+                        <label className="anti-revoke-row-main">
+                  <span className="anti-revoke-check">
+                    <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={() => toggleSelection(session.username)}
+                    />
+                    <span className="check-indicator" aria-hidden="true">
+                      <Check size={12} />
+                    </span>
+                  </span>
+                          <Avatar src={session.avatarUrl} name={session.displayName} size={30} />
+                          <div className="anti-revoke-row-text">
+                            <span className="name">{session.displayName || session.username}</span>
+                          </div>
+                        </label>
+                        <div className="anti-revoke-row-status">
+                  <span className={`status-badge ${isSelected ? 'installed' : 'not-installed'}`}>
+                    <i className="status-dot" aria-hidden="true" />
+                    {isSelected ? '已监控' : '未开启'}
+                  </span>
+                        </div>
+                      </div>
+                  )
+                })
+            )}
+          </div>
+
+          {/* 风险提示部分保持不变 */}
+          <div className="api-warning-modal" style={{ width: '100%', border: '1px solid rgba(239, 68, 68, 0.2)', marginTop: '16px', background: 'rgba(239, 68, 68, 0.02)', animation: 'none', boxShadow: 'none', position: 'static' }}>
+            <div className="modal-header" style={{ border: 'none', padding: '12px 20px 0' }}>
+              <Lock size={16} color="#ef4444" />
+              <h3 style={{ fontSize: '13px', color: '#ef4444' }}>风险警告</h3>
+            </div>
+            <div className="modal-body" style={{ fontSize: '12px', color: 'var(--text-secondary)', padding: '8px 20px 12px' }}>
+              此功能通过内存 Hook 修改微信行为，具有一定的风险。请尽量仅在白名单模式下针对必要会话开启。
+            </div>
+          </div>
+        </div>
+    )
+  }
+
+
+  const handleToggleAutoDownload = async (whitelist?: string[] | string) => {
+    const newVal = !autoDownloadHighRes
+    setAutoDownloadHighRes(newVal)
+
+    try {
+      if (newVal) {
+        let currentWhitelist: string[] | string = whitelist || Array.from(autoDownloadSelectedIds)
+        if (Array.isArray(currentWhitelist)) {
+          currentWhitelist = currentWhitelist.length > 0 ? (currentWhitelist.join('\0') + '\0\0') : ''
+        }
+        const result = await (window as any).electronAPI.image.startAutoDownload(currentWhitelist)
+        if (result && !result.success) {
+          // 如果底层明确返回了失败
+          throw new Error(result.error || '启动自动下载服务失败')
+        }
+        showMessage('自动下载已开启，正在尝试连接微信', true)
+        await fetchAutoDownloadStatus()
+      } else {
+        await (window as any).electronAPI.image.stopAutoDownload()
+        showMessage('自动下载已关闭', true)
+        setAutoDownloadStatus(null)
+      }
+      await configService.setAutoDownloadHighRes(newVal)
+    } catch (e: any) {
+      // 发生错误时，将开关拨回去
+      setAutoDownloadHighRes(!newVal)
+      showMessage(`操作失败: ${e.message || String(e)}`, false)
+    }
+  }
+
   const renderUpdatesTab = () => {
     const downloadPercent = Math.max(0, Math.min(100, Number(downloadProgress?.percent || 0)))
     const channelCards: { id: configService.UpdateChannel; title: string; desc: string }[] = [
@@ -4551,7 +5384,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
         <div className="settings-layout">
           <div className="settings-tabs" role="tablist" aria-label="设置项">
-            {tabs.flatMap((tab) => {
+            {filteredTabs.flatMap((tab) => {
               const row: React.ReactNode[] = [
                 <button
                   key={tab.id}
@@ -4567,7 +5400,7 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
                 row.push(
                   <div key="ai-settings-group" className={`tab-group ${aiGroupExpanded ? 'expanded' : ''}`}>
                     <button
-                      className={`tab-btn tab-group-trigger ${(activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint') ? 'active' : ''}`}
+                      className={`tab-btn tab-group-trigger ${(activeTab === 'aiCommon' || activeTab === 'insight' || activeTab === 'aiFootprint' || activeTab === 'aiGroupSummary' || activeTab === 'aiMessageInsight') ? 'active' : ''}`}
                       onClick={() => setAiGroupExpanded((prev) => !prev)}
                       aria-expanded={aiGroupExpanded}
                     >
@@ -4609,6 +5442,9 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
             {activeTab === 'aiCommon' && renderAiCommonTab()}
             {activeTab === 'insight' && renderInsightTab()}
             {activeTab === 'aiFootprint' && renderAiFootprintTab()}
+            {activeTab === 'aiGroupSummary' && renderAiGroupSummaryTab()}
+            {activeTab === 'aiMessageInsight' && renderAiMessageInsightTab()}
+            {activeTab === 'autoDownload' && renderAutoDownloadTab()}
             {activeTab === 'updates' && renderUpdatesTab()}
             {activeTab === 'analytics' && renderAnalyticsTab()}
             {activeTab === 'security' && renderSecurityTab()}
@@ -4676,7 +5512,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 }
 
 export default SettingsPage
-
 
 
 

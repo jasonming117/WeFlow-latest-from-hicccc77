@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { NavLink, useLocation, useNavigate } from 'react-router-dom'
-import { Home, MessageSquare, BarChart3, FileText, Settings, Download, Aperture, UserCircle, Lock, LockOpen, ChevronUp, FolderClosed, Footprints, Users } from 'lucide-react'
+import { Home, MessageSquare, BarChart3, FileText, Settings, Download, Aperture, UserCircle, Lock, LockOpen, ChevronUp, FolderClosed, Footprints, Users, ArchiveRestore, Sparkles } from 'lucide-react'
 import { useAppStore } from '../stores/appStore'
 import * as configService from '../services/config'
 import { onExportSessionStatus, requestExportSessionStatus } from '../services/exportBridge'
@@ -344,6 +344,15 @@ function Sidebar({ collapsed }: SidebarProps) {
             <span className="nav-label">朋友圈</span>
           </NavLink>
 
+          <NavLink
+            to="/insight-inbox"
+            className={`nav-item ${isActive('/insight-inbox') ? 'active' : ''}`}
+            title={collapsed ? '灵感信箱' : undefined}
+          >
+            <span className="nav-icon"><Sparkles size={20} /></span>
+            <span className="nav-label">灵感信箱</span>
+          </NavLink>
+
           {/* 通讯录 */}
           <NavLink
             to="/contacts"
@@ -410,6 +419,15 @@ function Sidebar({ collapsed }: SidebarProps) {
             {!collapsed && activeExportTaskCount > 0 && (
               <span className="nav-badge">{exportTaskBadge}</span>
             )}
+          </NavLink>
+
+          <NavLink
+            to="/backup"
+            className={`nav-item ${isActive('/backup') ? 'active' : ''}`}
+            title={collapsed ? '数据库备份' : undefined}
+          >
+            <span className="nav-icon"><ArchiveRestore size={20} /></span>
+            <span className="nav-label">数据库备份</span>
           </NavLink>
 
 

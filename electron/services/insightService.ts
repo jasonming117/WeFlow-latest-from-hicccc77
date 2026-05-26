@@ -10,18 +10,23 @@
  * 设计原则：
  * - 不引入任何额外 npm 依赖，使用 Node 原生 https 模块调用 OpenAI 兼容 API
  * - 所有失败静默处理，不影响主流程
- * - 当日触发记录（sessionId + 时间列表）随 prompt 一起发送，让模型自行判断是否克制
+ * - 触发频率、冷却与名单过滤均在本地完成，不把调度统计塞进模型 prompt
  */
 
 import https from 'https'
 import http from 'http'
-import fs from 'fs'
-import path from 'path'
 import { URL } from 'url'
-import { app, Notification } from 'electron'
 import { ConfigService } from './config'
 import { chatService, ChatSession, Message } from './chatService'
+import { snsService } from './snsService'
 import { weiboService } from './social/weiboService'
+import { showNotification } from '../windows/notificationWindow'
+import {
+  insightRecordService,
+  type InsightRecordLog,
+  type InsightRecordTriggerReason,
+  type MessageInsightAnalysis
+} from './insightRecordService'
 
 // ─── 常量 ────────────────────────────────────────────────────────────────────
 
@@ -36,10 +41,11 @@ const SILENCE_SCAN_INITIAL_DELAY_MS = 3 * 60 * 1000
 
 /** 单次 API 请求超时（毫秒） */
 const API_TIMEOUT_MS = 45_000
-const API_MAX_TOKENS_DEFAULT = 200
+const API_MAX_TOKENS_DEFAULT = 1024
 const API_MAX_TOKENS_MIN = 1
-const API_MAX_TOKENS_MAX = 65_535
+const API_MAX_TOKENS_MAX = 2_000_000
 const API_TEMPERATURE = 0.7
+const INSIGHT_NOTIFICATION_AVATAR_URL = './assets/insight/AI_Insight.png'
 
 /** 沉默天数阈值默认值 */
 const DEFAULT_SILENCE_DAYS = 3
@@ -50,6 +56,11 @@ const INSIGHT_CONFIG_KEYS = new Set([
   'aiModelApiKey',
   'aiModelApiModel',
   'aiModelApiMaxTokens',
+  'aiInsightFilterMode',
+  'aiInsightFilterList',
+  'aiInsightAllowMomentsContext',
+  'aiInsightMomentsContextCount',
+  'aiInsightMomentsBindings',
   'aiInsightAllowSocialContext',
   'aiInsightSocialContextCount',
   'aiInsightWeiboCookie',
@@ -73,64 +84,39 @@ interface SharedAiModelConfig {
   maxTokens: number
 }
 
+interface SessionInsightTriggerResult {
+  success: boolean
+  message: string
+  recordId?: string
+  insight?: string
+  skipped?: boolean
+  notificationEnabled?: boolean
+}
+
+type InsightFilterMode = 'whitelist' | 'blacklist'
+
+class ApiRequestError extends Error {
+  statusCode?: number
+  responseBody?: string
+
+  constructor(message: string, statusCode?: number, responseBody?: string) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.statusCode = statusCode
+    this.responseBody = responseBody
+  }
+}
+
 // ─── 日志 ─────────────────────────────────────────────────────────────────────
 
 type InsightLogLevel = 'INFO' | 'WARN' | 'ERROR'
 
-let debugLogWriteQueue: Promise<void> = Promise.resolve()
-
-function formatDebugTimestamp(date: Date = new Date()): string {
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  const hours = String(date.getHours()).padStart(2, '0')
-  const minutes = String(date.getMinutes()).padStart(2, '0')
-  const seconds = String(date.getSeconds()).padStart(2, '0')
-  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`
+function insightDebugLine(_level: InsightLogLevel, _message: string): void {
+  // Desktop debug log export has been replaced by per-insight request logs.
 }
 
-function getInsightDebugLogFilePath(date: Date = new Date()): string {
-  const year = date.getFullYear()
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  return path.join(app.getPath('desktop'), `weflow-ai-insight-debug-${year}-${month}-${day}.log`)
-}
-
-function isInsightDebugLogEnabled(): boolean {
-  try {
-    return ConfigService.getInstance().get('aiInsightDebugLogEnabled') === true
-  } catch {
-    return false
-  }
-}
-
-function appendInsightDebugText(text: string): void {
-  if (!isInsightDebugLogEnabled()) return
-
-  let logFilePath = ''
-  try {
-    logFilePath = getInsightDebugLogFilePath()
-  } catch {
-    return
-  }
-
-  debugLogWriteQueue = debugLogWriteQueue
-    .then(() => fs.promises.appendFile(logFilePath, text, 'utf8'))
-    .catch(() => undefined)
-}
-
-function insightDebugLine(level: InsightLogLevel, message: string): void {
-  appendInsightDebugText(`[${formatDebugTimestamp()}] [${level}] ${message}\n`)
-}
-
-function insightDebugSection(level: InsightLogLevel, title: string, payload: unknown): void {
-  const content = typeof payload === 'string'
-    ? payload
-    : JSON.stringify(payload, null, 2)
-
-  appendInsightDebugText(
-    `\n========== [${formatDebugTimestamp()}] [${level}] ${title} ==========\n${content}\n========== END ==========\n`
-  )
+function insightDebugSection(_level: InsightLogLevel, _title: string, _payload: unknown): void {
+  // Desktop debug log export has been replaced by per-insight request logs.
 }
 
 /**
@@ -196,6 +182,57 @@ function normalizeApiMaxTokens(value: unknown): number {
   return Math.min(API_MAX_TOKENS_MAX, Math.max(API_MAX_TOKENS_MIN, Math.floor(numeric)))
 }
 
+function normalizeSessionIdList(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return Array.from(new Set(value.map((item) => String(item || '').trim()).filter(Boolean)))
+}
+
+function clampText(value: unknown, maxLength: number): string {
+  const text = String(value || '').replace(/\s+/g, ' ').trim()
+  if (text.length <= maxLength) return text
+  return `${text.slice(0, Math.max(0, maxLength - 1))}…`
+}
+
+function stripJsonFence(value: string): string {
+  const text = String(value || '').trim()
+  const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)
+  if (fenced) return fenced[1].trim()
+  const firstBrace = text.indexOf('{')
+  const lastBrace = text.lastIndexOf('}')
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return text.slice(firstBrace, lastBrace + 1).trim()
+  }
+  return text
+}
+
+function parseMessageInsightAnalysis(rawOutput: string): MessageInsightAnalysis {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stripJsonFence(rawOutput))
+  } catch {
+    throw new Error('模型输出格式异常：不是合法 JSON')
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('模型输出格式异常：JSON 根节点不是对象')
+  }
+  const source = parsed as Record<string, unknown>
+  const explicitText = clampText(source.explicit_text ?? source.explicitText, 120)
+  const emotion = clampText(source.emotion, 16)
+  const intent = clampText(source.intent, 20)
+  const topic = clampText(source.topic, 20)
+  if (!explicitText || !emotion || !intent || !topic) {
+    throw new Error('模型输出格式异常：缺少必要字段')
+  }
+  return { explicitText, emotion, intent, topic }
+}
+
+function shouldFallbackJsonMode(error: unknown): boolean {
+  const statusCode = Number((error as ApiRequestError)?.statusCode || 0)
+  if (statusCode === 400 || statusCode === 404 || statusCode === 422) return true
+  const text = `${(error as Error)?.message || ''}\n${(error as ApiRequestError)?.responseBody || ''}`.toLowerCase()
+  return text.includes('response_format') || text.includes('json_object') || text.includes('json mode')
+}
+
 /**
  * 调用 OpenAI 兼容 API（非流式），返回模型第一条消息内容。
  * 使用 Node 原生 https/http 模块，无需任何第三方 SDK。
@@ -206,7 +243,8 @@ function callApi(
   model: string,
   messages: Array<{ role: string; content: string }>,
   timeoutMs: number = API_TIMEOUT_MS,
-  maxTokens: number = API_MAX_TOKENS_DEFAULT
+  maxTokens: number = API_MAX_TOKENS_DEFAULT,
+  options?: { responseFormatJson?: boolean }
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const endpoint = buildApiUrl(apiBaseUrl, '/chat/completions')
@@ -218,15 +256,19 @@ function callApi(
       return
     }
 
-    const body = JSON.stringify({
+    const payload: Record<string, unknown> = {
       model,
       messages,
       max_tokens: normalizeApiMaxTokens(maxTokens),
       temperature: API_TEMPERATURE,
       stream: false
-    })
+    }
+    if (options?.responseFormatJson) {
+      payload.response_format = { type: 'json_object' }
+    }
+    const body = JSON.stringify(payload)
 
-    const options = {
+    const requestOptions = {
       hostname: urlObj.hostname,
       port: urlObj.port || (urlObj.protocol === 'https:' ? 443 : 80),
       path: urlObj.pathname + urlObj.search,
@@ -240,11 +282,15 @@ function callApi(
 
     const isHttps = urlObj.protocol === 'https:'
     const requestFn = isHttps ? https.request : http.request
-    const req = requestFn(options, (res) => {
+    const req = requestFn(requestOptions, (res) => {
       let data = ''
       res.on('data', (chunk) => { data += chunk })
       res.on('end', () => {
         try {
+          if (res.statusCode && res.statusCode >= 400) {
+            reject(new ApiRequestError(`API 请求失败 (${res.statusCode}): ${data.slice(0, 200)}`, res.statusCode, data))
+            return
+          }
           const parsed = JSON.parse(data)
           const content = parsed?.choices?.[0]?.message?.content
           if (typeof content === 'string' && content.trim()) {
@@ -436,7 +482,7 @@ class InsightService {
 
     try {
       const endpoint = buildApiUrl(apiBaseUrl, '/chat/completions')
-      const requestMessages = [{ role: 'user', content: appendPromptCurrentTime('请回复"连接成功"四个字。') }]
+      const requestMessages = [{ role: 'user', content: '请回复"连接成功"四个字。' }]
       insightDebugSection(
         'INFO',
         'AI 测试连接请求',
@@ -495,19 +541,69 @@ class InsightService {
         return id && !id.endsWith('@chatroom') && !id.toLowerCase().includes('placeholder') && this.isSessionAllowed(id)
       })
       if (!session) {
-        return { success: false, message: '未找到任何私聊会话（若已启用白名单，请检查是否有勾选的私聊）' }
+        return { success: false, message: '未找到任何可触发的私聊会话（请检查黑白名单模式与选择列表）' }
       }
       const sessionId = session.username?.trim() || ''
       const displayName = session.displayName || sessionId
       insightLog('INFO', `测试目标会话：${displayName} (${sessionId})`)
-      await this.generateInsightForSession({
+      const result = await this.generateInsightForSession({
         sessionId,
         displayName,
-        triggerReason: 'activity'
+        triggerReason: 'test'
       })
-      return { success: true, message: `已向「${displayName}」发送测试见解，请查看右下角弹窗` }
+      if (!result.success) {
+        return { success: false, message: result.message }
+      }
+      const notificationEnabled = this.config.get('aiInsightNotificationEnabled') !== false
+      return {
+        success: true,
+        message: notificationEnabled
+          ? `已向「${displayName}」发送测试见解，请查看通知弹窗`
+          : `已生成「${displayName}」的测试见解，AI 见解消息通知当前已关闭`
+      }
     } catch (e) {
       return { success: false, message: `测试失败：${(e as Error).message}` }
+    }
+  }
+
+  /**
+   * 手动对指定会话立即触发一次 AI 见解。
+   * 只新增触发入口；实际上下文、朋友圈/微博拼接、prompt 和入库仍走 generateInsightForSession。
+   */
+  async triggerSessionInsight(params: {
+    sessionId: string
+    displayName?: string
+    avatarUrl?: string
+  }): Promise<SessionInsightTriggerResult> {
+    const sessionId = String(params?.sessionId || '').trim()
+    if (!sessionId) {
+      return { success: false, message: '当前会话无效，无法触发 AI 见解' }
+    }
+    if (!this.isEnabled()) {
+      return { success: false, message: '请先在设置中开启「AI 见解」' }
+    }
+
+    const { apiBaseUrl, apiKey } = this.getSharedAiModelConfig()
+    if (!apiBaseUrl || !apiKey) {
+      return { success: false, message: '请先填写通用 AI 模型配置（API 地址和 Key）' }
+    }
+
+    try {
+      const connectResult = await chatService.connect()
+      if (!connectResult.success) {
+        return { success: false, message: '数据库连接失败，请先在"数据库连接"页完成配置' }
+      }
+      this.dbConnected = true
+
+      const displayName = String(params?.displayName || sessionId).trim() || sessionId
+      insightLog('INFO', `手动触发当前会话见解：${displayName} (${sessionId})`)
+      return await this.generateInsightForSession({
+        sessionId,
+        displayName,
+        triggerReason: 'manual'
+      })
+    } catch (error) {
+      return { success: false, message: `触发失败：${(error as Error).message}` }
     }
   }
 
@@ -611,11 +707,212 @@ ${topMentionText}
         25_000,
         maxTokens
       )
-      const insight = result.trim().slice(0, 400)
+      const insight = result.trim()
       if (!insight) return { success: false, message: '模型返回为空' }
       return { success: true, message: '生成成功', insight }
     } catch (error) {
       return { success: false, message: `生成失败：${(error as Error).message}` }
+    }
+  }
+
+  async generateMessageInsight(params: {
+    sessionId: string
+    displayName?: string
+    avatarUrl?: string
+    targetLocalId?: number
+    targetCreateTime?: number
+    targetMessageKey?: string
+    targetText: string
+    targetSenderName?: string
+    contextCount?: number
+    forceRefresh?: boolean
+  }): Promise<{ success: boolean; message: string; cached?: boolean; recordId?: string; data?: MessageInsightAnalysis }> {
+    const enabled = this.config.get('aiMessageInsightEnabled') === true
+    if (!enabled) {
+      return { success: false, message: '请先在设置中开启「消息解析」' }
+    }
+
+    const sessionId = String(params?.sessionId || '').trim()
+    const targetText = clampText(params?.targetText || '', 500)
+    const targetCreateTime = Math.floor(Number(params?.targetCreateTime || 0))
+    const targetLocalId = Math.floor(Number(params?.targetLocalId || 0))
+    const targetMessageKey = String(params?.targetMessageKey || '').trim()
+    if (!sessionId || !targetText || targetCreateTime <= 0) {
+      return { success: false, message: '目标消息无效，无法解析' }
+    }
+
+    if (params?.forceRefresh !== true) {
+      const cached = insightRecordService.findLatestMessageAnalysis({
+        sessionId,
+        targetLocalId,
+        targetCreateTime,
+        targetMessageKey
+      })
+      if (cached?.messageInsight?.analysis) {
+        return {
+          success: true,
+          message: '已读取缓存解析',
+          cached: true,
+          recordId: cached.id,
+          data: cached.messageInsight.analysis
+        }
+      }
+    }
+
+    const { apiBaseUrl, apiKey, model, maxTokens } = this.getSharedAiModelConfig()
+    if (!apiBaseUrl || !apiKey) {
+      return { success: false, message: '请先填写通用 AI 模型配置（API 地址和 Key）' }
+    }
+
+    const configuredContextCount = Number(this.config.get('aiMessageInsightContextCount') || 50)
+    const contextCount = Math.max(1, Math.min(200, Math.floor(Number(params?.contextCount || configuredContextCount) || 50)))
+    const displayName = await this.resolveInsightSessionDisplayName(sessionId, String(params?.displayName || sessionId))
+    const targetSenderName = clampText(params?.targetSenderName || displayName, 40) || displayName
+    const targetTextPreview = clampText(targetText, 120)
+    let avatarUrl = String(params?.avatarUrl || '').trim() || undefined
+    if (!avatarUrl) {
+      try {
+        const contact = await chatService.getContactAvatar(sessionId)
+        avatarUrl = String(contact?.avatarUrl || '').trim() || undefined
+      } catch {
+        avatarUrl = undefined
+      }
+    }
+
+    let beforeMessages: Message[] = []
+    let afterMessages: Message[] = []
+    let contextReadError = ''
+    try {
+      const aroundResult = await chatService.getMessagesAround(
+        sessionId,
+        { localId: targetLocalId, createTime: targetCreateTime, messageKey: targetMessageKey },
+        contextCount
+      )
+      if (aroundResult.success) {
+        beforeMessages = aroundResult.before || []
+        afterMessages = aroundResult.after || []
+      } else {
+        contextReadError = aroundResult.error || '读取上下文失败'
+      }
+    } catch (error) {
+      contextReadError = (error as Error).message || String(error)
+    }
+
+    const formatLine = (message: Message) => {
+      const senderName = message.isSend === 1 ? '我' : (message.senderDisplayName || targetSenderName || displayName)
+      return `${this.formatInsightMessageTimestamp(message.createTime)} ${senderName}：${this.formatInsightMessageContent(message)}`
+    }
+    const beforeText = beforeMessages.length > 0 ? beforeMessages.map(formatLine).join('\n') : '无'
+    const afterText = afterMessages.length > 0 ? afterMessages.map(formatLine).join('\n') : '无'
+
+    const DEFAULT_MESSAGE_INSIGHT_PROMPT = `你是一个克制、准确的聊天语义分析助手。你的任务是把用户选中的一句聊天消息做深度解析，帮助用户理解对方未明说的含义。
+
+严格要求：
+1. 必须且只能输出合法的纯 JSON。
+2. 禁止输出解释说明、前言后语，禁止使用 Markdown 或代码块。
+3. 不要编造上下文没有支持的信息；不确定时用谨慎表述。
+4. explicit_text 用自然中文说明这句话可能想表达的真实含义，80字以内。
+5. emotion、intent、topic 必须是短标签。
+
+JSON 输出格式：
+{
+  "explicit_text": "暗示转明示，80字以内",
+  "emotion": "2-6字情绪标签",
+  "intent": "2-8字意图标签",
+  "topic": "2-8字话题标签"
+}`
+    const customPrompt = String(this.config.get('aiMessageInsightSystemPrompt') || '').trim()
+    const systemPrompt = customPrompt || DEFAULT_MESSAGE_INSIGHT_PROMPT
+    const userPromptBase = `会话：${displayName}
+目标发送者：${targetSenderName}
+目标消息时间：${this.formatInsightMessageTimestamp(targetCreateTime)}
+
+目标消息：
+${targetText}
+
+目标消息之前的上下文（${beforeMessages.length} 条）：
+${beforeText}
+
+目标消息之后的上下文（${afterMessages.length} 条）：
+${afterText}
+
+请分析目标消息，只输出指定 JSON。`
+    const userPrompt = appendPromptCurrentTime(userPromptBase)
+    const endpoint = buildApiUrl(apiBaseUrl, '/chat/completions')
+    const requestMessages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt }
+    ]
+
+    let rawOutput = ''
+    let responseFormatJson = true
+    let responseFormatFallback = false
+    let responseFormatFallbackReason = ''
+    const startedAt = Date.now()
+    try {
+      try {
+        rawOutput = await callApi(apiBaseUrl, apiKey, model, requestMessages, API_TIMEOUT_MS, maxTokens, { responseFormatJson: true })
+      } catch (error) {
+        if (!shouldFallbackJsonMode(error)) throw error
+        responseFormatJson = false
+        responseFormatFallback = true
+        responseFormatFallbackReason = (error as Error).message || 'response_format 不受支持'
+        rawOutput = await callApi(apiBaseUrl, apiKey, model, requestMessages, API_TIMEOUT_MS, maxTokens)
+      }
+      const analysis = parseMessageInsightAnalysis(rawOutput)
+      const finalInsight = analysis.explicitText
+      const log: InsightRecordLog = {
+        endpoint,
+        model,
+        maxTokens,
+        temperature: API_TEMPERATURE,
+        triggerReason: 'message_analysis',
+        allowContext: true,
+        contextCount,
+        systemPrompt,
+        userPrompt,
+        rawOutput,
+        finalInsight,
+        durationMs: Date.now() - startedAt,
+        createdAt: Date.now(),
+        responseFormatJson,
+        responseFormatFallback,
+        responseFormatFallbackReason,
+        targetMessage: {
+          localId: targetLocalId,
+          createTime: targetCreateTime,
+          messageKey: targetMessageKey,
+          senderName: targetSenderName,
+          textPreview: targetTextPreview
+        },
+        contextStats: {
+          requested: contextCount,
+          beforeTarget: beforeMessages.length,
+          afterTarget: afterMessages.length,
+          readError: contextReadError || undefined
+        },
+        parsedAnalysis: analysis
+      }
+      const record = insightRecordService.addRecord({
+        sessionId,
+        displayName,
+        avatarUrl,
+        sourceType: 'message_analysis',
+        triggerReason: 'message_analysis',
+        insight: finalInsight,
+        messageInsight: {
+          targetLocalId,
+          targetCreateTime,
+          targetMessageKey,
+          targetSenderName,
+          targetTextPreview,
+          analysis
+        },
+        log
+      })
+      return { success: true, message: '解析完成', cached: false, recordId: record.id, data: analysis }
+    } catch (error) {
+      return { success: false, message: `解析失败：${(error as Error).message}` }
     }
   }
 
@@ -747,14 +1044,23 @@ ${topMentionText}
 
   /**
    * 判断某个会话是否允许触发见解。
-   * 若白名单未启用，则所有私聊会话均允许；
-   * 若白名单已启用，则只有在白名单中的会话才允许。
+   * white/black 模式二选一：
+   * - whitelist：仅名单内允许
+   * - blacklist：名单内屏蔽，其他允许
    */
+  private getInsightFilterConfig(): { mode: InsightFilterMode; list: string[] } {
+    const modeRaw = String(this.config.get('aiInsightFilterMode') || '').trim().toLowerCase()
+    const mode: InsightFilterMode = modeRaw === 'blacklist' ? 'blacklist' : 'whitelist'
+    const list = normalizeSessionIdList(this.config.get('aiInsightFilterList'))
+    return { mode, list }
+  }
+
   private isSessionAllowed(sessionId: string): boolean {
-    const whitelistEnabled = this.config.get('aiInsightWhitelistEnabled') as boolean
-    if (!whitelistEnabled) return true
-    const whitelist = (this.config.get('aiInsightWhitelist') as string[]) || []
-    return whitelist.includes(sessionId)
+    const normalizedSessionId = String(sessionId || '').trim()
+    if (!normalizedSessionId) return false
+    const { mode, list } = this.getInsightFilterConfig()
+    if (mode === 'whitelist') return list.includes(normalizedSessionId)
+    return !list.includes(normalizedSessionId)
   }
 
   /**
@@ -805,26 +1111,13 @@ ${topMentionText}
   }
 
   /**
-   * 记录触发并返回该会话今日所有触发时间（用于组装 prompt）。
+   * 记录成功推送的见解，用于设置页展示今日触发统计。
    */
-  private recordTrigger(sessionId: string): string[] {
+  private recordTrigger(sessionId: string): void {
     this.resetIfNewDay()
     const existing = this.todayTriggers.get(sessionId) ?? { timestamps: [] }
     existing.timestamps.push(Date.now())
     this.todayTriggers.set(sessionId, existing)
-    return existing.timestamps.map(formatTimestamp)
-  }
-
-  /**
-   * 获取今日全局已触发次数（所有会话合计），用于 prompt 中告知模型全局上下文。
-   */
-  private getTodayTotalTriggerCount(): number {
-    this.resetIfNewDay()
-    let total = 0
-    for (const record of this.todayTriggers.values()) {
-      total += record.timestamps.length
-    }
-    return total
   }
 
   private formatWeiboTimestamp(raw: string): string {
@@ -835,12 +1128,66 @@ ${topMentionText}
     return new Date(parsed).toLocaleString('zh-CN')
   }
 
+  private formatMomentsTimestamp(raw: unknown): string {
+    const numeric = Number(raw)
+    if (!Number.isFinite(numeric) || numeric <= 0) {
+      return ''
+    }
+    const ms = numeric > 1_000_000_000_000 ? numeric : numeric * 1000
+    return new Date(ms).toLocaleString('zh-CN')
+  }
+
+  private extractMomentReadableText(post: { contentDesc?: unknown; linkTitle?: unknown }): string {
+    const contentDesc = this.normalizeInsightText(String(post.contentDesc || '')).replace(/\s+/g, ' ').trim()
+    if (contentDesc) return contentDesc
+
+    const linkTitle = this.normalizeInsightText(String(post.linkTitle || '')).replace(/\s+/g, ' ').trim()
+    if (linkTitle) return `[链接] ${linkTitle}`
+
+    return ''
+  }
+
+  private async getMomentsContextSection(sessionId: string): Promise<string> {
+    const allowMomentsContext = this.config.get('aiInsightAllowMomentsContext') === true
+    if (!allowMomentsContext) return ''
+
+    const bindings =
+      (this.config.get('aiInsightMomentsBindings') as Record<string, { enabled?: boolean }> | undefined) || {}
+    const isEnabledForSession = bindings[sessionId]?.enabled === true
+    if (!isEnabledForSession) return ''
+
+    const countRaw = Number(this.config.get('aiInsightMomentsContextCount') || 5)
+    const momentsCount = Math.max(1, Math.min(20, Math.floor(countRaw) || 5))
+
+    try {
+      const result = await snsService.getTimeline(momentsCount, 0, [sessionId])
+      const posts = result.success && Array.isArray(result.timeline) ? result.timeline : []
+      if (posts.length === 0) return ''
+
+      const lines = posts
+        .map((post) => {
+          const text = this.extractMomentReadableText(post as { contentDesc?: unknown; linkTitle?: unknown })
+          if (!text) return ''
+          const shortText = text.length > 180 ? `${text.slice(0, 180)}...` : text
+          const time = this.formatMomentsTimestamp((post as { createTime?: unknown }).createTime)
+          return time ? `[朋友圈 ${time}] ${shortText}` : `[朋友圈] ${shortText}`
+        })
+        .filter(Boolean) as string[]
+
+      if (lines.length === 0) return ''
+      insightLog('INFO', `已加载 ${lines.length} 条朋友圈内容 (sessionId=${sessionId})`)
+      return `近期朋友圈内容（最近 ${lines.length} 条）：\n${lines.join('\n')}`
+    } catch (error) {
+      insightLog('WARN', `拉取朋友圈内容失败 (sessionId=${sessionId}): ${(error as Error).message}`)
+      return ''
+    }
+  }
+
   private async getSocialContextSection(sessionId: string): Promise<string> {
     const allowSocialContext = this.config.get('aiInsightAllowSocialContext') === true
     if (!allowSocialContext) return ''
 
     const rawCookie = String(this.config.get('aiInsightWeiboCookie') || '').trim()
-    const hasCookie = rawCookie.length > 0
 
     const bindings =
       (this.config.get('aiInsightWeiboBindings') as Record<string, { uid?: string; screenName?: string }> | undefined) || {}
@@ -861,10 +1208,7 @@ ${topMentionText}
         return `[微博 ${time}] ${text}`
       })
       insightLog('INFO', `已加载 ${lines.length} 条微博公开内容 (uid=${uid})`)
-      const riskHint = hasCookie
-        ? ''
-        : '\n提示：未配置微博 Cookie，使用移动端公开接口抓取，可能因平台风控导致获取失败或内容较少。'
-      return `近期公开社交平台内容（来源：微博，最近 ${lines.length} 条）：\n${lines.join('\n')}${riskHint}`
+      return `近期公开社交平台内容（来源：微博，最近 ${lines.length} 条）：\n${lines.join('\n')}`
     } catch (error) {
       insightLog('WARN', `拉取微博公开内容失败 (uid=${uid}): ${(error as Error).message}`)
       return ''
@@ -966,8 +1310,8 @@ ${topMentionText}
    * 1. 会话有真正的新消息（lastTimestamp 比上次见到的更新）
    * 2. 该会话距上次活跃分析已超过冷却期
    *
-   * 白名单启用时：直接使用白名单里的 sessionId，完全跳过 getSessions()。
-   * 白名单未启用时：从缓存拉取全量会话后过滤私聊。
+   * whitelist 模式：直接使用名单里的 sessionId，完全跳过 getSessions()。
+   * blacklist 模式：从缓存拉取会话后过滤名单。
    */
   private async analyzeRecentActivity(): Promise<void> {
     if (!this.isEnabled()) return
@@ -978,12 +1322,11 @@ ${topMentionText}
       const now = Date.now()
       const cooldownMinutes = (this.config.get('aiInsightCooldownMinutes') as number) ?? 120
       const cooldownMs = cooldownMinutes * 60 * 1000
-      const whitelistEnabled = this.config.get('aiInsightWhitelistEnabled') as boolean
-      const whitelist = (this.config.get('aiInsightWhitelist') as string[]) || []
+      const { mode: filterMode, list: filterList } = this.getInsightFilterConfig()
 
-      // 白名单启用且有勾选项时，直接用白名单 sessionId，无需查数据库全量会话列表。
+      // whitelist 模式且有勾选项时，直接用名单 sessionId，无需查数据库全量会话列表。
       // 通过拉取该会话最新 1 条消息时间戳判断是否真正有新消息，开销极低。
-      if (whitelistEnabled && whitelist.length > 0) {
+      if (filterMode === 'whitelist' && filterList.length > 0) {
         // 确保数据库已连接（首次时连接，之后复用）
         if (!this.dbConnected) {
           const connectResult = await chatService.connect()
@@ -991,8 +1334,8 @@ ${topMentionText}
           this.dbConnected = true
         }
 
-        for (const sessionId of whitelist) {
-          if (!sessionId || sessionId.endsWith('@chatroom')) continue
+        for (const sessionId of filterList) {
+          if (!sessionId || sessionId.toLowerCase().includes('placeholder')) continue
 
           // 冷却期检查（先过滤，减少不必要的 DB 查询）
           if (cooldownMs > 0) {
@@ -1029,16 +1372,22 @@ ${topMentionText}
         return
       }
 
-      // 白名单未启用：需要拉取全量会话列表，从中过滤私聊
+      if (filterMode === 'whitelist' && filterList.length === 0) {
+        insightLog('INFO', '白名单模式且名单为空，跳过活跃分析')
+        return
+      }
+
+      // blacklist 模式：拉取会话缓存后按过滤规则筛选
       const sessions = await this.getSessionsCached()
       if (sessions.length === 0) return
 
-      const privateSessions = sessions.filter((s) => {
+      const candidateSessions = sessions.filter((s) => {
         const id = s.username?.trim() || ''
-        return id && !id.endsWith('@chatroom') && !id.toLowerCase().includes('placeholder')
+        if (!id || id.toLowerCase().includes('placeholder')) return false
+        return this.isSessionAllowed(id)
       })
 
-      for (const session of privateSessions.slice(0, 10)) {
+      for (const session of candidateSessions.slice(0, 10)) {
         const sessionId = session.username?.trim() || ''
         if (!sessionId) continue
 
@@ -1074,30 +1423,33 @@ ${topMentionText}
   private async generateInsightForSession(params: {
     sessionId: string
     displayName: string
-    triggerReason: 'activity' | 'silence'
+    triggerReason: InsightRecordTriggerReason
     silentDays?: number
-  }): Promise<void> {
+  }): Promise<SessionInsightTriggerResult> {
     const { sessionId, displayName, triggerReason, silentDays } = params
-    if (!sessionId) return
-    if (!this.isEnabled()) return
+    if (!sessionId) return { success: false, message: '会话无效，无法生成见解' }
+    if (!this.isEnabled()) return { success: false, message: '请先在设置中开启「AI 见解」' }
 
     const { apiBaseUrl, apiKey, model, maxTokens } = this.getSharedAiModelConfig()
     const allowContext = this.config.get('aiInsightAllowContext') as boolean
     const contextCount = (this.config.get('aiInsightContextCount') as number) || 40
     const resolvedDisplayName = await this.resolveInsightSessionDisplayName(sessionId, displayName)
+    let resolvedAvatarUrl: string | undefined
+    try {
+      const contact = await chatService.getContactAvatar(sessionId)
+      resolvedAvatarUrl = String(contact?.avatarUrl || '').trim() || undefined
+    } catch {
+      resolvedAvatarUrl = undefined
+    }
 
     insightLog('INFO', `generateInsightForSession: sessionId=${sessionId}, reason=${triggerReason}, contextCount=${contextCount}, api=${apiBaseUrl ? '已配置' : '未配置'}`)
 
     if (!apiBaseUrl || !apiKey) {
       insightLog('WARN', 'API 地址或 Key 未配置，跳过见解生成')
-      return
+      return { success: false, message: '请先填写通用 AI 模型配置（API 地址和 Key）' }
     }
 
     // ── 构建 prompt ────────────────────────────────────────────────────────────
-
-    // 今日触发统计（让模型具备时间与克制感）
-    const sessionTriggerTimes = this.recordTrigger(sessionId)
-    const totalTodayTriggers = this.getTodayTotalTriggerCount()
 
     let contextSection = ''
     if (allowContext) {
@@ -1113,6 +1465,7 @@ ${topMentionText}
       }
     }
 
+    const momentsContextSection = await this.getMomentsContextSection(sessionId)
     const socialContextSection = await this.getSocialContextSection(sessionId)
 
     // ── 默认 system prompt（稳定内容，有利于 provider 端 prompt cache 命中）────
@@ -1128,25 +1481,12 @@ ${topMentionText}
     const customPrompt = (this.config.get('aiInsightSystemPrompt') as string) || ''
     const systemPrompt = customPrompt.trim() || DEFAULT_SYSTEM_PROMPT
 
-    // 可变的上下文统计信息放在 user message 里，保持 system prompt 稳定不变
-    // 这样 provider 端（Anthropic/OpenAI）能最大化命中 prompt cache，降低费用
-    const triggerDesc =
-      triggerReason === 'silence'
-        ? `你已经 ${silentDays} 天没有和「${resolvedDisplayName}」聊天了。`
-        : `你最近和「${resolvedDisplayName}」有新的聊天动态。`
-
-    const todayStatsDesc =
-      sessionTriggerTimes.length > 1
-        ? `今天你已经针对「${resolvedDisplayName}」收到过 ${sessionTriggerTimes.length - 1} 条见解（时间：${sessionTriggerTimes.slice(0, -1).join('、')}），请适当克制。`
-        : `今天你还没有针对「${resolvedDisplayName}」发出过见解。`
-
-    const globalStatsDesc = `今天全部联系人合计已触发 ${totalTodayTriggers} 条见解。`
-
     const userPromptBase = [
-      `触发原因：${triggerDesc}`,
-      `时间统计：${todayStatsDesc}`,
-      `全局统计：${globalStatsDesc}`,
+      triggerReason === 'silence' && silentDays
+        ? `已 ${silentDays} 天未联系「${resolvedDisplayName}」。`
+        : '',
       contextSection,
+      momentsContextSection,
       socialContextSection,
       '请给出你的见解（≤80字）：'
     ].filter(Boolean).join('\n\n')
@@ -1166,7 +1506,7 @@ ${topMentionText}
         `接口地址：${endpoint}`,
         `模型：${model}`,
         `Max Tokens：${maxTokens}`,
-        `触发原因：${triggerReason}`,
+        `触发类型：${triggerReason}`,
         `上下文开关：${allowContext ? '开启' : '关闭'}`,
         `上下文条数：${contextCount}`,
         '',
@@ -1179,6 +1519,7 @@ ${topMentionText}
     )
 
     try {
+      const apiStartedAt = Date.now()
       const result = await callApi(
         apiBaseUrl,
         apiKey,
@@ -1187,6 +1528,7 @@ ${topMentionText}
         API_TIMEOUT_MS,
         maxTokens
       )
+      const apiDurationMs = Date.now() - apiStartedAt
 
       insightLog('INFO', `API 返回原文: ${result.slice(0, 150)}`)
       insightDebugSection('INFO', `AI 输出原文 ${resolvedDisplayName} (${sessionId})`, result)
@@ -1194,21 +1536,51 @@ ${topMentionText}
       // 模型主动选择跳过
       if (result.trim().toUpperCase() === 'SKIP' || result.trim().startsWith('SKIP')) {
         insightLog('INFO', `模型选择跳过 ${resolvedDisplayName}`)
-        return
+        return { success: true, message: `模型判断「${resolvedDisplayName}」暂无可生成的见解`, skipped: true }
       }
-      if (!this.isEnabled()) return
+      if (!this.isEnabled()) return { success: false, message: 'AI 见解已关闭，生成结果未保存' }
 
-      const insight = result.slice(0, 120)
+      const insight = result.trim()
       const notifTitle = `见解 · ${resolvedDisplayName}`
+      const recordLog: InsightRecordLog = {
+        endpoint,
+        model,
+        maxTokens,
+        temperature: API_TEMPERATURE,
+        triggerReason,
+        allowContext,
+        contextCount,
+        systemPrompt,
+        userPrompt,
+        rawOutput: result,
+        finalInsight: insight,
+        durationMs: apiDurationMs,
+        createdAt: Date.now()
+      }
+      const record = insightRecordService.addRecord({
+        sessionId,
+        displayName: resolvedDisplayName,
+        avatarUrl: resolvedAvatarUrl,
+        triggerReason,
+        insight,
+        log: recordLog
+      })
 
-      insightLog('INFO', `推送通知 → ${resolvedDisplayName}: ${insight}`)
+      const insightNotificationEnabled = this.config.get('aiInsightNotificationEnabled') !== false
+      if (insightNotificationEnabled) {
+        insightLog('INFO', `推送通知 → ${resolvedDisplayName}: ${insight}`)
 
-      // 渠道一：Electron 原生系统通知
-      if (Notification.isSupported()) {
-        const notif = new Notification({ title: notifTitle, body: insight, silent: false })
-        notif.show()
+        // 渠道一：应用内通知窗口。AI 见解使用独立通知开关，不受新消息通知开关和会话过滤影响。
+        await showNotification({
+          title: notifTitle,
+          content: insight,
+          avatarUrl: INSIGHT_NOTIFICATION_AVATAR_URL,
+          sessionId,
+          insightRecordId: record.id,
+          channel: 'ai-insight'
+        })
       } else {
-        insightLog('WARN', '当前系统不支持原生通知')
+        insightLog('INFO', `AI 见解消息通知已关闭，跳过应用通知 → ${resolvedDisplayName}: ${insight}`)
       }
 
       // 渠道二：Telegram Bot 推送（可选）
@@ -1229,7 +1601,17 @@ ${topMentionText}
         }
       }
 
-      insightLog('INFO', `已为 ${resolvedDisplayName} 推送见解`)
+      insightLog('INFO', `已完成 ${resolvedDisplayName} 的见解处理`)
+      this.recordTrigger(sessionId)
+      return {
+        success: true,
+        message: insightNotificationEnabled
+          ? `已生成「${resolvedDisplayName}」的 AI 见解，请查看通知弹窗`
+          : `已生成「${resolvedDisplayName}」的 AI 见解，AI 见解消息通知当前已关闭`,
+        recordId: record.id,
+        insight,
+        notificationEnabled: insightNotificationEnabled
+      }
     } catch (e) {
       insightDebugSection(
         'ERROR',
@@ -1237,6 +1619,7 @@ ${topMentionText}
         `错误信息：${(e as Error).message}\n\n堆栈：\n${(e as Error).stack || '[无堆栈]'}`
       )
       insightLog('ERROR', `API 调用失败 (${resolvedDisplayName}): ${(e as Error).message}`)
+      return { success: false, message: `生成失败：${(e as Error).message}` }
     }
   }
 

@@ -100,7 +100,7 @@ export class BizService {
       const contactInfoMap = enrichment.success && enrichment.contacts ? enrichment.contacts : {}
 
       const root = this.configService.get('dbPath')
-      const myWxid = this.configService.get('myWxid')
+      const myWxid = this.configService.getMyWxidCleaned()
       const accountWxid = account || myWxid
       if (!root || !accountWxid) return []
 

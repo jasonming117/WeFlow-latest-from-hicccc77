@@ -21,6 +21,263 @@ export interface SocialSaveWeiboCookieResult {
   error?: string
 }
 
+export type InsightRecordTriggerReason = 'activity' | 'silence' | 'test' | 'manual' | 'message_analysis'
+export type InsightRecordSourceType = 'insight' | 'message_analysis'
+
+export interface MessageInsightAnalysis {
+  explicitText: string
+  emotion: string
+  intent: string
+  topic: string
+}
+
+export interface MessageInsightTarget {
+  targetLocalId: number
+  targetCreateTime: number
+  targetMessageKey: string
+  targetSenderName: string
+  targetTextPreview: string
+  analysis: MessageInsightAnalysis
+}
+
+export interface InsightRecordLog {
+  endpoint: string
+  model: string
+  maxTokens: number
+  temperature: number
+  triggerReason: InsightRecordTriggerReason
+  allowContext: boolean
+  contextCount: number
+  systemPrompt: string
+  userPrompt: string
+  rawOutput: string
+  finalInsight: string
+  durationMs: number
+  createdAt: number
+  responseFormatJson?: boolean
+  responseFormatFallback?: boolean
+  responseFormatFallbackReason?: string
+  targetMessage?: {
+    localId: number
+    createTime: number
+    messageKey: string
+    senderName: string
+    textPreview: string
+  }
+  contextStats?: {
+    requested: number
+    beforeTarget: number
+    afterTarget: number
+    readError?: string
+  }
+  parsedAnalysis?: MessageInsightAnalysis
+}
+
+export interface InsightRecordSummary {
+  id: string
+  sourceType: InsightRecordSourceType
+  createdAt: number
+  sessionId: string
+  displayName: string
+  avatarUrl?: string
+  triggerReason: InsightRecordTriggerReason
+  insight: string
+  read: boolean
+  messageInsight?: MessageInsightTarget
+}
+
+export interface InsightRecord extends InsightRecordSummary {
+  accountScope: string
+  log: InsightRecordLog
+}
+
+export interface InsightRecordContactFacet {
+  sessionId: string
+  displayName: string
+  avatarUrl?: string
+  count: number
+}
+
+export interface InsightRecordFilters {
+  keyword?: string
+  sessionId?: string
+  startTime?: number
+  endTime?: number
+  sourceType?: InsightRecordSourceType | 'all'
+  limit?: number
+  offset?: number
+}
+
+export interface InsightRecordListResult {
+  success: boolean
+  records: InsightRecordSummary[]
+  total: number
+  todayCount: number
+  unreadCount: number
+  contacts: InsightRecordContactFacet[]
+  error?: string
+}
+
+export interface InsightRecordResult {
+  success: boolean
+  record?: InsightRecord
+  error?: string
+}
+
+export type GroupSummaryTriggerType = 'auto' | 'manual'
+
+export interface GroupSummaryTopic {
+  title: string
+  participants: string[]
+  keyPoints: string[]
+  conclusion: string
+}
+
+export interface GroupSummaryLog {
+  endpoint: string
+  model: string
+  temperature: number
+  triggerType: GroupSummaryTriggerType
+  periodStart: number
+  periodEnd: number
+  messageCount: number
+  readableMessageCount: number
+  systemPrompt: string
+  userPrompt: string
+  rawOutput: string
+  finalSummary: string
+  durationMs: number
+  createdAt: number
+  responseFormatJson?: boolean
+  responseFormatFallback?: boolean
+  responseFormatFallbackReason?: string
+  parsedTopics?: GroupSummaryTopic[]
+}
+
+export interface GroupSummaryRecordSummary {
+  id: string
+  createdAt: number
+  sessionId: string
+  displayName: string
+  avatarUrl?: string
+  triggerType: GroupSummaryTriggerType
+  periodStart: number
+  periodEnd: number
+  messageCount: number
+  readableMessageCount: number
+  topics: GroupSummaryTopic[]
+  summaryText: string
+}
+
+export interface GroupSummaryRecord extends GroupSummaryRecordSummary {
+  accountScope: string
+  rawOutput: string
+  log: GroupSummaryLog
+}
+
+export interface GroupSummaryRecordFilters {
+  sessionId?: string
+  startTime?: number
+  endTime?: number
+  limit?: number
+  offset?: number
+}
+
+export interface GroupSummaryRecordListResult {
+  success: boolean
+  records: GroupSummaryRecordSummary[]
+  total: number
+  error?: string
+}
+
+export interface GroupSummaryRecordResult {
+  success: boolean
+  record?: GroupSummaryRecord
+  error?: string
+}
+
+export interface BackupProgress {
+  phase: 'preparing' | 'scanning' | 'exporting' | 'packing' | 'inspecting' | 'restoring' | 'done' | 'failed'
+  message: string
+  current?: number
+  total?: number
+  detail?: string
+}
+
+export interface BackupOptions {
+  includeImages?: boolean
+  includeVideos?: boolean
+  includeFiles?: boolean
+}
+
+export interface BackupImageDatMeta {
+  version?: number
+  aesSize?: number
+  aes_size?: number
+  xorSize?: number
+  xor_size?: number
+  rawSize?: number
+  raw_size?: number
+  flag?: number
+}
+
+export interface BackupManifest {
+  version: 1
+  type: 'weflow-db-snapshots'
+  createdAt: string
+  appVersion: string
+  source: {
+    wxid: string
+    dbRoot: string
+  }
+  options?: BackupOptions
+  databases: Array<{
+    id: string
+    kind: 'session' | 'contact' | 'emoticon' | 'message' | 'media' | 'sns' | 'hardlink'
+    dbPath: string
+    relativePath: string
+    tables: Array<{
+      name: string
+      snapshotPath: string
+      rows: number
+      columns: number
+      schemaSql?: string
+    }>
+  }>
+  resources?: {
+    images?: Array<{
+      kind: 'image' | 'video' | 'file'
+      id: string
+      md5?: string
+      sessionId?: string
+      createTime?: number
+      sourceFileName?: string
+      archivePath: string
+      targetRelativePath: string
+      ext?: string
+      size?: number
+      datMeta?: BackupImageDatMeta
+    }>
+    videos?: Array<{
+      kind: 'image' | 'video' | 'file'
+      id: string
+      md5?: string
+      sourceFileName?: string
+      archivePath: string
+      targetRelativePath: string
+      size?: number
+    }>
+    files?: Array<{
+      kind: 'image' | 'video' | 'file'
+      id: string
+      sourceFileName?: string
+      archivePath: string
+      targetRelativePath: string
+      size?: number
+    }>
+  }
+}
+
 export interface ElectronAPI {
   window: {
     minimize: () => void
@@ -85,13 +342,14 @@ export interface ElectronAPI {
     onUpdateAvailable: (callback: (info: { version: string; releaseNotes: string }) => void) => () => void
   }
   notification: {
-    show: (data: { title: string; content: string; avatarUrl?: string; sessionId: string }) => Promise<{ success?: boolean; error?: string } | void>
+    show: (data: { title: string; content: string; avatarUrl?: string; sessionId: string; channel?: string; insightRecordId?: string; targetRoute?: string }) => Promise<{ success?: boolean; error?: string } | void>
     close: () => Promise<void>
-    click: (sessionId: string) => void
+    click: (payload: string | { sessionId?: string; channel?: string; insightRecordId?: string; targetRoute?: string }) => void
     ready: () => void
     resize: (width: number, height: number) => void
     onShow: (callback: (event: any, data: any) => void) => () => void
     onNavigateToSession: (callback: (sessionId: string) => void) => () => void
+    onNavigateToRoute: (callback: (route: string) => void) => () => void
   }
   log: {
     getPath: () => Promise<string>
@@ -158,6 +416,27 @@ export interface ElectronAPI {
     close: () => Promise<boolean>
 
   }
+  backup: {
+    create: (payload: { outputPath: string; options?: BackupOptions }) => Promise<{
+      success: boolean
+      filePath?: string
+      manifest?: BackupManifest
+      error?: string
+    }>
+    inspect: (payload: { archivePath: string }) => Promise<{
+      success: boolean
+      manifest?: BackupManifest
+      error?: string
+    }>
+    restore: (payload: { archivePath: string }) => Promise<{
+      success: boolean
+      inserted?: number
+      ignored?: number
+      skipped?: number
+      error?: string
+    }>
+    onProgress: (callback: (progress: BackupProgress) => void) => () => void
+  }
   key: {
     autoGetDbKey: () => Promise<{ success: boolean; key?: string; error?: string; logs?: string[] }>
     autoGetImageKey: (manualDir?: string, wxid?: string) => Promise<{ success: boolean; xorKey?: number; aesKey?: string; verified?: boolean; error?: string }>
@@ -168,6 +447,8 @@ export interface ElectronAPI {
   chat: {
     connect: () => Promise<{ success: boolean; error?: string }>
     getSessions: () => Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }>
+    markAllSessionsRead: () => Promise<{ success: boolean; error?: string }>
+    getAntiRevokeSessions: () => Promise<{ success: boolean; sessions?: ChatSession[]; error?: string }>
     getSessionStatuses: (usernames: string[]) => Promise<{
       success: boolean
       map?: Record<string, { isFolded?: boolean; isMuted?: boolean }>
@@ -193,7 +474,7 @@ export interface ElectronAPI {
       }
       error?: string
     }>
-    getSessionMessageCounts: (sessionIds: string[]) => Promise<{
+    getSessionMessageCounts: (sessionIds: string[], options?: { preferHintCache?: boolean; bypassSessionCache?: boolean }) => Promise<{
       success: boolean
       counts?: Record<string, number>
       error?: string
@@ -311,6 +592,8 @@ export interface ElectronAPI {
         allowStaleCache?: boolean
         preferAccurateSpecialTypes?: boolean
         cacheOnly?: boolean
+        beginTimestamp?: number
+        endTimestamp?: number
       }
     ) => Promise<{
       success: boolean
@@ -849,6 +1132,8 @@ export interface ElectronAPI {
           initiatedChats: number
           receivedChats: number
           initiativeRate: number
+          topInitiatedFriend?: string
+          topInitiatedCount?: number
         } | null
         responseSpeed: {
           avgResponseTime: number
@@ -879,6 +1164,12 @@ export interface ElectronAPI {
     exportImages: (payload: { baseDir: string; folderName: string; images: Array<{ name: string; dataUrl: string }> }) => Promise<{
       success: boolean
       dir?: string
+      error?: string
+    }>
+    captureCurrentWindow: () => Promise<{
+      success: boolean
+      dataUrl?: string
+      size?: { width: number; height: number }
       error?: string
     }>
     onAvailableYearsProgress: (callback: (payload: {
@@ -978,16 +1269,22 @@ export interface ElectronAPI {
       estimatedSeconds: number
       sessions: Array<{ sessionId: string; displayName: string; totalCount: number; voiceCount: number }>
     }>
-    exportSessions: (sessionIds: string[], outputDir: string, options: ExportOptions) => Promise<{
+    exportSessions: (sessionIds: string[], outputDir: string, options: ExportOptions, controlOptions?: { taskId?: string }) => Promise<{
       success: boolean
       successCount?: number
       failCount?: number
+      paused?: boolean
+      stopped?: boolean
       pendingSessionIds?: string[]
       successSessionIds?: string[]
       failedSessionIds?: string[]
+      failedSessionErrors?: Record<string, string>
       sessionOutputPaths?: Record<string, string>
       error?: string
     }>
+    pauseTask: (taskId: string) => Promise<{ success: boolean; error?: string }>
+    resumeTask: (taskId: string) => Promise<{ success: boolean; error?: string }>
+    cancelTask: (taskId: string) => Promise<{ success: boolean; error?: string }>
     exportSession: (sessionId: string, outputPath: string, options: ExportOptions) => Promise<{
       success: boolean
       error?: string
@@ -1060,7 +1357,8 @@ export interface ElectronAPI {
       exportVideos?: boolean
       startTime?: number
       endTime?: number
-    }) => Promise<{ success: boolean; filePath?: string; postCount?: number; mediaCount?: number; error?: string }>
+      taskId?: string
+    }) => Promise<{ success: boolean; filePath?: string; postCount?: number; mediaCount?: number; paused?: boolean; stopped?: boolean; error?: string }>
     onExportProgress: (callback: (payload: { current: number; total: number; status: string }) => void) => () => void
     selectExportDir: () => Promise<{ canceled: boolean; filePath?: string }>
     getSnsUsernames: () => Promise<{ success: boolean; usernames?: string[]; error?: string }>
@@ -1113,7 +1411,16 @@ export interface ElectronAPI {
   insight: {
     testConnection: () => Promise<{ success: boolean; message: string }>
     getTodayStats: () => Promise<Array<{ sessionId: string; count: number; times: string[] }>>
+    listRecords: (filters?: InsightRecordFilters) => Promise<InsightRecordListResult>
+    getRecord: (id: string) => Promise<InsightRecordResult>
+    markRecordRead: (id: string) => Promise<{ success: boolean; error?: string }>
+    clearRecords: (filters?: InsightRecordFilters) => Promise<{ success: boolean; removed: number; error?: string }>
     triggerTest: () => Promise<{ success: boolean; message: string }>
+    triggerSessionInsight: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+    }) => Promise<{ success: boolean; message: string; recordId?: string; insight?: string; skipped?: boolean; notificationEnabled?: boolean }>
     generateFootprintInsight: (payload: {
       rangeLabel: string
       summary: {
@@ -1127,6 +1434,35 @@ export interface ElectronAPI {
       privateSegments?: Array<{ displayName?: string; session_id?: string; incoming_count?: number; outgoing_count?: number; message_count?: number; replied?: boolean }>
       mentionGroups?: Array<{ displayName?: string; session_id?: string; count?: number }>
     }) => Promise<{ success: boolean; message: string; insight?: string }>
+    generateMessageInsight: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+      targetLocalId?: number
+      targetCreateTime?: number
+      targetMessageKey?: string
+      targetText: string
+      targetSenderName?: string
+      contextCount?: number
+      forceRefresh?: boolean
+    }) => Promise<{ success: boolean; message: string; cached?: boolean; recordId?: string; data?: MessageInsightAnalysis }>
+  }
+  groupSummary: {
+    listRecords: (filters?: GroupSummaryRecordFilters) => Promise<GroupSummaryRecordListResult>
+    getRecord: (id: string) => Promise<GroupSummaryRecordResult>
+    triggerManual: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+      startTime: number
+      endTime: number
+    }) => Promise<{ success: boolean; message: string; recordId?: string; record?: GroupSummaryRecordSummary; skipped?: boolean; skippedReason?: string }>
+    triggerDay: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+      date: string
+    }) => Promise<{ success: boolean; message: string; generated: number; skipped: number; records: GroupSummaryRecordSummary[] }>
   }
 }
 
@@ -1149,6 +1485,7 @@ export interface ExportOptions {
   txtColumns?: string[]
   fileNamingMode?: 'classic' | 'date-range'
   sessionLayout?: 'shared' | 'per-session'
+  exportWriteLayout?: 'A' | 'B' | 'C'
   sessionNameWithTypePrefix?: boolean
   displayNamePreference?: 'group-nickname' | 'remark' | 'nickname'
   exportConcurrency?: number
@@ -1210,6 +1547,3 @@ declare global {
 }
 
 export { }
-
-
-

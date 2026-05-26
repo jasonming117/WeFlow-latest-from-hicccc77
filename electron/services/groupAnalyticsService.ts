@@ -251,7 +251,7 @@ class GroupAnalyticsService {
   }
 
   private async ensureConnected(): Promise<{ success: boolean; error?: string }> {
-    const wxid = this.configService.get('myWxid')
+    const wxid = this.configService.getMyWxidCleaned()
     const dbPath = this.configService.get('dbPath')
     const decryptKey = this.configService.get('decryptKey')
     if (!wxid) return { success: false, error: '未配置微信ID' }
@@ -259,7 +259,9 @@ class GroupAnalyticsService {
     if (!decryptKey) return { success: false, error: '未配置解密密钥' }
 
     const cleanedWxid = this.cleanAccountDirName(wxid)
-    const ok = await wcdbService.open(dbPath, decryptKey, cleanedWxid)
+    const accountDir = this.configService.getAccountDir(dbPath, wxid)
+    if (!accountDir) return { success: false, error: '无法找到账号目录' }
+    const ok = await wcdbService.open(accountDir, decryptKey)
     if (!ok) return { success: false, error: 'WCDB 打开失败' }
     return { success: true }
   }
@@ -1555,7 +1557,7 @@ class GroupAnalyticsService {
       const phraseCounts = new Map<string, number>()
       const emojiCounts = new Map<string, number>()
 
-      const myWxid = String(this.configService.get('myWxid') || '').trim()
+      const myWxid = String(this.configService.getMyWxidCleaned() || '').trim()
 
       try {
         while (true) {

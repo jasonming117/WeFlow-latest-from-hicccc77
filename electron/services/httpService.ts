@@ -26,7 +26,7 @@ interface ChatLabHeader {
 interface ChatLabMeta {
   name: string
   platform: string
-  type: 'group' | 'private'
+  type: ApiSessionType
   groupId?: string
   groupAvatar?: string
   ownerId?: string
@@ -52,6 +52,20 @@ interface ChatLabMessage {
   mediaPath?: string
 }
 
+interface ApiQuoteSnapshot {
+  platformMessageId?: string
+  sender?: string
+  accountName?: string
+  content?: string
+  type?: number
+}
+
+interface ApiQuoteInfo {
+  replyText?: string
+  replyToMessageId?: string
+  quote?: ApiQuoteSnapshot
+}
+
 interface ChatLabData {
   chatlab: ChatLabHeader
   meta: ChatLabMeta
@@ -68,12 +82,19 @@ interface ApiMediaOptions {
 }
 
 type MediaKind = 'image' | 'voice' | 'video' | 'emoji'
+type ApiSessionType = 'group' | 'private' | 'channel' | 'other'
 
 interface ApiExportedMedia {
   kind: MediaKind
   fileName: string
   fullPath: string
   relativePath: string
+}
+
+interface MessagePushReplayEvent {
+  id: number
+  body: string
+  createdAt: number
 }
 
 // ChatLab 消息类型映射
@@ -107,8 +128,12 @@ class HttpService {
   private running: boolean = false
   private connections: Set<import('net').Socket> = new Set()
   private messagePushClients: Set<http.ServerResponse> = new Set()
+  private messagePushReplayBuffer: MessagePushReplayEvent[] = []
   private messagePushHeartbeatTimer: ReturnType<typeof setInterval> | null = null
   private connectionMutex: boolean = false
+  private messagePushEventId = 0
+  private readonly messagePushReplayLimit = 1000
+  private readonly messagePushReplayTtlMs = 10 * 60 * 1000
 
   constructor() {
     this.configService = ConfigService.getInstance()
@@ -178,6 +203,7 @@ class HttpService {
           } catch {}
         }
         this.messagePushClients.clear()
+        this.messagePushReplayBuffer = []
         if (this.messagePushHeartbeatTimer) {
           clearInterval(this.messagePushHeartbeatTimer)
           this.messagePushHeartbeatTimer = null
@@ -232,9 +258,57 @@ class HttpService {
     return `http://${this.host}:${this.port}/api/v1/push/messages`
   }
 
+  private nextMessagePushEventId(): number {
+    this.messagePushEventId += 1
+    if (!Number.isSafeInteger(this.messagePushEventId) || this.messagePushEventId <= 0) {
+      this.messagePushEventId = 1
+    }
+    return this.messagePushEventId
+  }
+
+  private rememberMessagePushEvent(id: number, body: string): void {
+    this.pruneMessagePushReplayBuffer()
+    this.messagePushReplayBuffer.push({ id, body, createdAt: Date.now() })
+    if (this.messagePushReplayBuffer.length > this.messagePushReplayLimit) {
+      this.messagePushReplayBuffer.splice(0, this.messagePushReplayBuffer.length - this.messagePushReplayLimit)
+    }
+  }
+
+  private pruneMessagePushReplayBuffer(): void {
+    const cutoff = Date.now() - this.messagePushReplayTtlMs
+    while (this.messagePushReplayBuffer.length > 0 && this.messagePushReplayBuffer[0].createdAt < cutoff) {
+      this.messagePushReplayBuffer.shift()
+    }
+  }
+
+  private parseMessagePushLastEventId(req: http.IncomingMessage, url?: URL): number {
+    const queryValue = url?.searchParams.get('lastEventId') || url?.searchParams.get('last_event_id') || ''
+    const headerValue = Array.isArray(req.headers['last-event-id'])
+      ? req.headers['last-event-id'][0]
+      : req.headers['last-event-id']
+    const parsed = Number.parseInt(String(queryValue || headerValue || '0').trim(), 10)
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+  }
+
+  private replayMessagePushEvents(res: http.ServerResponse, lastEventId: number): void {
+    this.pruneMessagePushReplayBuffer()
+    const events = lastEventId > 0
+      ? this.messagePushReplayBuffer.filter((event) => event.id > lastEventId)
+      : this.messagePushReplayBuffer
+
+    for (const event of events) {
+      if (res.writableEnded || res.destroyed) return
+      res.write(event.body)
+    }
+  }
+
   broadcastMessagePush(payload: Record<string, unknown>): void {
-    if (!this.running || this.messagePushClients.size === 0) return
-    const eventBody = `event: message.new\ndata: ${JSON.stringify(payload)}\n\n`
+    if (!this.running) return
+    const eventId = this.nextMessagePushEventId()
+    const eventName = this.getMessagePushEventName(payload)
+    const eventBody = `id: ${eventId}\nevent: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`
+    this.rememberMessagePushEvent(eventId, eventBody)
+    if (this.messagePushClients.size === 0) return
 
     for (const client of Array.from(this.messagePushClients)) {
       try {
@@ -248,6 +322,11 @@ class HttpService {
         try { client.end() } catch {}
       }
     }
+  }
+
+  private getMessagePushEventName(payload: Record<string, unknown>): string {
+    const eventName = String(payload?.event || '').trim()
+    return /^[a-z0-9._-]+$/i.test(eventName) ? eventName : 'message.new'
   }
 
   async autoStart(): Promise<void> {
@@ -365,11 +444,22 @@ class HttpService {
             if (pathname === '/health' || pathname === '/api/v1/health') {
                 this.sendJson(res, { status: 'ok' })
             } else if (pathname === '/api/v1/push/messages') {
-                this.handleMessagePushStream(req, res)
+                this.handleMessagePushStream(req, res, url)
             } else if (pathname === '/api/v1/messages') {
                 await this.handleMessages(url, res)
             } else if (pathname === '/api/v1/sessions') {
                 await this.handleSessions(url, res)
+            } else if (
+                pathname.startsWith('/api/v1/sessions/') &&
+                pathname.endsWith('/messages')
+            ) {
+                const parts = pathname.split('/')
+                const sessionId = decodeURIComponent(parts[4] || '')
+                if (!sessionId) {
+                    this.sendError(res, 400, 'Missing session ID')
+                } else {
+                    await this.handlePullMessages(sessionId, url, res)
+                }
             } else if (pathname === '/api/v1/contacts') {
                 await this.handleContacts(url, res)
             } else if (pathname === '/api/v1/group-members') {
@@ -429,7 +519,7 @@ class HttpService {
     }, 25000)
   }
 
-  private handleMessagePushStream(req: http.IncomingMessage, res: http.ServerResponse): void {
+  private handleMessagePushStream(req: http.IncomingMessage, res: http.ServerResponse, url: URL): void {
     if (this.configService.get('messagePushEnabled') !== true) {
       this.sendError(res, 403, 'Message push is disabled')
       return
@@ -442,9 +532,10 @@ class HttpService {
       'X-Accel-Buffering': 'no'
     })
     res.flushHeaders?.()
-    res.write(`event: ready\ndata: ${JSON.stringify({ success: true, stream: this.getMessagePushStreamUrl() })}\n\n`)
 
     this.messagePushClients.add(res)
+    res.write(`event: ready\ndata: ${JSON.stringify({ success: true, stream: this.getMessagePushStreamUrl() })}\n\n`)
+    this.replayMessagePushEvents(res, this.parseMessagePushLastEventId(req, url))
 
     const cleanup = () => {
       this.messagePushClients.delete(res)
@@ -485,11 +576,20 @@ class HttpService {
     const contentType = mimeTypes[ext] || 'application/octet-stream'
 
     try {
-      const fileBuffer = fs.readFileSync(fullPath)
+      const stat = fs.statSync(fullPath)
       res.setHeader('Content-Type', contentType)
-      res.setHeader('Content-Length', fileBuffer.length)
+      res.setHeader('Content-Length', stat.size)
       res.writeHead(200)
-      res.end(fileBuffer)
+
+      const stream = fs.createReadStream(fullPath)
+      stream.on('error', () => {
+        if (!res.headersSent) {
+          this.sendError(res, 500, 'Failed to read media file')
+        } else {
+          try { res.destroy() } catch {}
+        }
+      })
+      stream.pipe(res)
     } catch (e) {
       this.sendError(res, 500, 'Failed to read media file')
     }
@@ -505,27 +605,29 @@ class HttpService {
     limit: number,
     startTime: number,
     endTime: number,
-    ascending: boolean
+    ascending: boolean,
+    useLiteMapping: boolean = true
   ): Promise<{ success: boolean; messages?: Message[]; hasMore?: boolean; error?: string }> {
     try {
-      // 使用固定 batch 大小（与 limit 相同或最多 500）来减少循环次数
-      const batchSize = Math.min(limit, 500)
+      // 深分页时放大 batch，避免 offset 很大时出现大量小批次循环。
+      const batchSize = Math.min(2000, Math.max(500, limit))
       const beginTimestamp = startTime > 10000000000 ? Math.floor(startTime / 1000) : startTime
       const endTimestamp = endTime > 10000000000 ? Math.floor(endTime / 1000) : endTime
 
-      const cursorResult = await wcdbService.openMessageCursor(talker, batchSize, ascending, beginTimestamp, endTimestamp)
+      const cursorResult = await wcdbService.openMessageCursorLite(talker, batchSize, ascending, beginTimestamp, endTimestamp)
       if (!cursorResult.success || !cursorResult.cursor) {
         return { success: false, error: cursorResult.error || '打开消息游标失败' }
       }
 
       const cursor = cursorResult.cursor
       try {
-        const allRows: Record<string, any>[] = []
+        const collectedRows: Record<string, any>[] = []
         let hasMore = true
         let skipped = 0
+        let reachedLimit = false
 
         // 循环获取消息，处理 offset 跳过 + limit 累积
-        while (allRows.length < limit && hasMore) {
+        while (collectedRows.length < limit && hasMore) {
           const batch = await wcdbService.fetchMessageBatch(cursor)
           if (!batch.success || !batch.rows || batch.rows.length === 0) {
             hasMore = false
@@ -546,12 +648,20 @@ class HttpService {
             skipped = offset
           }
 
-          allRows.push(...rows)
+          const remainingCapacity = limit - collectedRows.length
+          if (rows.length > remainingCapacity) {
+            collectedRows.push(...rows.slice(0, remainingCapacity))
+            reachedLimit = true
+            break
+          }
+
+          collectedRows.push(...rows)
         }
 
-        const trimmedRows = allRows.slice(0, limit)
-        const finalHasMore = hasMore || allRows.length > limit
-        const messages = chatService.mapRowsToMessagesForApi(trimmedRows)
+        const finalHasMore = hasMore || reachedLimit
+        const messages = useLiteMapping
+          ? chatService.mapRowsToMessagesLiteForApi(collectedRows)
+          : chatService.mapRowsToMessagesForApi(collectedRows)
         await this.backfillMissingSenderUsernames(talker, messages)
         return { success: true, messages, hasMore: finalHasMore }
       } finally {
@@ -578,33 +688,71 @@ class HttpService {
     const targets = messages.filter((msg) => !String(msg.senderUsername || '').trim())
     if (targets.length === 0) return
 
-    const myWxid = (this.configService.get('myWxid') || '').trim()
-    for (const msg of targets) {
-      const localId = Number(msg.localId || 0)
-      if (Number.isFinite(localId) && localId > 0) {
-        try {
-          const detail = await wcdbService.getMessageById(talker, localId)
-          if (detail.success && detail.message) {
-            const hydrated = chatService.mapRowsToMessagesForApi([detail.message])[0]
-            if (hydrated?.senderUsername) {
-              msg.senderUsername = hydrated.senderUsername
-            }
-            if ((msg.isSend === null || msg.isSend === undefined) && hydrated?.isSend !== undefined) {
-              msg.isSend = hydrated.isSend
-            }
-            if (!msg.rawContent && hydrated?.rawContent) {
-              msg.rawContent = hydrated.rawContent
-            }
-          }
-        } catch (error) {
-          console.warn('[HttpService] backfill sender failed:', error)
+    const myWxid = (this.configService.getMyWxidCleaned() || '').trim()
+    const MAX_DETAIL_BACKFILL = 120
+    if (targets.length > MAX_DETAIL_BACKFILL) {
+      for (const msg of targets) {
+        if (!msg.senderUsername && msg.isSend === 1 && myWxid) {
+          msg.senderUsername = myWxid
         }
       }
+      return
+    }
 
-      if (!msg.senderUsername && msg.isSend === 1 && myWxid) {
-        msg.senderUsername = myWxid
+    const queue = [...targets]
+    const workerCount = Math.max(1, Math.min(6, queue.length))
+    const state = {
+      attempted: 0,
+      hydrated: 0,
+      consecutiveMiss: 0
+    }
+    const MAX_DETAIL_LOOKUPS = 80
+    const MAX_CONSECUTIVE_MISS = 36
+    const runWorker = async (): Promise<void> => {
+      while (queue.length > 0) {
+        if (state.attempted >= MAX_DETAIL_LOOKUPS) break
+        if (state.consecutiveMiss >= MAX_CONSECUTIVE_MISS && state.hydrated <= 0) break
+        const msg = queue.shift()
+        if (!msg) break
+
+        const localId = Number(msg.localId || 0)
+        if (Number.isFinite(localId) && localId > 0) {
+          state.attempted += 1
+          try {
+            const detail = await wcdbService.getMessageById(talker, localId)
+            if (detail.success && detail.message) {
+              const hydrated = chatService.mapRowsToMessagesForApi([detail.message])[0]
+              if (hydrated?.senderUsername) {
+                msg.senderUsername = hydrated.senderUsername
+              }
+              if ((msg.isSend === null || msg.isSend === undefined) && hydrated?.isSend !== undefined) {
+                msg.isSend = hydrated.isSend
+              }
+              if (!msg.rawContent && hydrated?.rawContent) {
+                msg.rawContent = hydrated.rawContent
+              }
+              if (msg.senderUsername) {
+                state.hydrated += 1
+                state.consecutiveMiss = 0
+              } else {
+                state.consecutiveMiss += 1
+              }
+            } else {
+              state.consecutiveMiss += 1
+            }
+          } catch (error) {
+            console.warn('[HttpService] backfill sender failed:', error)
+            state.consecutiveMiss += 1
+          }
+        }
+
+        if (!msg.senderUsername && msg.isSend === 1 && myWxid) {
+          msg.senderUsername = myWxid
+        }
       }
     }
+
+    await Promise.all(Array.from({ length: workerCount }, () => runWorker()))
   }
 
   private parseBooleanParam(url: URL, keys: string[], defaultValue: boolean = false): boolean {
@@ -648,11 +796,22 @@ class HttpService {
     }
   }
 
+  private getApiSessionType(username: string): ApiSessionType {
+    const normalized = String(username || '').trim()
+    const lowered = normalized.toLowerCase()
+    if (!normalized) return 'other'
+    if (lowered.endsWith('@chatroom')) return 'group'
+    if (lowered.startsWith('gh_')) return 'channel'
+    if (lowered.includes('@openim')) return 'channel'
+    if (lowered.startsWith('weixin') && lowered !== 'weixin') return 'channel'
+    return 'private'
+  }
+
   private async handleMessages(url: URL, res: http.ServerResponse): Promise<void> {
     const talker = (url.searchParams.get('talker') || '').trim()
     const limit = this.parseIntParam(url.searchParams.get('limit'), 100, 1, 10000)
     const offset = this.parseIntParam(url.searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER)
-    const keyword = (url.searchParams.get('keyword') || '').trim().toLowerCase()
+    const keyword = (url.searchParams.get('keyword') || '').trim()
     const startParam = url.searchParams.get('start')
     const endParam = url.searchParams.get('end')
     const chatlab = this.parseBooleanParam(url, ['chatlab'], false)
@@ -672,26 +831,41 @@ class HttpService {
 
     const startTime = this.parseTimeParam(startParam)
     const endTime = this.parseTimeParam(endParam, true)
-    const queryOffset = keyword ? 0 : offset
-    const queryLimit = keyword ? 10000 : limit
-
-    const result = await this.fetchMessagesBatch(talker, queryOffset, queryLimit, startTime, endTime, false)
-    if (!result.success || !result.messages) {
-      this.sendError(res, 500, result.error || 'Failed to get messages')
-      return
-    }
-
-    let messages = result.messages
-    let hasMore = result.hasMore === true
+    let messages: Message[] = []
+    let hasMore = false
 
     if (keyword) {
-      const filtered = messages.filter((msg) => {
-        const content = (msg.parsedContent || msg.rawContent || '').toLowerCase()
-        return content.includes(keyword)
-      })
-      const endIndex = offset + limit
-      hasMore = filtered.length > endIndex
-      messages = filtered.slice(offset, endIndex)
+      const searchLimit = Math.max(1, limit) + 1
+      const searchResult = await chatService.searchMessages(
+        keyword,
+        talker,
+        searchLimit,
+        offset,
+        startTime,
+        endTime
+      )
+      if (!searchResult.success || !searchResult.messages) {
+        this.sendError(res, 500, searchResult.error || 'Failed to search messages')
+        return
+      }
+      hasMore = searchResult.messages.length > limit
+      messages = hasMore ? searchResult.messages.slice(0, limit) : searchResult.messages
+    } else {
+      const result = await this.fetchMessagesBatch(
+        talker,
+        offset,
+        limit,
+        startTime,
+        endTime,
+        false,
+        !mediaOptions.enabled
+      )
+      if (!result.success || !result.messages) {
+        this.sendError(res, 500, result.error || 'Failed to get messages')
+        return
+      }
+      messages = result.messages
+      hasMore = result.hasMore === true
     }
 
     const mediaMap = mediaOptions.enabled
@@ -736,6 +910,7 @@ class HttpService {
   private async handleSessions(url: URL, res: http.ServerResponse): Promise<void> {
     const keyword = (url.searchParams.get('keyword') || '').trim()
     const limit = this.parseIntParam(url.searchParams.get('limit'), 100, 1, 10000)
+    const format = (url.searchParams.get('format') || '').trim().toLowerCase()
 
     try {
       const sessions = await chatService.getSessions()
@@ -753,8 +928,21 @@ class HttpService {
         )
       }
 
-      // 应用 limit
       const limitedSessions = filteredSessions.slice(0, limit)
+
+      if (format === 'chatlab') {
+        this.sendJson(res, {
+          sessions: limitedSessions.map(s => ({
+            id: s.username,
+            name: s.displayName || s.username,
+            platform: 'wechat',
+            type: this.getApiSessionType(s.username),
+            messageCount: s.messageCountHint || undefined,
+            lastMessageAt: s.lastTimestamp
+          }))
+        })
+        return
+      }
 
       this.sendJson(res, {
         success: true,
@@ -763,11 +951,59 @@ class HttpService {
           username: s.username,
           displayName: s.displayName,
           type: s.type,
+          sessionType: this.getApiSessionType(s.username),
           lastTimestamp: s.lastTimestamp,
           unreadCount: s.unreadCount
         }))
       })
     } catch (error) {
+      this.sendError(res, 500, String(error))
+    }
+  }
+
+  /**
+   * ChatLab Pull: GET /api/v1/sessions/:id/messages?since=&limit=&offset=&end=
+   * 返回 ChatLab 标准格式 + sync 分页块
+   */
+  private async handlePullMessages(sessionId: string, url: URL, res: http.ServerResponse): Promise<void> {
+    const PULL_MAX_LIMIT = 5000
+    const limit = this.parseIntParam(url.searchParams.get('limit'), PULL_MAX_LIMIT, 1, PULL_MAX_LIMIT)
+    const offset = this.parseIntParam(url.searchParams.get('offset'), 0, 0, Number.MAX_SAFE_INTEGER)
+    const sinceParam = url.searchParams.get('since')
+    const endParam = url.searchParams.get('end')
+
+    const startTime = sinceParam ? this.parseTimeParam(sinceParam) : 0
+    const endTime = endParam ? this.parseTimeParam(endParam, true) : 0
+
+    try {
+      const result = await this.fetchMessagesBatch(sessionId, offset, limit, startTime, endTime, true, true)
+      if (!result.success || !result.messages) {
+        this.sendError(res, 500, result.error || 'Failed to get messages')
+        return
+      }
+
+      const messages = result.messages
+      const hasMore = result.hasMore === true
+
+      const displayNames = await this.getDisplayNames([sessionId])
+      const talkerName = displayNames[sessionId] || sessionId
+      const chatLabData = await this.convertToChatLab(messages, sessionId, talkerName)
+
+      const lastTimestamp = messages.length > 0
+        ? messages[messages.length - 1].createTime
+        : undefined
+
+      this.sendJson(res, {
+        ...chatLabData,
+        sync: {
+          hasMore,
+          nextSince: hasMore && lastTimestamp ? lastTimestamp : undefined,
+          nextOffset: hasMore ? offset + messages.length : undefined,
+          watermark: Math.floor(Date.now() / 1000)
+        }
+      })
+    } catch (error) {
+      console.error('[HttpService] handlePullMessages error:', error)
       this.sendError(res, 500, String(error))
     }
   }
@@ -1323,7 +1559,7 @@ class HttpService {
           talker,
           String(msg.localId),
           msg.createTime || undefined,
-          msg.serverId || undefined
+          this.getMessageServerId(msg) || undefined
         )
         if (result.success && result.data) {
           const fileName = `voice_${msg.localId}.wav`
@@ -1377,15 +1613,17 @@ class HttpService {
   }
 
   private toApiMessage(msg: Message, media?: ApiExportedMedia): Record<string, any> {
-    return {
+    const serverId = this.getMessageServerId(msg)
+    const quoteInfo = this.extractApiQuoteInfo(msg)
+    const apiMessage: Record<string, any> = {
       localId: msg.localId,
-      serverId: msg.serverId,
+      serverId: serverId || '0',
       localType: msg.localType,
       createTime: msg.createTime,
       sortSeq: msg.sortSeq,
       isSend: msg.isSend,
       senderUsername: msg.senderUsername,
-      content: this.getMessageContent(msg),
+      content: this.getMessageContent(msg, quoteInfo),
       rawContent: msg.rawContent,
       parsedContent: msg.parsedContent,
       mediaType: media?.kind,
@@ -1393,6 +1631,36 @@ class HttpService {
       mediaUrl: media ? `http://${this.host}:${this.port}/api/v1/media/${media.relativePath}` : undefined,
       mediaLocalPath: media?.fullPath
     }
+
+    if (quoteInfo?.replyToMessageId) {
+      apiMessage.replyToMessageId = quoteInfo.replyToMessageId
+    }
+    if (quoteInfo?.quote && Object.keys(quoteInfo.quote).length > 0) {
+      apiMessage.quote = quoteInfo.quote
+    }
+
+    return apiMessage
+  }
+
+  private getMessageServerId(msg: Message): string {
+    const raw = this.normalizeUnsignedIntToken(msg.serverIdRaw)
+    if (raw && raw !== '0') return raw
+
+    const fallback = this.normalizeUnsignedIntToken(msg.serverId)
+    return fallback && fallback !== '0' ? fallback : ''
+  }
+
+  private normalizeUnsignedIntToken(value: unknown): string {
+    if (value === null || value === undefined) return ''
+    const text = String(value).trim()
+    if (!text) return ''
+    if (/^\d+$/.test(text)) {
+      return text.replace(/^0+(?=\d)/, '')
+    }
+
+    const numeric = Number(value)
+    if (!Number.isFinite(numeric) || numeric <= 0) return ''
+    return String(Math.floor(numeric))
   }
 
   /**
@@ -1587,7 +1855,7 @@ class HttpService {
     mediaMap: Map<number, ApiExportedMedia> = new Map()
   ): Promise<ChatLabData> {
     const isGroup = talkerId.endsWith('@chatroom')
-    const myWxid = this.configService.get('myWxid') || ''
+    const myWxid = this.configService.getMyWxidCleaned() || ''
     const normalizedMyWxid = this.normalizeAccountId(myWxid).toLowerCase()
 
     // 收集所有发送者
@@ -1651,17 +1919,22 @@ class HttpService {
     // 转换消息
     const chatLabMessages: ChatLabMessage[] = messages.map(msg => {
       const senderInfo = this.resolveChatLabSenderInfo(msg, talkerId, talkerName, myWxid, isGroup, senderNames, groupNicknamesMap)
+      const quoteInfo = this.extractApiQuoteInfo(msg)
 
-      return {
+      const chatLabMessage: ChatLabMessage = {
         sender: senderInfo.sender,
         accountName: senderInfo.accountName,
         groupNickname: senderInfo.groupNickname,
         timestamp: msg.createTime,
         type: this.mapMessageType(msg.localType, msg),
-        content: this.getMessageContent(msg),
-        platformMessageId: msg.serverId ? String(msg.serverId) : undefined,
+        content: this.getMessageContent(msg, quoteInfo),
+        platformMessageId: this.getMessageServerId(msg) || undefined,
         mediaPath: mediaMap.get(msg.localId) ? `http://${this.host}:${this.port}/api/v1/media/${mediaMap.get(msg.localId)!.relativePath}` : undefined
       }
+      if (quoteInfo?.replyToMessageId) {
+        chatLabMessage.replyToMessageId = quoteInfo.replyToMessageId
+      }
+      return chatLabMessage
     })
 
     return {
@@ -1673,7 +1946,7 @@ class HttpService {
       meta: {
         name: talkerName,
         platform: 'wechat',
-        type: isGroup ? 'group' : 'private',
+        type: this.getApiSessionType(talkerId),
         groupId: isGroup ? talkerId : undefined,
         groupAvatar: isGroup ? sessionAvatarInfo?.avatarUrl : undefined,
         ownerId: myWxid || undefined
@@ -1750,7 +2023,7 @@ class HttpService {
   }
 
   private extractType49Subtype(rawContent: string): string {
-    const content = String(rawContent || '')
+    const content = this.normalizeAppMessageContent(String(rawContent || ''))
     if (!content) return ''
 
     const appmsgMatch = /<appmsg[\s\S]*?>([\s\S]*?)<\/appmsg>/i.exec(content)
@@ -1804,9 +2077,9 @@ class HttpService {
     }
   }
 
-  private getType49Content(msg: Message): string {
+  private getType49Content(msg: Message, quoteInfo?: ApiQuoteInfo): string {
     const subtype = this.resolveType49Subtype(msg)
-    const title = msg.linkTitle || msg.fileName || ''
+    const title = msg.linkTitle || msg.fileName || this.extractAppMessageTitle(msg.rawContent) || ''
 
     switch (subtype) {
       case '5':
@@ -1820,7 +2093,7 @@ class HttpService {
       case '36':
         return title ? `[小程序] ${title}` : '[小程序]'
       case '57':
-        return msg.parsedContent || title || '[引用消息]'
+        return msg.parsedContent || quoteInfo?.replyText || title || '[引用消息]'
       case '2000':
         return title ? `[转账] ${title}` : '[转账]'
       case '2001':
@@ -1835,9 +2108,19 @@ class HttpService {
   /**
    * 获取消息内容
    */
-  private getMessageContent(msg: Message): string | null {
+  private getMessageContent(msg: Message, quoteInfo?: ApiQuoteInfo): string | null {
+    const normalizeTextContent = (value: string | null | undefined): string | null => {
+      const text = String(value || '')
+      if (!text) return null
+      return text.replace(/^[\s]*([a-zA-Z0-9_@-]+):(?!\/\/)(?:\s*(?:\r?\n|<br\s*\/?>)\s*|\s*)/i, '').trim()
+    }
+
     if (msg.localType === 49) {
-      return this.getType49Content(msg)
+      return this.getType49Content(msg, quoteInfo)
+    }
+
+    if (this.isReplyMessage(msg, quoteInfo)) {
+      return msg.parsedContent || quoteInfo?.replyText || this.extractAppMessageTitle(msg.rawContent) || '[引用消息]'
     }
 
     // 优先使用已解析的内容
@@ -1848,7 +2131,7 @@ class HttpService {
     // 根据类型返回占位符
     switch (msg.localType) {
       case 1:
-        return msg.rawContent || null
+        return normalizeTextContent(msg.parsedContent || msg.rawContent)
       case 3:
         return '[图片]'
       case 34:
@@ -1862,9 +2145,255 @@ class HttpService {
       case 48:
         return '[位置]'
       case 49:
-        return this.getType49Content(msg)
+        return this.getType49Content(msg, quoteInfo)
       default:
-        return msg.rawContent || null
+        return normalizeTextContent(msg.parsedContent || msg.rawContent) || null
+    }
+  }
+
+  private isReplyMessage(msg: Message, quoteInfo?: ApiQuoteInfo): boolean {
+    if (!quoteInfo?.replyToMessageId && !quoteInfo?.quote) return false
+    if (msg.localType === 244813135921) return true
+    if (msg.localType === 49 && this.resolveType49Subtype(msg) === '57') return true
+    return false
+  }
+
+  private extractApiQuoteInfo(msg: Message): ApiQuoteInfo | undefined {
+    const rawContent = String(msg.rawContent || msg.content || '')
+    if (!rawContent || !this.messageMayContainQuote(rawContent)) {
+      return undefined
+    }
+
+    const normalized = this.normalizeAppMessageContent(rawContent)
+    const referMsgXml = this.extractXmlBlock(normalized, 'refermsg')
+    if (!referMsgXml) return undefined
+
+    const replyToMessageId = this.extractReplyToMessageId(referMsgXml)
+    const referTypeRaw = this.extractXmlValue(referMsgXml, 'type')
+    const referContentRaw = this.extractXmlValue(referMsgXml, 'content')
+    const quoteContent = this.resolveQuotedContent(referMsgXml, referTypeRaw, referContentRaw)
+    const sender = this.resolveQuotedSender(referMsgXml)
+    const accountName = this.resolveQuotedAccountName(referMsgXml)
+    const quoteType = this.mapQuotedMessageType(referTypeRaw, referContentRaw)
+
+    const quote: ApiQuoteSnapshot = {}
+    if (replyToMessageId) quote.platformMessageId = replyToMessageId
+    if (sender) quote.sender = sender
+    if (accountName) quote.accountName = accountName
+    if (quoteContent) quote.content = quoteContent
+    if (quoteType !== undefined) quote.type = quoteType
+
+    const replyText = this.extractAppMessageTitle(normalized)
+
+    if (!replyToMessageId && Object.keys(quote).length === 0 && !replyText) {
+      return undefined
+    }
+
+    return {
+      replyText: replyText || undefined,
+      replyToMessageId,
+      quote: Object.keys(quote).length > 0 ? quote : undefined
+    }
+  }
+
+  private messageMayContainQuote(content: string): boolean {
+    return content.includes('<refermsg>') ||
+      content.includes('&lt;refermsg&gt;') ||
+      content.includes('<type>57</type>') ||
+      content.includes('&lt;type&gt;57&lt;/type&gt;')
+  }
+
+  private normalizeAppMessageContent(content: string): string {
+    return this.decodeHtmlEntities(String(content || ''))
+  }
+
+  private decodeHtmlEntities(text: string): string {
+    if (!text) return ''
+    return text
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&apos;/g, "'")
+  }
+
+  private extractXmlBlock(xml: string, tag: string): string {
+    if (!xml || !tag) return ''
+    const match = new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, 'i').exec(xml)
+    return match ? match[0] : ''
+  }
+
+  private extractXmlValue(xml: string, tag: string): string {
+    if (!xml || !tag) return ''
+    const match = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i').exec(xml)
+    if (!match) return ''
+    return this.decodeHtmlEntities(match[1])
+      .replace(/<!\[CDATA\[/g, '')
+      .replace(/\]\]>/g, '')
+      .trim()
+  }
+
+  private extractAppMessageTitle(content: string): string {
+    const normalized = this.normalizeAppMessageContent(content || '')
+    if (!normalized) return ''
+    const appMsgXml = this.extractXmlBlock(normalized, 'appmsg')
+    return this.sanitizeQuotedContent(this.extractXmlValue(appMsgXml || normalized, 'title'))
+  }
+
+  private extractReplyToMessageId(referMsgXml: string): string | undefined {
+    const candidates = [
+      this.extractXmlValue(referMsgXml, 'svrid'),
+      this.extractXmlValue(referMsgXml, 'msgsvrid'),
+      this.extractXmlValue(referMsgXml, 'newmsgid'),
+      this.extractXmlValue(referMsgXml, 'msgid')
+    ]
+
+    for (const candidate of candidates) {
+      const normalized = this.normalizeUnsignedIntToken(candidate)
+      if (normalized && normalized !== '0') return normalized
+    }
+
+    return undefined
+  }
+
+  private resolveQuotedSender(referMsgXml: string): string | undefined {
+    const chatusr = this.extractXmlValue(referMsgXml, 'chatusr')
+    if (chatusr) return chatusr
+
+    const fromusr = this.extractXmlValue(referMsgXml, 'fromusr')
+    if (fromusr && !fromusr.endsWith('@chatroom')) return fromusr
+
+    return undefined
+  }
+
+  private resolveQuotedAccountName(referMsgXml: string): string | undefined {
+    const displayName = this.extractXmlValue(referMsgXml, 'displayname')
+    if (!displayName || this.looksLikeWxid(displayName)) return undefined
+    return displayName
+  }
+
+  private looksLikeWxid(value: string): boolean {
+    const text = String(value || '').trim().toLowerCase()
+    return Boolean(text) && (text.startsWith('wxid_') || /^wx[a-z0-9_-]{4,}$/.test(text))
+  }
+
+  private resolveQuotedContent(referMsgXml: string, referTypeRaw: string, referContentRaw: string): string {
+    const referType = String(referTypeRaw || '').trim()
+    switch (referType) {
+      case '1':
+        return this.extractPreferredQuotedText(referMsgXml)
+      case '3':
+        return '[图片]'
+      case '34':
+        return '[语音]'
+      case '43':
+        return '[视频]'
+      case '47':
+        return '[动画表情]'
+      case '42':
+        return '[名片]'
+      case '48':
+        return '[位置]'
+      case '49': {
+        const innerType = this.extractType49Subtype(referContentRaw)
+        if (innerType === '57') {
+          return this.extractAppMessageTitle(referContentRaw) || '[引用消息]'
+        }
+        if (innerType === '6') return '[文件]'
+        if (innerType === '19') return '[聊天记录]'
+        if (innerType === '33' || innerType === '36') return '[小程序]'
+        return '[链接]'
+      }
+      default:
+        if (!referContentRaw || referContentRaw.includes('wxid_')) return '[消息]'
+        return this.sanitizeQuotedContent(referContentRaw)
+    }
+  }
+
+  private extractPreferredQuotedText(referMsgXml: string): string {
+    const candidateTags = [
+      'selectedcontent',
+      'selectedtext',
+      'selectcontent',
+      'selecttext',
+      'quotecontent',
+      'quotetext',
+      'partcontent',
+      'parttext',
+      'excerpt',
+      'summary',
+      'preview',
+      'content'
+    ]
+
+    for (const tag of candidateTags) {
+      const value = this.sanitizeQuotedContent(this.extractXmlValue(referMsgXml, tag))
+      if (value) return value
+    }
+
+    return ''
+  }
+
+  private sanitizeQuotedContent(content: string): string {
+    if (!content) return ''
+    return String(content || '')
+      .replace(/wxid_[A-Za-z0-9_-]{3,}/g, '')
+      .replace(/^[\s:：\-]+/, '')
+      .replace(/[:：]{2,}/g, ':')
+      .replace(/^[\s:：\-]+/, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  private mapQuotedMessageType(referTypeRaw: string, referContentRaw: string): number | undefined {
+    const referType = String(referTypeRaw || '').trim()
+    switch (referType) {
+      case '1':
+        return ChatLabType.TEXT
+      case '3':
+        return ChatLabType.IMAGE
+      case '34':
+        return ChatLabType.VOICE
+      case '43':
+        return ChatLabType.VIDEO
+      case '47':
+        return ChatLabType.EMOJI
+      case '48':
+        return ChatLabType.LOCATION
+      case '42':
+        return ChatLabType.CONTACT
+      case '50':
+        return ChatLabType.CALL
+      case '10000':
+        return ChatLabType.SYSTEM
+      case '49':
+        return this.mapQuotedType49MessageType(referContentRaw)
+      default:
+        return undefined
+    }
+  }
+
+  private mapQuotedType49MessageType(content: string): number {
+    const subtype = this.extractType49Subtype(content)
+    switch (subtype) {
+      case '57':
+        return ChatLabType.REPLY
+      case '6':
+        return ChatLabType.FILE
+      case '19':
+        return ChatLabType.FORWARD
+      case '33':
+      case '36':
+        return ChatLabType.SHARE
+      case '2000':
+        return ChatLabType.TRANSFER
+      case '2001':
+        return ChatLabType.RED_PACKET
+      case '5':
+      case '49':
+      default:
+        return ChatLabType.LINK
     }
   }
 

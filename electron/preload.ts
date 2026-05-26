@@ -13,7 +13,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   notification: {
     show: (data: any) => ipcRenderer.invoke('notification:show', data),
     close: () => ipcRenderer.invoke('notification:close'),
-    click: (sessionId: string) => ipcRenderer.send('notification-clicked', sessionId),
+    click: (payload: any) => ipcRenderer.send('notification-clicked', payload),
     ready: () => ipcRenderer.send('notification:ready'),
     resize: (width: number, height: number) => ipcRenderer.send('notification:resize', { width, height }),
     onShow: (callback: (event: any, data: any) => void) => {
@@ -24,6 +24,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       const listener = (_: any, sessionId: string) => callback(sessionId)
       ipcRenderer.on('navigate-to-session', listener)
       return () => ipcRenderer.removeListener('navigate-to-session', listener)
+    },
+    onNavigateToRoute: (callback: (route: string) => void) => {
+      const listener = (_: any, route: string) => callback(route)
+      ipcRenderer.on('navigate-to-route', listener)
+      return () => ipcRenderer.removeListener('navigate-to-route', listener)
     }
   },
 
@@ -154,6 +159,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
 
   },
 
+  backup: {
+    create: (payload: { outputPath: string; options?: { includeImages?: boolean; includeVideos?: boolean; includeFiles?: boolean } }) => ipcRenderer.invoke('backup:create', payload),
+    inspect: (payload: { archivePath: string }) => ipcRenderer.invoke('backup:inspect', payload),
+    restore: (payload: { archivePath: string }) => ipcRenderer.invoke('backup:restore', payload),
+    onProgress: (callback: (progress: any) => void) => {
+      const listener = (_: unknown, progress: any) => callback(progress)
+      ipcRenderer.on('backup:progress', listener)
+      return () => ipcRenderer.removeListener('backup:progress', listener)
+    }
+  },
+
   // 密钥获取
   key: {
     autoGetDbKey: () => ipcRenderer.invoke('key:autoGetDbKey'),
@@ -174,10 +190,12 @@ contextBridge.exposeInMainWorld('electronAPI', {
   chat: {
     connect: () => ipcRenderer.invoke('chat:connect'),
     getSessions: () => ipcRenderer.invoke('chat:getSessions'),
+    markAllSessionsRead: () => ipcRenderer.invoke('chat:markAllSessionsRead'),
+    getAntiRevokeSessions: () => ipcRenderer.invoke('chat:getAntiRevokeSessions'),
     getSessionStatuses: (usernames: string[]) => ipcRenderer.invoke('chat:getSessionStatuses', usernames),
     getExportTabCounts: () => ipcRenderer.invoke('chat:getExportTabCounts'),
     getContactTypeCounts: () => ipcRenderer.invoke('chat:getContactTypeCounts'),
-    getSessionMessageCounts: (sessionIds: string[]) => ipcRenderer.invoke('chat:getSessionMessageCounts', sessionIds),
+    getSessionMessageCounts: (sessionIds: string[], options?: { preferHintCache?: boolean; bypassSessionCache?: boolean }) => ipcRenderer.invoke('chat:getSessionMessageCounts', sessionIds, options),
     enrichSessionsContactInfo: (
       usernames: string[],
       options?: { skipDisplayName?: boolean; onlyMissingAvatar?: boolean }
@@ -219,6 +237,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
         allowStaleCache?: boolean
         preferAccurateSpecialTypes?: boolean
         cacheOnly?: boolean
+        beginTimestamp?: number
+        endTimestamp?: number
       }
     ) => ipcRenderer.invoke('chat:getExportSessionStats', sessionIds, options),
     getGroupMyMessageCountHint: (chatroomId: string) =>
@@ -351,13 +371,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
       }) => callback(payload)
       ipcRenderer.on('image:decryptProgress', listener)
       return () => ipcRenderer.removeListener('image:decryptProgress', listener)
-    }
+    },
+    startAutoDownload: (whitelist: string[] | string) => ipcRenderer.invoke('image:startAutoDownload', whitelist),
+    stopAutoDownload: () => ipcRenderer.invoke('image:stopAutoDownload'),
+    getAutoDownloadStatus: () => ipcRenderer.invoke('image:getAutoDownloadStatus')
   },
 
   // 视频
   video: {
     getVideoInfo: (videoMd5: string, options?: { includePoster?: boolean; posterFormat?: 'dataUrl' | 'fileUrl' }) => ipcRenderer.invoke('video:getVideoInfo', videoMd5, options),
     parseVideoMd5: (content: string) => ipcRenderer.invoke('video:parseVideoMd5', content)
+  },
+
+  process: {
+    platform: process.platform,
+    arch: process.arch
   },
 
   // 数据分析
@@ -412,6 +440,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     generateReport: (year: number) => ipcRenderer.invoke('annualReport:generateReport', year),
     exportImages: (payload: { baseDir: string; folderName: string; images: Array<{ name: string; dataUrl: string }> }) =>
       ipcRenderer.invoke('annualReport:exportImages', payload),
+    captureCurrentWindow: () => ipcRenderer.invoke('annualReport:captureCurrentWindow'),
     onAvailableYearsProgress: (callback: (payload: {
       taskId: string
       years?: number[]
@@ -448,8 +477,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   export: {
     getExportStats: (sessionIds: string[], options: any) =>
       ipcRenderer.invoke('export:getExportStats', sessionIds, options),
-    exportSessions: (sessionIds: string[], outputDir: string, options: any) =>
-      ipcRenderer.invoke('export:exportSessions', sessionIds, outputDir, options),
+    exportSessions: (sessionIds: string[], outputDir: string, options: any, controlOptions?: { taskId?: string }) =>
+      ipcRenderer.invoke('export:exportSessions', sessionIds, outputDir, options, controlOptions),
+    pauseTask: (taskId: string) =>
+      ipcRenderer.invoke('export:pauseTask', taskId),
+    resumeTask: (taskId: string) =>
+      ipcRenderer.invoke('export:resumeTask', taskId),
+    cancelTask: (taskId: string) =>
+      ipcRenderer.invoke('export:cancelTask', taskId),
     exportSession: (sessionId: string, outputPath: string, options: any) =>
       ipcRenderer.invoke('export:exportSession', sessionId, outputPath, options),
     exportContacts: (outputDir: string, options: any) =>
@@ -543,7 +578,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   insight: {
     testConnection: () => ipcRenderer.invoke('insight:testConnection'),
     getTodayStats: () => ipcRenderer.invoke('insight:getTodayStats'),
+    listRecords: (filters?: any) => ipcRenderer.invoke('insight:listRecords', filters),
+    getRecord: (id: string) => ipcRenderer.invoke('insight:getRecord', id),
+    markRecordRead: (id: string) => ipcRenderer.invoke('insight:markRecordRead', id),
+    clearRecords: (filters?: any) => ipcRenderer.invoke('insight:clearRecords', filters),
     triggerTest: () => ipcRenderer.invoke('insight:triggerTest'),
+    triggerSessionInsight: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+    }) => ipcRenderer.invoke('insight:triggerSessionInsight', payload),
     generateFootprintInsight: (payload: {
       rangeLabel: string
       summary: {
@@ -556,7 +600,37 @@ contextBridge.exposeInMainWorld('electronAPI', {
       }
       privateSegments?: Array<{ displayName?: string; session_id?: string; incoming_count?: number; outgoing_count?: number; message_count?: number; replied?: boolean }>
       mentionGroups?: Array<{ displayName?: string; session_id?: string; count?: number }>
-    }) => ipcRenderer.invoke('insight:generateFootprintInsight', payload)
+    }) => ipcRenderer.invoke('insight:generateFootprintInsight', payload),
+    generateMessageInsight: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+      targetLocalId?: number
+      targetCreateTime?: number
+      targetMessageKey?: string
+      targetText: string
+      targetSenderName?: string
+      contextCount?: number
+      forceRefresh?: boolean
+    }) => ipcRenderer.invoke('insight:generateMessageInsight', payload)
+  },
+
+  groupSummary: {
+    listRecords: (filters?: any) => ipcRenderer.invoke('groupSummary:listRecords', filters),
+    getRecord: (id: string) => ipcRenderer.invoke('groupSummary:getRecord', id),
+    triggerManual: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+      startTime: number
+      endTime: number
+    }) => ipcRenderer.invoke('groupSummary:triggerManual', payload),
+    triggerDay: (payload: {
+      sessionId: string
+      displayName?: string
+      avatarUrl?: string
+      date: string
+    }) => ipcRenderer.invoke('groupSummary:triggerDay', payload)
   },
 
   social: {
@@ -564,4 +638,3 @@ contextBridge.exposeInMainWorld('electronAPI', {
     validateWeiboUid: (uid: string) => ipcRenderer.invoke('social:validateWeiboUid', uid)
   }
 })
-

@@ -27,6 +27,8 @@ import ResourcesPage from './pages/ResourcesPage'
 import ChatHistoryPage from './pages/ChatHistoryPage'
 import NotificationWindow from './pages/NotificationWindow'
 import AccountManagementPage from './pages/AccountManagementPage'
+import BackupPage from './pages/BackupPage'
+import InsightInboxPage from './pages/InsightInboxPage'
 
 import { useAppStore } from './stores/appStore'
 import { themes, useThemeStore, type ThemeId, type ThemeMode } from './stores/themeStore'
@@ -80,6 +82,8 @@ function App() {
   const isChatHistoryWindow = location.pathname.startsWith('/chat-history/') || location.pathname.startsWith('/chat-history-inline/')
   const isStandaloneChatWindow = location.pathname === '/chat-window'
   const isNotificationWindow = location.pathname === '/notification-window'
+  const isAnnualReportWindow = location.pathname === '/annual-report/view'
+  const isDualReportWindow = location.pathname === '/dual-report/view'
   const isSettingsRoute = location.pathname === '/settings'
   const settingsRouteState = location.state as { backgroundLocation?: Location; initialTab?: unknown } | null
   const routeLocation = isSettingsRoute
@@ -127,7 +131,7 @@ function App() {
     const body = document.body
     const appRoot = document.getElementById('app')
 
-    if (isOnboardingWindow || isNotificationWindow) {
+    if (isOnboardingWindow || isNotificationWindow || isAnnualReportWindow || isDualReportWindow) {
       root.style.background = 'transparent'
       body.style.background = 'transparent'
       body.style.overflow = 'hidden'
@@ -144,9 +148,9 @@ function App() {
         appRoot.style.overflow = ''
       }
     }
-  }, [isOnboardingWindow])
+  }, [isOnboardingWindow, isNotificationWindow, isAnnualReportWindow, isDualReportWindow])
 
-  // 应用主题
+  // 应用主题 (accent color + light/dark mode)
   useEffect(() => {
     const mq = window.matchMedia('(prefers-color-scheme: dark)')
     const applyMode = (mode: ThemeMode, systemDark?: boolean) => {
@@ -165,7 +169,7 @@ function App() {
     }
     mq.addEventListener('change', handler)
     return () => mq.removeEventListener('change', handler)
-  }, [currentTheme, themeMode, isOnboardingWindow, isNotificationWindow])
+  }, [currentTheme, themeMode, isOnboardingWindow, isNotificationWindow, isAnnualReportWindow, isDualReportWindow])
 
   // 读取已保存的主题设置
   useEffect(() => {
@@ -309,6 +313,19 @@ function App() {
       if (!sessionId) return
       // 导航到聊天页面，通过URL参数让ChatPage接收sessionId
       navigate(`/chat?sessionId=${encodeURIComponent(sessionId)}`, { replace: true })
+    })
+
+    return () => {
+      removeListener?.()
+    }
+  }, [navigate, isNotificationWindow])
+
+  useEffect(() => {
+    if (isNotificationWindow) return
+
+    const removeListener = window.electronAPI?.notification?.onNavigateToRoute?.((route: string) => {
+      if (!route || !route.startsWith('/')) return
+      navigate(route, { replace: true })
     })
 
     return () => {
@@ -511,6 +528,16 @@ function App() {
     return <NotificationWindow />
   }
 
+  // 独立年度报告全屏窗口
+  if (isAnnualReportWindow) {
+    return <AnnualReportWindow />
+  }
+
+  // 独立双人报告全屏窗口
+  if (isDualReportWindow) {
+    return <DualReportWindow />
+  }
+
   // 主窗口 - 完整布局
   const handleCloseSettings = () => {
     const backgroundLocation = settingsRouteState?.backgroundLocation ?? settingsBackgroundRef.current
@@ -690,9 +717,11 @@ function App() {
 
               <Route path="/export" element={<div className="export-route-anchor" aria-hidden="true" />} />
               <Route path="/sns" element={<SnsPage />} />
+              <Route path="/insight-inbox" element={<InsightInboxPage />} />
               <Route path="/biz" element={<BizPage />} />
               <Route path="/contacts" element={<ContactsPage />} />
               <Route path="/resources" element={<ResourcesPage />} />
+              <Route path="/backup" element={<BackupPage />} />
               <Route path="/chat-history/:sessionId/:messageId" element={<ChatHistoryPage />} />
               <Route path="/chat-history-inline/:payloadId" element={<ChatHistoryPage />} />
             </Routes>

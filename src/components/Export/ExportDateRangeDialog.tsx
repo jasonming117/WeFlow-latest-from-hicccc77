@@ -551,8 +551,13 @@ export function ExportDateRangeDialog({
   if (!open) return null
 
   return createPortal(
-    <div className="export-date-range-dialog-overlay" onClick={onClose}>
-      <div className="export-date-range-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
+    <div
+      className="export-date-range-dialog-overlay"
+      onClick={(event) => {
+        event.stopPropagation()
+        onClose()
+      }}
+    >      <div className="export-date-range-dialog" role="dialog" aria-modal="true" onClick={(event) => event.stopPropagation()}>
         <div className="export-date-range-dialog-header">
           <h4>{title}</h4>
           <button
@@ -565,6 +570,7 @@ export function ExportDateRangeDialog({
           </button>
         </div>
 
+        <div className="export-date-range-dialog-content">
         <div className="export-date-range-preset-list">
           {EXPORT_DATE_RANGE_PRESETS.map((preset) => {
             const active = isPresetActive(preset.value)
@@ -728,6 +734,7 @@ export function ExportDateRangeDialog({
             })}
           </div>
         </section>
+        </div>
 
         <div className="export-date-range-dialog-actions">
           <button type="button" className="export-date-range-dialog-btn secondary" onClick={onClose}>

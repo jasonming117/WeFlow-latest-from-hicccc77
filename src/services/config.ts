@@ -15,6 +15,7 @@ export const CONFIG_KEYS = {
   WINDOW_BOUNDS: 'windowBounds',
   CACHE_PATH: 'cachePath',
   LAUNCH_AT_STARTUP: 'launchAtStartup',
+  SILENT_STARTUP: 'silentStartup',
 
   EXPORT_PATH: 'exportPath',
   AGREEMENT_ACCEPTED: 'agreementAccepted',
@@ -65,6 +66,7 @@ export const CONFIG_KEYS = {
 
   // 通知
   NOTIFICATION_ENABLED: 'notificationEnabled',
+  AI_INSIGHT_NOTIFICATION_ENABLED: 'aiInsightNotificationEnabled',
   NOTIFICATION_POSITION: 'notificationPosition',
   NOTIFICATION_FILTER_MODE: 'notificationFilterMode',
   NOTIFICATION_FILTER_LIST: 'notificationFilterList',
@@ -96,7 +98,12 @@ export const CONFIG_KEYS = {
   AI_INSIGHT_API_MODEL: 'aiInsightApiModel',
   AI_INSIGHT_SILENCE_DAYS: 'aiInsightSilenceDays',
   AI_INSIGHT_ALLOW_CONTEXT: 'aiInsightAllowContext',
+  AI_INSIGHT_ALLOW_MOMENTS_CONTEXT: 'aiInsightAllowMomentsContext',
+  AI_INSIGHT_MOMENTS_CONTEXT_COUNT: 'aiInsightMomentsContextCount',
+  AI_INSIGHT_MOMENTS_BINDINGS: 'aiInsightMomentsBindings',
   AI_INSIGHT_ALLOW_SOCIAL_CONTEXT: 'aiInsightAllowSocialContext',
+  AI_INSIGHT_FILTER_MODE: 'aiInsightFilterMode',
+  AI_INSIGHT_FILTER_LIST: 'aiInsightFilterList',
   AI_INSIGHT_WHITELIST_ENABLED: 'aiInsightWhitelistEnabled',
   AI_INSIGHT_WHITELIST: 'aiInsightWhitelist',
   AI_INSIGHT_COOLDOWN_MINUTES: 'aiInsightCooldownMinutes',
@@ -113,7 +120,17 @@ export const CONFIG_KEYS = {
   // AI 足迹
   AI_FOOTPRINT_ENABLED: 'aiFootprintEnabled',
   AI_FOOTPRINT_SYSTEM_PROMPT: 'aiFootprintSystemPrompt',
-  AI_INSIGHT_DEBUG_LOG_ENABLED: 'aiInsightDebugLogEnabled'
+  AI_GROUP_SUMMARY_ENABLED: 'aiGroupSummaryEnabled',
+  AI_GROUP_SUMMARY_INTERVAL_HOURS: 'aiGroupSummaryIntervalHours',
+  AI_GROUP_SUMMARY_SYSTEM_PROMPT: 'aiGroupSummarySystemPrompt',
+  AI_GROUP_SUMMARY_FILTER_MODE: 'aiGroupSummaryFilterMode',
+  AI_GROUP_SUMMARY_FILTER_LIST: 'aiGroupSummaryFilterList',
+  AI_MESSAGE_INSIGHT_ENABLED: 'aiMessageInsightEnabled',
+  AI_MESSAGE_INSIGHT_CONTEXT_COUNT: 'aiMessageInsightContextCount',
+  AI_MESSAGE_INSIGHT_SYSTEM_PROMPT: 'aiMessageInsightSystemPrompt',
+  AI_INSIGHT_DEBUG_LOG_ENABLED: 'aiInsightDebugLogEnabled',
+  AUTO_DOWNLOAD_HIGH_RES: 'autoDownloadHighRes',
+  AUTO_DOWNLOAD_WHITELIST: 'autoDownloadWhitelist'
 } as const
 
 export interface WxidConfig {
@@ -126,6 +143,11 @@ export interface WxidConfig {
 export interface AiInsightWeiboBinding {
   uid: string
   screenName?: string
+  updatedAt: number
+}
+
+export interface AiInsightMomentsBinding {
+  enabled: boolean
   updatedAt: number
 }
 
@@ -184,10 +206,35 @@ export async function setDbPath(path: string): Promise<void> {
   await config.set(CONFIG_KEYS.DB_PATH, path)
 }
 
-// 获取当前用户 wxid
+// 清洗账号目录名称（移除后缀）
+function cleanAccountDirName(dirName: string): string {
+  const trimmed = dirName.trim()
+  if (!trimmed) return trimmed
+
+  // wxid_ 开头的特殊处理
+  if (trimmed.toLowerCase().startsWith('wxid_')) {
+    const match = trimmed.match(/^(wxid_[^_]+)/i)
+    if (match) return match[1]
+    return trimmed
+  }
+
+  // 移除4位后缀
+  const suffixMatch = trimmed.match(/^(.+)_([a-zA-Z0-9]{4})$/)
+  if (suffixMatch) return suffixMatch[1]
+
+  return trimmed
+}
+
+// 获取当前用户 wxid（原始值，可能带后缀）
 export async function getMyWxid(): Promise<string | null> {
   const value = await config.get(CONFIG_KEYS.MY_WXID)
   return value as string | null
+}
+
+// 获取当前用户 wxid（清洗后，不带后缀）
+export async function getMyWxidCleaned(): Promise<string | null> {
+  const value = await getMyWxid()
+  return value ? cleanAccountDirName(value) : null
 }
 
 // 设置当前用户 wxid
@@ -317,6 +364,17 @@ export async function getLaunchAtStartup(): Promise<boolean | null> {
 // 设置开机自启动偏好
 export async function setLaunchAtStartup(enabled: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.LAUNCH_AT_STARTUP, enabled)
+}
+
+// 获取静默启动偏好
+export async function getSilentStartup(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.SILENT_STARTUP)
+  return value === true
+}
+
+// 设置静默启动偏好
+export async function setSilentStartup(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.SILENT_STARTUP, enabled)
 }
 
 // 获取 LLM 模型路径
@@ -1653,6 +1711,15 @@ export async function setNotificationEnabled(enabled: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.NOTIFICATION_ENABLED, enabled)
 }
 
+export async function getAiInsightNotificationEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_NOTIFICATION_ENABLED)
+  return value !== false
+}
+
+export async function setAiInsightNotificationEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_NOTIFICATION_ENABLED, enabled)
+}
+
 // 获取通知位置
 export async function getNotificationPosition(): Promise<'top-right' | 'top-left' | 'bottom-right' | 'bottom-left'> {
   const value = await config.get(CONFIG_KEYS.NOTIFICATION_POSITION)
@@ -1844,13 +1911,13 @@ export async function getAiModelApiMaxTokens(): Promise<number> {
   if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
     return Math.floor(value)
   }
-  return 200
+  return 1024
 }
 
 export async function setAiModelApiMaxTokens(maxTokens: number): Promise<void> {
   const normalized = Number.isFinite(maxTokens)
-    ? Math.min(65535, Math.max(1, Math.floor(maxTokens)))
-    : 200
+    ? Math.min(2000000, Math.max(1, Math.floor(maxTokens)))
+    : 1024
   await config.set(CONFIG_KEYS.AI_MODEL_API_MAX_TOKENS, normalized)
 }
 
@@ -1908,6 +1975,24 @@ export async function setAiInsightAllowContext(allow: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.AI_INSIGHT_ALLOW_CONTEXT, allow)
 }
 
+export async function getAiInsightAllowMomentsContext(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_ALLOW_MOMENTS_CONTEXT)
+  return value === true
+}
+
+export async function setAiInsightAllowMomentsContext(allow: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_ALLOW_MOMENTS_CONTEXT, allow)
+}
+
+export async function getAiInsightMomentsContextCount(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_MOMENTS_CONTEXT_COUNT)
+  return typeof value === 'number' && value > 0 ? value : 5
+}
+
+export async function setAiInsightMomentsContextCount(count: number): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_MOMENTS_CONTEXT_COUNT, count)
+}
+
 export async function getAiInsightAllowSocialContext(): Promise<boolean> {
   const value = await config.get(CONFIG_KEYS.AI_INSIGHT_ALLOW_SOCIAL_CONTEXT)
   return value === true
@@ -1917,22 +2002,49 @@ export async function setAiInsightAllowSocialContext(allow: boolean): Promise<vo
   await config.set(CONFIG_KEYS.AI_INSIGHT_ALLOW_SOCIAL_CONTEXT, allow)
 }
 
+export type AiInsightFilterMode = 'whitelist' | 'blacklist'
+
+const normalizeAiInsightFilterList = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  return Array.from(new Set(value.map((item) => String(item || '').trim()).filter(Boolean)))
+}
+
+export async function getAiInsightFilterMode(): Promise<AiInsightFilterMode> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_FILTER_MODE)
+  if (value === 'blacklist') return 'blacklist'
+  if (value === 'whitelist') return 'whitelist'
+  return 'whitelist'
+}
+
+export async function setAiInsightFilterMode(mode: AiInsightFilterMode): Promise<void> {
+  const normalizedMode: AiInsightFilterMode = mode === 'blacklist' ? 'blacklist' : 'whitelist'
+  await config.set(CONFIG_KEYS.AI_INSIGHT_FILTER_MODE, normalizedMode)
+}
+
+export async function getAiInsightFilterList(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_FILTER_LIST)
+  return normalizeAiInsightFilterList(value)
+}
+
+export async function setAiInsightFilterList(list: string[]): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_FILTER_LIST, normalizeAiInsightFilterList(list))
+}
+
+// 兼容旧字段命名：内部已映射到新的黑白名单模式
 export async function getAiInsightWhitelistEnabled(): Promise<boolean> {
-  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_WHITELIST_ENABLED)
-  return value === true
+  return (await getAiInsightFilterMode()) === 'whitelist'
 }
 
 export async function setAiInsightWhitelistEnabled(enabled: boolean): Promise<void> {
-  await config.set(CONFIG_KEYS.AI_INSIGHT_WHITELIST_ENABLED, enabled)
+  await setAiInsightFilterMode(enabled ? 'whitelist' : 'blacklist')
 }
 
 export async function getAiInsightWhitelist(): Promise<string[]> {
-  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_WHITELIST)
-  return Array.isArray(value) ? (value as string[]) : []
+  return getAiInsightFilterList()
 }
 
 export async function setAiInsightWhitelist(list: string[]): Promise<void> {
-  await config.set(CONFIG_KEYS.AI_INSIGHT_WHITELIST, list)
+  await setAiInsightFilterList(list)
 }
 
 export async function getAiInsightCooldownMinutes(): Promise<number> {
@@ -2026,6 +2138,33 @@ export async function setAiInsightWeiboBindings(bindings: Record<string, AiInsig
   await config.set(CONFIG_KEYS.AI_INSIGHT_WEIBO_BINDINGS, bindings)
 }
 
+const normalizeAiInsightMomentsBindings = (value: unknown): Record<string, AiInsightMomentsBinding> => {
+  if (!value || typeof value !== 'object') return {}
+  const result: Record<string, AiInsightMomentsBinding> = {}
+  for (const [sessionIdRaw, bindingRaw] of Object.entries(value as Record<string, unknown>)) {
+    const sessionId = String(sessionIdRaw || '').trim()
+    if (!sessionId) continue
+    if (!bindingRaw || typeof bindingRaw !== 'object') continue
+    const bindingObj = bindingRaw as { enabled?: unknown; updatedAt?: unknown }
+    if (bindingObj.enabled !== true) continue
+    const updatedAtRaw = Number(bindingObj.updatedAt)
+    result[sessionId] = {
+      enabled: true,
+      updatedAt: Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? Math.floor(updatedAtRaw) : Date.now()
+    }
+  }
+  return result
+}
+
+export async function getAiInsightMomentsBindings(): Promise<Record<string, AiInsightMomentsBinding>> {
+  const value = await config.get(CONFIG_KEYS.AI_INSIGHT_MOMENTS_BINDINGS)
+  return normalizeAiInsightMomentsBindings(value)
+}
+
+export async function setAiInsightMomentsBindings(bindings: Record<string, AiInsightMomentsBinding>): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_INSIGHT_MOMENTS_BINDINGS, normalizeAiInsightMomentsBindings(bindings))
+}
+
 export async function getAiFootprintEnabled(): Promise<boolean> {
   const value = await config.get(CONFIG_KEYS.AI_FOOTPRINT_ENABLED)
   return value === true
@@ -2044,6 +2183,97 @@ export async function setAiFootprintSystemPrompt(prompt: string): Promise<void> 
   await config.set(CONFIG_KEYS.AI_FOOTPRINT_SYSTEM_PROMPT, prompt)
 }
 
+// Legacy only: 群聊总结现在只使用 aiGroupSummaryFilterList 作为作用域白名单。
+export type AiGroupSummaryFilterMode = 'whitelist' | 'blacklist'
+
+const AI_GROUP_SUMMARY_INTERVALS = new Set([1, 2, 4, 8, 12, 24])
+
+const normalizeAiGroupSummaryFilterList = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return []
+  return Array.from(new Set(
+    value
+      .map((item) => String(item || '').trim())
+      .filter((item) => item.endsWith('@chatroom'))
+  ))
+}
+
+export async function getAiGroupSummaryEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_ENABLED)
+  return value === true
+}
+
+export async function setAiGroupSummaryEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_ENABLED, enabled)
+}
+
+export async function getAiGroupSummaryIntervalHours(): Promise<number> {
+  const value = Number(await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_INTERVAL_HOURS))
+  const normalized = Number.isFinite(value) ? Math.floor(value) : 4
+  return AI_GROUP_SUMMARY_INTERVALS.has(normalized) ? normalized : 4
+}
+
+export async function setAiGroupSummaryIntervalHours(hours: number): Promise<void> {
+  const normalized = Math.floor(Number(hours) || 4)
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_INTERVAL_HOURS, AI_GROUP_SUMMARY_INTERVALS.has(normalized) ? normalized : 4)
+}
+
+export async function getAiGroupSummarySystemPrompt(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_SYSTEM_PROMPT)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiGroupSummarySystemPrompt(prompt: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_SYSTEM_PROMPT, prompt)
+}
+
+export async function getAiGroupSummaryFilterMode(): Promise<AiGroupSummaryFilterMode> {
+  const value = await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_FILTER_MODE)
+  return value === 'blacklist' ? 'blacklist' : 'whitelist'
+}
+
+export async function setAiGroupSummaryFilterMode(mode: AiGroupSummaryFilterMode): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_FILTER_MODE, mode === 'blacklist' ? 'blacklist' : 'whitelist')
+}
+
+export async function getAiGroupSummaryFilterList(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.AI_GROUP_SUMMARY_FILTER_LIST)
+  return normalizeAiGroupSummaryFilterList(value)
+}
+
+export async function setAiGroupSummaryFilterList(list: string[]): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_GROUP_SUMMARY_FILTER_LIST, normalizeAiGroupSummaryFilterList(list))
+}
+
+export async function getAiMessageInsightEnabled(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AI_MESSAGE_INSIGHT_ENABLED)
+  return value === true
+}
+
+export async function setAiMessageInsightEnabled(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MESSAGE_INSIGHT_ENABLED, enabled)
+}
+
+export async function getAiMessageInsightContextCount(): Promise<number> {
+  const value = await config.get(CONFIG_KEYS.AI_MESSAGE_INSIGHT_CONTEXT_COUNT)
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return 50
+  return Math.max(1, Math.min(200, Math.floor(numeric)))
+}
+
+export async function setAiMessageInsightContextCount(count: number): Promise<void> {
+  const normalized = Number.isFinite(count) ? Math.max(1, Math.min(200, Math.floor(count))) : 50
+  await config.set(CONFIG_KEYS.AI_MESSAGE_INSIGHT_CONTEXT_COUNT, normalized)
+}
+
+export async function getAiMessageInsightSystemPrompt(): Promise<string> {
+  const value = await config.get(CONFIG_KEYS.AI_MESSAGE_INSIGHT_SYSTEM_PROMPT)
+  return typeof value === 'string' ? value : ''
+}
+
+export async function setAiMessageInsightSystemPrompt(prompt: string): Promise<void> {
+  await config.set(CONFIG_KEYS.AI_MESSAGE_INSIGHT_SYSTEM_PROMPT, prompt)
+}
+
 export async function getAiInsightDebugLogEnabled(): Promise<boolean> {
   const value = await config.get(CONFIG_KEYS.AI_INSIGHT_DEBUG_LOG_ENABLED)
   return value === true
@@ -2051,5 +2281,24 @@ export async function getAiInsightDebugLogEnabled(): Promise<boolean> {
 
 export async function setAiInsightDebugLogEnabled(enabled: boolean): Promise<void> {
   await config.set(CONFIG_KEYS.AI_INSIGHT_DEBUG_LOG_ENABLED, enabled)
+}
+
+export async function getAutoDownloadHighRes(): Promise<boolean> {
+  const value = await config.get(CONFIG_KEYS.AUTO_DOWNLOAD_HIGH_RES)
+  return value === true
+}
+
+export async function setAutoDownloadHighRes(enabled: boolean): Promise<void> {
+  await config.set(CONFIG_KEYS.AUTO_DOWNLOAD_HIGH_RES, enabled)
+}
+
+export async function getAutoDownloadWhitelist(): Promise<string[]> {
+  const value = await config.get(CONFIG_KEYS.AUTO_DOWNLOAD_WHITELIST)
+  return Array.isArray(value) ? value : []
+}
+
+export async function setAutoDownloadWhitelist(list: string[]): Promise<void> {
+  const normalized = Array.from(new Set((list || []).map(item => String(item || '').trim()).filter(Boolean)))
+  await config.set(CONFIG_KEYS.AUTO_DOWNLOAD_WHITELIST, normalized)
 }
 

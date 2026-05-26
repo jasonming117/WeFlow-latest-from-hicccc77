@@ -76,5 +76,5 @@ wechat-research-site
 .codex
 weflow-web-offical
 /Wedecrypt
-.codebuddy/
-.DS_Store
+/scripts/syncwcdb.py
+/scripts/syncWedecrypt.py
