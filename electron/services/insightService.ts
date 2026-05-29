@@ -1,4 +1,4 @@
-﻿/**
+/**
  * insightService.ts
  *
  * AI 见解后台服务：
@@ -47,6 +47,18 @@ const API_MAX_TOKENS_MIN = 1
 const API_MAX_TOKENS_MAX = 2_000_000
 const API_TEMPERATURE = 0.7
 const INSIGHT_NOTIFICATION_AVATAR_URL = './assets/insight/AI_Insight.png'
+const MIMO_FOOTPRINT_MIN_TOKENS = 4096
+const FOOTPRINT_API_TEMPERATURE = 0.2
+
+const DEFAULT_FOOTPRINT_SYSTEM_PROMPT = `你是“我的微信足迹”模块的总结器，只能根据用户提供的统计数据生成最终复盘文案。
+硬性输出规则：
+1. 只输出最终总结正文，不输出思考过程、步骤、标题、列表、JSON、Markdown、代码块、引号或字段名。
+2. 输出 2 句中文，总长度 60-160 字，最多 180 字。
+3. 第 1 句概括联络活跃度、回复情况或 @我情况；第 2 句给出一个当天/当前范围内可执行的沟通建议。
+4. 必须引用至少 2 个输入数字，例如人数、回复率、@我次数或群聊数。
+5. 数据为 0 时如实说明，不臆测具体聊天内容、关系、情绪、诊断或原因。
+6. 禁止出现“首先”“其次”“根据”“综上”“作为AI”“我认为”“以下是”等过程性表达。
+输出格式：直接输出两句自然中文。`
 
 /** 沉默天数阈值默认值 */
 const DEFAULT_SILENCE_DAYS = 3
@@ -95,6 +107,13 @@ interface SessionInsightTriggerResult {
 }
 
 type InsightFilterMode = 'whitelist' | 'blacklist'
+
+interface CallApiOptions {
+  temperature?: number
+  disableThinking?: boolean
+  useMaxCompletionTokens?: boolean
+  responseFormatJson?: boolean
+}
 
 class ApiRequestError extends Error {
   statusCode?: number
@@ -188,6 +207,54 @@ function normalizeSessionIdList(value: unknown): string[] {
   return Array.from(new Set(value.map((item) => String(item || '').trim()).filter(Boolean)))
 }
 
+function isMimoModel(apiBaseUrl: string, model: string): boolean {
+  const target = `${apiBaseUrl} ${model}`.toLowerCase()
+  return target.includes('mimo') || target.includes('xiaomi')
+}
+
+function buildFootprintSystemPrompt(customPrompt: string): string {
+  const custom = String(customPrompt || '').trim()
+  if (!custom || custom === DEFAULT_FOOTPRINT_SYSTEM_PROMPT) {
+    return DEFAULT_FOOTPRINT_SYSTEM_PROMPT
+  }
+  return `${DEFAULT_FOOTPRINT_SYSTEM_PROMPT}
+
+用户自定义补充要求如下，只能在不违反上述硬性输出规则时执行：
+${custom}`
+}
+
+function normalizeFootprintInsight(text: string): string {
+  let normalized = String(text || '').trim()
+  if (!normalized) return ''
+
+  if (normalized.startsWith('{') && normalized.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(normalized)
+      const value = parsed?.summary || parsed?.insight || parsed?.content || parsed?.text
+      if (typeof value === 'string' && value.trim()) {
+        normalized = value.trim()
+      }
+    } catch { }
+  }
+
+  normalized = normalized
+    .replace(/^```(?:text|markdown|md|json)?/i, '')
+    .replace(/```$/i, '')
+    .replace(/^(足迹复盘|AI足迹总结|AI 足迹总结|总结|建议)[:：]\s*/i, '')
+    .replace(/^\s*[-*•]\s*/gm, '')
+    .replace(/\s*\n+\s*/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+
+  if (normalized.length > 180) {
+    const sliced = normalized.slice(0, 180)
+    const lastStop = Math.max(sliced.lastIndexOf('。'), sliced.lastIndexOf('！'), sliced.lastIndexOf('？'))
+    normalized = lastStop >= 60 ? sliced.slice(0, lastStop + 1) : `${sliced.replace(/[，,；;、\s]+$/g, '')}。`
+  }
+
+  return normalized
+}
+
 function clampText(value: unknown, maxLength: number): string {
   const text = String(value || '').replace(/\s+/g, ' ').trim()
   if (text.length <= maxLength) return text
@@ -245,7 +312,7 @@ function callApi(
   messages: Array<{ role: string; content: string }>,
   timeoutMs: number = API_TIMEOUT_MS,
   maxTokens: number = API_MAX_TOKENS_DEFAULT,
-  options?: { responseFormatJson?: boolean }
+  options: CallApiOptions = {}
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const endpoint = buildApiUrl(apiBaseUrl, '/chat/completions')
@@ -257,12 +324,21 @@ function callApi(
       return
     }
 
+    const normalizedMaxTokens = normalizeApiMaxTokens(maxTokens)
     const payload: Record<string, unknown> = {
       model,
       messages,
-      max_tokens: normalizeApiMaxTokens(maxTokens),
-      temperature: API_TEMPERATURE,
+      temperature: options.temperature ?? API_TEMPERATURE,
       stream: false
+    }
+    if (options.useMaxCompletionTokens) {
+      payload.max_completion_tokens = normalizedMaxTokens
+    } else {
+      payload.max_tokens = normalizedMaxTokens
+    }
+    if (options.disableThinking) {
+      payload.thinking = { type: 'disabled' }
+      payload.enable_thinking = false
     }
     if (options?.responseFormatJson) {
       payload.response_format = { type: 'json_object' }
@@ -297,7 +373,13 @@ function callApi(
           if (typeof content === 'string' && content.trim()) {
             resolve(content.trim())
           } else {
-            reject(new Error(`API 返回格式异常: ${data.slice(0, 200)}`))
+            const finishReason = parsed?.choices?.[0]?.finish_reason
+            const reasoningContent = parsed?.choices?.[0]?.message?.reasoning_content
+            if (typeof reasoningContent === 'string' && reasoningContent.trim()) {
+              reject(new Error(`API 仅返回推理内容未返回正文${finishReason ? `（finish_reason=${finishReason}）` : ''}，请增大最大输出 Token 或关闭思考模式`))
+              return
+            }
+            reject(new Error(`API 返回格式异常${finishReason ? `（finish_reason=${finishReason}）` : ''}: ${data.slice(0, 200)}`))
           }
         } catch (e) {
           reject(new Error(`JSON 解析失败: ${data.slice(0, 200)}`))
@@ -652,6 +734,7 @@ class InsightService {
     const rangeLabel = String(params?.rangeLabel || '').trim() || '当前范围'
     const privateSegments = Array.isArray(params?.privateSegments) ? params.privateSegments.slice(0, 6) : []
     const mentionGroups = Array.isArray(params?.mentionGroups) ? params.mentionGroups.slice(0, 6) : []
+    const mimoMode = isMimoModel(apiBaseUrl, model)
 
     const topPrivateText = privateSegments.length > 0
       ? privateSegments
@@ -675,20 +758,31 @@ class InsightService {
         .join('\n')
       : '无'
 
-    const defaultSystemPrompt = `你是用户的聊天足迹教练，负责基于统计数据给出一段简明复盘。
-要求：
-1. 输出 2-3 句，总长度不超过 180 字。
-2. 必须包含：总体观察 + 一个可执行建议。
-3. 语气务实，不夸张，不使用 Markdown。`
     const customPrompt = String(this.config.get('aiFootprintSystemPrompt') || '').trim()
-    const systemPrompt = customPrompt || defaultSystemPrompt
+    const systemPrompt = buildFootprintSystemPrompt(customPrompt)
 
-    const userPromptBase = `统计范围：${rangeLabel}
-有聊天的人数：${Number(summary.private_inbound_people) || 0}
-我有回复的人数：${Number(summary.private_outbound_people) || 0}
-回复率：${(((Number(summary.private_reply_rate) || 0) * 100)).toFixed(1)}%
-@我次数：${Number(summary.mention_count) || 0}
-涉及群聊：${Number(summary.mention_group_count) || 0}
+    const inboundPeople = Number(summary.private_inbound_people) || 0
+    const repliedPeople = Number(summary.private_replied_people) || 0
+    const outboundPeople = Number(summary.private_outbound_people) || 0
+    const replyRate = (((Number(summary.private_reply_rate) || 0) * 100)).toFixed(1)
+    const mentionCount = Number(summary.mention_count) || 0
+    const mentionGroupCount = Number(summary.mention_group_count) || 0
+
+    const userPromptBase = `任务：基于下面的“我的微信足迹”统计生成最终总结正文。
+
+输出要求再强调一次：
+- 只输出 2 句中文自然语言，不要输出分析过程。
+- 不要输出 JSON / Markdown / 列表 / 标题 / 代码块。
+- 第 1 句做总体观察，第 2 句给一个可执行建议。
+- 必须引用至少 2 个统计数字。
+
+统计范围：${rangeLabel}
+有聊天的人数：${inboundPeople}
+我有回复的人数：${outboundPeople}
+实际回复了其中：${repliedPeople}
+回复率：${replyRate}%
+@我次数：${mentionCount}
+涉及群聊：${mentionGroupCount}
 
 私聊重点：
 ${topPrivateText}
@@ -696,7 +790,7 @@ ${topPrivateText}
 群聊@我重点：
 ${topMentionText}
 
-请给出足迹复盘（2-3句，含建议）：`
+现在直接输出最终总结正文：`
     const userPrompt = appendPromptCurrentTime(userPromptBase)
 
     try {
@@ -709,9 +803,14 @@ ${topMentionText}
           { role: 'user', content: userPrompt }
         ],
         25_000,
-        maxTokens
+        mimoMode ? Math.max(maxTokens, MIMO_FOOTPRINT_MIN_TOKENS) : maxTokens,
+        {
+          temperature: FOOTPRINT_API_TEMPERATURE,
+          disableThinking: mimoMode,
+          useMaxCompletionTokens: mimoMode
+        }
       )
-      const insight = result.trim()
+      const insight = normalizeFootprintInsight(result)
       if (!insight) return { success: false, message: '模型返回为空' }
       return { success: true, message: '生成成功', insight }
     } catch (error) {
@@ -1671,5 +1770,3 @@ ${afterText}
 }
 
 export const insightService = new InsightService()
-
-

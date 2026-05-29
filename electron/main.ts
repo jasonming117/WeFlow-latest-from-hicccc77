@@ -3561,6 +3561,10 @@ function registerIpcHandlers() {
     return analyticsService.getTimeDistribution()
   })
 
+  ipcMain.handle('analytics:getSelfSentDailyDistribution', async (_, beginTimestamp?: number, endTimestamp?: number, force?: boolean) => {
+    return analyticsService.getSelfSentDailyDistribution(beginTimestamp, endTimestamp, force)
+  })
+
   ipcMain.handle('analytics:getExcludedUsernames', async () => {
     return analyticsService.getExcludedUsernames()
   })

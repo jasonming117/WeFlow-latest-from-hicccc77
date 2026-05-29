@@ -929,6 +929,19 @@ export interface ElectronAPI {
       }
       error?: string
     }>
+    getSelfSentDailyDistribution: (beginTimestamp?: number, endTimestamp?: number, force?: boolean) => Promise<{
+      success: boolean
+      data?: {
+        unit: 'day'
+        dailyDistribution: Record<string, number>
+        totalMessages: number
+        firstMessageTime: number | null
+        lastMessageTime: number | null
+        beginTimestamp: number
+        endTimestamp: number
+      }
+      error?: string
+    }>
     getExcludedUsernames: () => Promise<{
       success: boolean
       data?: string[]

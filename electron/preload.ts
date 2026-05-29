@@ -399,6 +399,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getContactRankings: (limit?: number, beginTimestamp?: number, endTimestamp?: number) =>
       ipcRenderer.invoke('analytics:getContactRankings', limit, beginTimestamp, endTimestamp),
     getTimeDistribution: () => ipcRenderer.invoke('analytics:getTimeDistribution'),
+    getSelfSentDailyDistribution: (beginTimestamp?: number, endTimestamp?: number, force?: boolean) =>
+      ipcRenderer.invoke('analytics:getSelfSentDailyDistribution', beginTimestamp, endTimestamp, force),
     getExcludedUsernames: () => ipcRenderer.invoke('analytics:getExcludedUsernames'),
     setExcludedUsernames: (usernames: string[]) => ipcRenderer.invoke('analytics:setExcludedUsernames', usernames),
     getExcludeCandidates: () => ipcRenderer.invoke('analytics:getExcludeCandidates'),
