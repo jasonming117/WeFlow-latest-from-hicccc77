@@ -232,12 +232,13 @@ const EXPORT_PROGRESS_UI_FLUSH_INTERVAL_MS = 320
 const SESSION_MEDIA_METRIC_PREFETCH_ROWS = 10
 const SESSION_MEDIA_METRIC_BATCH_SIZE = 8
 const SESSION_MEDIA_METRIC_BACKGROUND_FEED_SIZE = 48
-const SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS = 120
 const SESSION_MEDIA_METRIC_CACHE_FLUSH_DELAY_MS = 1200
+const SESSION_DETAIL_BACKGROUND_METRIC_LIMIT_PER_TAB = 96
 const SNS_USER_POST_COUNT_BATCH_SIZE = 12
 const SNS_USER_POST_COUNT_BATCH_INTERVAL_MS = 120
 const SNS_RANK_PAGE_SIZE = 50
 const SNS_RANK_DISPLAY_LIMIT = 15
+const INLINE_AVATAR_CACHE_MAX_LENGTH = 4096
 const contentTypeLabels: Record<ContentType, string> = {
   text: '聊天文本',
   voice: '语音',
@@ -796,6 +797,13 @@ const normalizeExportAvatarUrl = (value?: string | null): string | undefined => 
   return normalized
 }
 
+const shouldPersistExportAvatarUrl = (value?: string | null): value is string => {
+  const normalized = normalizeExportAvatarUrl(value)
+  if (!normalized) return false
+  if (!normalized.startsWith('data:')) return true
+  return normalized.length <= INLINE_AVATAR_CACHE_MAX_LENGTH
+}
+
 const toComparableNameSet = (values: Array<string | undefined | null>): Set<string> => {
   const set = new Set<string>()
   for (const value of values) {
@@ -1306,6 +1314,15 @@ const buildSessionMutualFriendsMetric = (
   }
 }
 
+const cloneCompactSessionMutualFriendsMetric = (
+  metric: SessionMutualFriendsMetric,
+  limit = SNS_RANK_DISPLAY_LIMIT
+): SessionMutualFriendsMetric => ({
+  ...metric,
+  items: metric.items.slice(0, Math.max(0, limit)),
+  count: metric.count
+})
+
 const getSessionMutualFriendDirectionLabel = (direction: SessionMutualFriendDirection): string => {
   if (direction === 'incoming') return '对方赞/评TA'
   if (direction === 'outgoing') return 'TA赞/评对方'
@@ -1435,12 +1452,45 @@ const toContactMapFromCaches = (
   const map: Record<string, ContactInfo> = {}
   for (const contact of contacts || []) {
     if (!contact?.username) continue
+    const cachedAvatarUrl = avatarEntries[contact.username]?.avatarUrl
     map[contact.username] = {
       ...contact,
-      avatarUrl: avatarEntries[contact.username]?.avatarUrl
+      avatarUrl: shouldPersistExportAvatarUrl(cachedAvatarUrl) ? cachedAvatarUrl : undefined
     }
   }
   return map
+}
+
+const compactExportAvatarEntries = (
+  avatarEntries: Record<string, configService.ContactsAvatarCacheEntry>
+): {
+  avatarEntries: Record<string, configService.ContactsAvatarCacheEntry>
+  changed: boolean
+} => {
+  const nextCache: Record<string, configService.ContactsAvatarCacheEntry> = {}
+  let changed = false
+  for (const [username, entry] of Object.entries(avatarEntries || {})) {
+    const normalizedUsername = String(username || '').trim()
+    const avatarUrl = normalizeExportAvatarUrl(entry?.avatarUrl)
+    if (!normalizedUsername || !shouldPersistExportAvatarUrl(avatarUrl)) {
+      changed = true
+      continue
+    }
+    nextCache[normalizedUsername] = {
+      avatarUrl,
+      updatedAt: Number(entry?.updatedAt || 0) || Date.now(),
+      checkedAt: Number(entry?.checkedAt || 0) || Date.now()
+    }
+    if (
+      normalizedUsername !== username ||
+      avatarUrl !== entry?.avatarUrl ||
+      nextCache[normalizedUsername].updatedAt !== entry?.updatedAt ||
+      nextCache[normalizedUsername].checkedAt !== entry?.checkedAt
+    ) {
+      changed = true
+    }
+  }
+  return { avatarEntries: nextCache, changed }
 }
 
 const mergeAvatarCacheIntoContacts = (
@@ -1454,7 +1504,7 @@ const mergeAvatarCacheIntoContacts = (
   let changed = false
   const merged = sourceContacts.map((contact) => {
     const cachedAvatar = avatarEntries[contact.username]?.avatarUrl
-    if (!cachedAvatar || contact.avatarUrl) {
+    if (!shouldPersistExportAvatarUrl(cachedAvatar) || contact.avatarUrl) {
       return contact
     }
     changed = true
@@ -1476,19 +1526,20 @@ const upsertAvatarCacheFromContacts = (
   changed: boolean
   updatedAt: number | null
 } => {
-  const nextCache = { ...avatarEntries }
+  const compactedCache = compactExportAvatarEntries(avatarEntries)
+  const nextCache = { ...compactedCache.avatarEntries }
   const now = options?.now || Date.now()
   const markCheckedSet = new Set((options?.markCheckedUsernames || []).filter(Boolean))
   const usernamesInSource = new Set<string>()
-  let changed = false
+  let changed = compactedCache.changed
 
   for (const contact of sourceContacts) {
     const username = String(contact.username || '').trim()
     if (!username) continue
     usernamesInSource.add(username)
     const prev = nextCache[username]
-    const avatarUrl = String(contact.avatarUrl || '').trim()
-    if (!avatarUrl) continue
+    const avatarUrl = normalizeExportAvatarUrl(contact.avatarUrl)
+    if (!shouldPersistExportAvatarUrl(avatarUrl)) continue
     const updatedAt = !prev || prev.avatarUrl !== avatarUrl ? now : prev.updatedAt
     const checkedAt = markCheckedSet.has(username) ? now : (prev?.checkedAt || now)
     if (!prev || prev.avatarUrl !== avatarUrl || prev.updatedAt !== updatedAt || prev.checkedAt !== checkedAt) {
@@ -2459,6 +2510,7 @@ function ExportPage() {
   const hasBaseConfigReadyRef = useRef(false)
   const sessionCountRequestIdRef = useRef(0)
   const isLoadingSessionCountsRef = useRef(false)
+  const isExportRouteRef = useRef(isExportRoute)
   const activeTabRef = useRef<ConversationTab>('private')
   const detailStatsPriorityRef = useRef(false)
   const sessionSnsTimelinePostsRef = useRef<SnsPost[]>([])
@@ -2499,6 +2551,8 @@ function ExportPage() {
     startIndex: 0,
     endIndex: -1
   })
+  const enqueueSessionMutualFriendsRequestsRef = useRef<(sessionIds: string[], options?: { front?: boolean }) => void>(() => {})
+  const scheduleSessionMutualFriendsWorkerRef = useRef<() => void>(() => {})
 
   const handleContactsListScrollParentRef = useCallback((node: HTMLDivElement | null) => {
     setContactsListScrollParent(prev => (prev === node ? prev : node))
@@ -2611,6 +2665,10 @@ function ExportPage() {
   useEffect(() => {
     isLoadingSessionCountsRef.current = isLoadingSessionCounts
   }, [isLoadingSessionCounts])
+
+  useEffect(() => {
+    isExportRouteRef.current = isExportRoute
+  }, [isExportRoute])
 
   useEffect(() => {
     sessionContentMetricsRef.current = sessionContentMetrics
@@ -2895,7 +2953,7 @@ function ExportPage() {
 
     let avatarCacheChanged = false
     for (const [username, patch] of avatarPatches.entries()) {
-      if (!patch.avatarUrl) continue
+      if (!shouldPersistExportAvatarUrl(patch.avatarUrl)) continue
       const previous = contactsAvatarCacheRef.current[username]
       if (previous?.avatarUrl === patch.avatarUrl) continue
       contactsAvatarCacheRef.current[username] = {
@@ -3220,7 +3278,7 @@ function ExportPage() {
     }
   }, [])
 
-  const loadSnsUserPostCounts = useCallback(async (options?: { force?: boolean }) => {
+  const loadSnsUserPostCounts = useCallback(async (options?: { force?: boolean; cacheOnly?: boolean }) => {
     if (snsUserPostCountsStatus === 'loading') return
     if (!options?.force && snsUserPostCountsStatus === 'ready') return
 
@@ -3268,6 +3326,10 @@ function ExportPage() {
       ? targetSessionIds
       : targetSessionIds.filter((sessionId) => !(sessionId in cachedTargetCounts))
     if (pendingSessionIds.length === 0) {
+      setSnsUserPostCountsStatus('ready')
+      return
+    }
+    if (options?.cacheOnly) {
       setSnsUserPostCountsStatus('ready')
       return
     }
@@ -3442,7 +3504,7 @@ function ExportPage() {
     const username = String(sessionSnsTimelineTarget?.username || '').trim()
     if (!username) return false
     if (Object.prototype.hasOwnProperty.call(snsUserPostCounts, username)) return false
-    return snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle'
+    return snsUserPostCountsStatus === 'loading'
   }, [sessionSnsTimelineTarget, snsUserPostCounts, snsUserPostCountsStatus])
 
   const openSessionSnsTimelineByTarget = useCallback((target: SessionSnsTimelineTarget) => {
@@ -3468,11 +3530,11 @@ function ExportPage() {
       setSessionSnsRankTotalPosts(normalizedCount)
     } else {
       setSessionSnsTimelineTotalPosts(null)
-      setSessionSnsTimelineStatsLoading(snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle')
+      setSessionSnsTimelineStatsLoading(snsUserPostCountsStatus === 'loading')
       setSessionSnsRankTotalPosts(null)
     }
 
-    void loadSnsUserPostCounts()
+    void loadSnsUserPostCounts({ cacheOnly: true })
   }, [
     loadSnsUserPostCounts,
     snsUserPostCounts,
@@ -3506,7 +3568,11 @@ function ExportPage() {
     const normalizedSessionId = String(contact?.username || '').trim()
     if (!normalizedSessionId || !isSingleContactSession(normalizedSessionId)) return
     const metric = sessionMutualFriendsMetricsRef.current[normalizedSessionId]
-    if (!metric) return
+    if (!metric) {
+      enqueueSessionMutualFriendsRequestsRef.current([normalizedSessionId], { front: true })
+      scheduleSessionMutualFriendsWorkerRef.current()
+      return
+    }
     setSessionMutualFriendsSearch('')
     setSessionMutualFriendsDialogTarget({
       username: normalizedSessionId,
@@ -3848,6 +3914,21 @@ function ExportPage() {
     }
   }, [])
 
+  const stopExportPageBackgroundLoaders = useCallback(() => {
+    sessionLoadTokenRef.current = Date.now()
+    sessionCountRequestIdRef.current += 1
+    snsUserPostCountsHydrationTokenRef.current += 1
+    if (snsUserPostCountsBatchTimerRef.current) {
+      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
+      snsUserPostCountsBatchTimerRef.current = null
+    }
+    resetSessionMediaMetricLoader()
+    resetSessionMutualFriendsLoader()
+    setIsSessionEnriching(false)
+    setIsLoadingSessionCounts(false)
+    setSnsUserPostCountsStatus(prev => (prev === 'loading' ? 'idle' : prev))
+  }, [resetSessionMediaMetricLoader, resetSessionMutualFriendsLoader])
+
   const flushSessionMutualFriendsCache = useCallback(async () => {
     try {
       const scopeKey = await ensureExportCacheScope()
@@ -3880,6 +3961,7 @@ function ExportPage() {
   }, [])
 
   const enqueueSessionMutualFriendsRequests = useCallback((sessionIds: string[], options?: { front?: boolean }) => {
+    if (!isExportRouteRef.current) return
     if (activeTaskCountRef.current > 0) return
     const front = options?.front === true
     const incoming: string[] = []
@@ -3901,13 +3983,16 @@ function ExportPage() {
     }
   }, [isSessionMutualFriendsReady, patchSessionLoadTraceStage])
 
+  useEffect(() => {
+    enqueueSessionMutualFriendsRequestsRef.current = enqueueSessionMutualFriendsRequests
+  }, [enqueueSessionMutualFriendsRequests])
+
   const hasPendingMetricLoads = useCallback((): boolean => (
     isLoadingSessionCountsRef.current ||
     sessionMediaMetricQueuedSetRef.current.size > 0 ||
     sessionMediaMetricLoadingSetRef.current.size > 0 ||
     sessionMediaMetricWorkerRunningRef.current ||
-    snsUserPostCountsStatus === 'loading' ||
-    snsUserPostCountsStatus === 'idle'
+    snsUserPostCountsStatus === 'loading'
   ), [snsUserPostCountsStatus])
 
   const getSessionMutualFriendProfile = useCallback((sessionId: string): {
@@ -4070,6 +4155,7 @@ function ExportPage() {
   }, [])
 
   const enqueueSessionMediaMetricRequests = useCallback((sessionIds: string[], options?: { front?: boolean }) => {
+    if (!isExportRouteRef.current) return
     if (activeTaskCountRef.current > 0) return
     const front = options?.front === true
     const incoming: string[] = []
@@ -4128,6 +4214,7 @@ function ExportPage() {
 
   const runSessionMediaMetricWorker = useCallback(async (runId: number) => {
     if (sessionMediaMetricWorkerRunningRef.current) return
+    if (!isExportRouteRef.current) return
     sessionMediaMetricWorkerRunningRef.current = true
     const withTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, stage: string): Promise<T> => {
       let timer: number | null = null
@@ -4146,6 +4233,7 @@ function ExportPage() {
     }
     try {
       while (runId === sessionMediaMetricRunIdRef.current) {
+        if (!isExportRouteRef.current) break
         if (activeTaskCountRef.current > 0) {
           await new Promise(resolve => window.setTimeout(resolve, 150))
           continue
@@ -4210,6 +4298,10 @@ function ExportPage() {
             })
           }
         } catch (error) {
+          if (!isExportRouteRef.current || runId !== sessionMediaMetricRunIdRef.current) {
+            patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'pending', { force: true })
+            break
+          }
           console.error('导出页加载会话媒体统计失败:', error)
           patchSessionLoadTraceStage(batchSessionIds, 'mediaMetrics', 'failed', {
             error: String(error)
@@ -4234,11 +4326,14 @@ function ExportPage() {
       sessionMediaMetricWorkerRunningRef.current = false
       if (runId === sessionMediaMetricRunIdRef.current && sessionMediaMetricQueueRef.current.length > 0) {
         void runSessionMediaMetricWorker(runId)
+      } else if (runId === sessionMediaMetricRunIdRef.current && sessionMutualFriendsQueueRef.current.length > 0) {
+        scheduleSessionMutualFriendsWorkerRef.current()
       }
     }
   }, [applySessionMediaMetricsFromStats, isSessionMediaMetricReady, patchSessionLoadTraceStage])
 
   const scheduleSessionMediaMetricWorker = useCallback(() => {
+    if (!isExportRouteRef.current) return
     if (activeTaskCountRef.current > 0) return
     if (sessionMediaMetricWorkerRunningRef.current) return
     const runId = sessionMediaMetricRunIdRef.current
@@ -4255,6 +4350,9 @@ function ExportPage() {
     let hasMore = true
 
     while (hasMore) {
+      if (!isExportRouteRef.current) {
+        throw new Error('导出页已隐藏，已停止共同好友统计')
+      }
       const result = await window.electronAPI.sns.getTimeline(
         SNS_RANK_PAGE_SIZE,
         0,
@@ -4280,14 +4378,16 @@ function ExportPage() {
       hasMore = pagePosts.length >= SNS_RANK_PAGE_SIZE
     }
 
-    return buildSessionMutualFriendsMetric(allPosts, knownTotal)
+    return cloneCompactSessionMutualFriendsMetric(buildSessionMutualFriendsMetric(allPosts, knownTotal))
   }, [snsUserPostCounts])
 
   const runSessionMutualFriendsWorker = useCallback(async (runId: number) => {
     if (sessionMutualFriendsWorkerRunningRef.current) return
+    if (!isExportRouteRef.current) return
     sessionMutualFriendsWorkerRunningRef.current = true
     try {
       while (runId === sessionMutualFriendsRunIdRef.current) {
+        if (!isExportRouteRef.current) break
         if (activeTaskCountRef.current > 0) {
           await new Promise(resolve => window.setTimeout(resolve, 150))
           continue
@@ -4313,6 +4413,10 @@ function ExportPage() {
           sessionMutualFriendsReadySetRef.current.add(sessionId)
           patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'done')
         } catch (error) {
+          if (!isExportRouteRef.current || runId !== sessionMutualFriendsRunIdRef.current) {
+            patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'pending', { force: true })
+            break
+          }
           console.error('导出页加载共同好友统计失败:', error)
           patchSessionLoadTraceStage([sessionId], 'mutualFriends', 'failed', {
             error: error instanceof Error ? error.message : String(error)
@@ -4338,6 +4442,7 @@ function ExportPage() {
   ])
 
   const scheduleSessionMutualFriendsWorker = useCallback(() => {
+    if (!isExportRouteRef.current) return
     if (activeTaskCountRef.current > 0) return
     if (!isSessionCountStageReady) return
     if (hasPendingMetricLoads()) return
@@ -4345,6 +4450,16 @@ function ExportPage() {
     const runId = sessionMutualFriendsRunIdRef.current
     void runSessionMutualFriendsWorker(runId)
   }, [hasPendingMetricLoads, isSessionCountStageReady, runSessionMutualFriendsWorker])
+
+  useEffect(() => {
+    scheduleSessionMutualFriendsWorkerRef.current = scheduleSessionMutualFriendsWorker
+  }, [scheduleSessionMutualFriendsWorker])
+
+  useEffect(() => {
+    if (snsUserPostCountsStatus === 'loading') return
+    if (sessionMutualFriendsQueueRef.current.length === 0) return
+    scheduleSessionMutualFriendsWorker()
+  }, [scheduleSessionMutualFriendsWorker, snsUserPostCountsStatus])
 
   const loadSessionMessageCounts = useCallback(async (
     sourceSessions: SessionRow[],
@@ -4862,18 +4977,8 @@ function ExportPage() {
     if (isExportRoute) return
     // 导出页隐藏时停止后台联系人补齐请求，避免与通讯录页面查询抢占。
     setIsAutomationCreateMode(false)
-    sessionLoadTokenRef.current = Date.now()
-    sessionCountRequestIdRef.current += 1
-    snsUserPostCountsHydrationTokenRef.current += 1
-    if (snsUserPostCountsBatchTimerRef.current) {
-      window.clearTimeout(snsUserPostCountsBatchTimerRef.current)
-      snsUserPostCountsBatchTimerRef.current = null
-    }
-    resetSessionMutualFriendsLoader()
-    setIsSessionEnriching(false)
-    setIsLoadingSessionCounts(false)
-    setSnsUserPostCountsStatus(prev => (prev === 'loading' ? 'idle' : prev))
-  }, [isExportRoute, resetSessionMutualFriendsLoader])
+    stopExportPageBackgroundLoaders()
+  }, [isExportRoute, stopExportPageBackgroundLoaders])
 
   useEffect(() => {
     if (activeTab === 'official') {
@@ -6808,6 +6913,7 @@ function ExportPage() {
     for (const session of sessions) {
       if (!session.hasSession) continue
       if (!keywordMatchedContactUsernameSet.has(session.username)) continue
+      if (targets[session.kind].length >= SESSION_DETAIL_BACKGROUND_METRIC_LIMIT_PER_TAB) continue
       targets[session.kind].push(session.username)
     }
     return targets
@@ -7056,18 +7162,21 @@ function ExportPage() {
   ])
 
   useEffect(() => {
+    if (!isExportRoute) return
     if (filteredContacts.length === 0) return
     const bootstrapTargets = filteredContacts.slice(0, 24).map((contact) => contact.username)
     void hydrateVisibleContactAvatars(bootstrapTargets)
-  }, [filteredContacts, hydrateVisibleContactAvatars])
+  }, [filteredContacts, hydrateVisibleContactAvatars, isExportRoute])
 
   useEffect(() => {
+    if (!isExportRoute) return
     const sessionId = String(sessionDetail?.wxid || '').trim()
     if (!sessionId) return
     void hydrateVisibleContactAvatars([sessionId])
-  }, [hydrateVisibleContactAvatars, sessionDetail?.wxid])
+  }, [hydrateVisibleContactAvatars, isExportRoute, sessionDetail?.wxid])
 
   useEffect(() => {
+    if (!isExportRoute) return
     if (activeTaskCount > 0) return
     if (filteredContacts.length === 0) return
     const runId = sessionMediaMetricRunIdRef.current
@@ -7102,9 +7211,7 @@ function ExportPage() {
         scheduleSessionMediaMetricWorker()
       }
 
-      if (cursor < filteredContacts.length) {
-        sessionMediaMetricBackgroundFeedTimerRef.current = window.setTimeout(feedNext, SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS)
-      }
+      // 限制后台预热规模；继续滚动时再按可见行补齐。
     }
 
     feedNext()
@@ -7119,11 +7226,13 @@ function ExportPage() {
     collectVisibleSessionMetricTargets,
     enqueueSessionMediaMetricRequests,
     filteredContacts,
+    isExportRoute,
     scheduleSessionMediaMetricWorker,
     sessionRowByUsername
   ])
 
   useEffect(() => {
+    if (!isExportRoute) return
     if (activeTaskCount > 0) return
     const runId = sessionMediaMetricRunIdRef.current
     const allTargets = [
@@ -7133,7 +7242,6 @@ function ExportPage() {
     ]
     if (allTargets.length === 0) return
 
-    let timer: number | null = null
     let cursor = 0
     const feedNext = () => {
       if (runId !== sessionMediaMetricRunIdRef.current) return
@@ -7148,20 +7256,14 @@ function ExportPage() {
         enqueueSessionMediaMetricRequests(batchIds)
         scheduleSessionMediaMetricWorker()
       }
-      if (cursor < allTargets.length) {
-        timer = window.setTimeout(feedNext, SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS)
-      }
+      // 数据详情只展示受限目标；更多行由可见行加载按需补齐。
     }
 
     feedNext()
-    return () => {
-      if (timer !== null) {
-        window.clearTimeout(timer)
-      }
-    }
   }, [
     activeTaskCount,
     enqueueSessionMediaMetricRequests,
+    isExportRoute,
     loadDetailTargetsByTab.former_friend,
     loadDetailTargetsByTab.group,
     loadDetailTargetsByTab.private,
@@ -7169,6 +7271,7 @@ function ExportPage() {
   ])
 
   useEffect(() => {
+    if (!isExportRoute) return
     if (activeTaskCount > 0) return
     if (!isSessionCountStageReady || filteredContacts.length === 0) return
     const runId = sessionMutualFriendsRunIdRef.current
@@ -7203,9 +7306,7 @@ function ExportPage() {
         scheduleSessionMutualFriendsWorker()
       }
 
-      if (cursor < filteredContacts.length) {
-        sessionMutualFriendsBackgroundFeedTimerRef.current = window.setTimeout(feedNext, SESSION_MEDIA_METRIC_BACKGROUND_FEED_INTERVAL_MS)
-      }
+      // 限制后台预热规模；继续滚动时再按可见行补齐。
     }
 
     feedNext()
@@ -7220,6 +7321,7 @@ function ExportPage() {
     collectVisibleSessionMutualFriendsTargets,
     enqueueSessionMutualFriendsRequests,
     filteredContacts,
+    isExportRoute,
     isSessionCountStageReady,
     scheduleSessionMutualFriendsWorker,
     sessionRowByUsername
@@ -7318,7 +7420,7 @@ function ExportPage() {
     const sessionId = String(sessionDetail?.wxid || '').trim()
     if (!sessionId || !sessionDetailSupportsSnsTimeline) return '朋友圈：0条'
 
-    if (snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle') {
+    if (snsUserPostCountsStatus === 'loading') {
       return '朋友圈：统计中...'
     }
     if (snsUserPostCountsStatus === 'error') {
@@ -7761,7 +7863,7 @@ function ExportPage() {
   useEffect(() => {
     if (!showSessionDetailPanel || !sessionDetailSupportsSnsTimeline) return
     if (snsUserPostCountsStatus === 'idle') {
-      void loadSnsUserPostCounts()
+      void loadSnsUserPostCounts({ cacheOnly: true })
     }
   }, [
     loadSnsUserPostCounts,
@@ -7774,7 +7876,7 @@ function ExportPage() {
     if (!isExportRoute || !isSessionCountStageReady) return
     if (snsUserPostCountsStatus !== 'idle') return
     const timer = window.setTimeout(() => {
-      void loadSnsUserPostCounts()
+      void loadSnsUserPostCounts({ cacheOnly: true })
     }, 260)
     return () => window.clearTimeout(timer)
   }, [isExportRoute, isSessionCountStageReady, loadSnsUserPostCounts, snsUserPostCountsStatus])
@@ -7789,7 +7891,7 @@ function ExportPage() {
       setSessionSnsTimelineStatsLoading(false)
       return
     }
-    if (snsUserPostCountsStatus === 'loading' || snsUserPostCountsStatus === 'idle') {
+    if (snsUserPostCountsStatus === 'loading') {
       setSessionSnsTimelineStatsLoading(true)
       return
     }
@@ -7843,7 +7945,7 @@ function ExportPage() {
     detailStatsPriorityRef.current = true
     setShowSessionDetailPanel(true)
     if (isSingleContactSession(sessionId)) {
-      void loadSnsUserPostCounts()
+      void loadSnsUserPostCounts({ cacheOnly: true })
     }
     void loadSessionDetail(sessionId)
   }, [loadSessionDetail, loadSnsUserPostCounts])
@@ -7862,7 +7964,7 @@ function ExportPage() {
   useEffect(() => {
     if (!showSessionLoadDetailModal) return
     if (snsUserPostCountsStatus === 'idle') {
-      void loadSnsUserPostCounts()
+      void loadSnsUserPostCounts({ cacheOnly: true })
     }
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
@@ -8543,8 +8645,7 @@ function ExportPage() {
       (
         snsStageStatus === 'pending' ||
         snsStageStatus === 'loading' ||
-        snsUserPostCountsStatus === 'loading' ||
-        snsUserPostCountsStatus === 'idle'
+        snsUserPostCountsStatus === 'loading'
       )
     )
     const snsRawCount = Number(snsUserPostCounts[contact.username] || 0)
@@ -8697,7 +8798,7 @@ function ExportPage() {
                   className={`row-sns-metric-btn row-mutual-friends-btn ${isMutualFriendsLoading ? 'loading' : ''} ${hasMutualFriendsMetric ? 'ready' : ''}`}
                   title={`查看 ${contact.displayName || contact.username} 的共同好友`}
                   onClick={() => openSessionMutualFriendsDialog(contact)}
-                  disabled={!hasMutualFriendsMetric}
+                  disabled={isMutualFriendsLoading}
                 >
                   {isMutualFriendsLoading
                     ? <Loader2 size={12} className="spin row-media-metric-icon" aria-label="共同好友统计加载中" />
@@ -9770,6 +9871,9 @@ function ExportPage() {
                       {sessionLoadDetailUpdatedAt > 0
                         ? new Date(sessionLoadDetailUpdatedAt).toLocaleString('zh-CN')
                         : '暂无'}
+                    </p>
+                    <p>
+                      后台预热仅跟踪每类前 {SESSION_DETAIL_BACKGROUND_METRIC_LIMIT_PER_TAB} 个会话；其他行滚动到可见时按需加载。
                     </p>
                   </div>
                   <button

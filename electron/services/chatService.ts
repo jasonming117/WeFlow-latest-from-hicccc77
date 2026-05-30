@@ -490,6 +490,13 @@ class ChatService {
     return true
   }
 
+  private shouldPersistAvatarUrl(avatarUrl?: string): avatarUrl is string {
+    const normalized = String(avatarUrl || '').trim()
+    if (!this.isValidAvatarUrl(normalized)) return false
+    if (!normalized.startsWith('data:')) return true
+    return normalized.length <= 4096
+  }
+
   private extractErrorCode(message?: string | null): number | null {
     const text = String(message || '').trim()
     if (!text) return null
@@ -1115,6 +1122,7 @@ class ChatService {
       const summary = this.cleanString(row.summary || row.digest || row.last_msg || row.lastMsg || '')
       const lastMsgType = parseInt(row.last_msg_type || row.lastMsgType || '0', 10)
       const cached = this.avatarCache.get(username)
+      const cachedAvatarUrl = this.shouldPersistAvatarUrl(cached?.avatarUrl) ? cached?.avatarUrl : undefined
       const contact = contactMap.get(username)
 
       const session: ChatSession = {
@@ -1126,7 +1134,7 @@ class ChatService {
         lastTimestamp: lastTs,
         lastMsgType,
         displayName: contact?.displayName || cached?.displayName || username,
-        avatarUrl: cached?.avatarUrl,
+        avatarUrl: cachedAvatarUrl,
         lastMsgSender: row.last_msg_sender,
         lastSenderDisplayName: row.last_sender_display_name,
         selfWxid: myWxid
@@ -1484,8 +1492,7 @@ class ChatService {
       // 检查缓存
       for (const username of normalizedUsernames) {
         const cached = this.avatarCache.get(username)
-        const isValidAvatar = this.isValidAvatarUrl(cached?.avatarUrl)
-        const cachedAvatarUrl = isValidAvatar ? cached?.avatarUrl : undefined
+        const cachedAvatarUrl = this.shouldPersistAvatarUrl(cached?.avatarUrl) ? cached?.avatarUrl : undefined
         if (onlyMissingAvatar && cachedAvatarUrl) {
           result[username] = {
             displayName: skipDisplayName ? undefined : cached?.displayName,
@@ -1495,7 +1502,7 @@ class ChatService {
         }
         // 如果缓存有效且有头像，直接使用；如果没有头像，也需要重新尝试获取
         // 额外检查：如果头像是无效的 hex 格式（以 ffd8 开头），也需要重新获取
-        if (cached && now - cached.updatedAt < this.avatarCacheTtlMs && isValidAvatar) {
+        if (cached && now - cached.updatedAt < this.avatarCacheTtlMs && cachedAvatarUrl) {
           result[username] = {
             displayName: skipDisplayName ? undefined : cached.displayName,
             avatarUrl: cachedAvatarUrl
@@ -1529,7 +1536,11 @@ class ChatService {
 
           const cacheEntry: ContactCacheEntry = {
             displayName: displayName || previous?.displayName || username,
-            avatarUrl,
+            avatarUrl: this.shouldPersistAvatarUrl(avatarUrl)
+              ? avatarUrl
+              : this.shouldPersistAvatarUrl(previous?.avatarUrl)
+                ? previous?.avatarUrl
+                : undefined,
             updatedAt: now
           }
           result[username] = {
@@ -1549,7 +1560,7 @@ class ChatService {
             if (avatarUrl) {
               result[username].avatarUrl = avatarUrl
               const cached = this.avatarCache.get(username)
-              if (cached) {
+              if (cached && this.shouldPersistAvatarUrl(avatarUrl)) {
                 cached.avatarUrl = avatarUrl
                 updatedEntries[username] = cached
               }
@@ -7276,9 +7287,9 @@ class ChatService {
       if (!connectResult.success) return null
       const cached = this.avatarCache.get(username)
       // 检查缓存是否有效，且头像不是错误的 hex 格式
-      const isValidAvatar = this.isValidAvatarUrl(cached?.avatarUrl)
-      if (cached && isValidAvatar && Date.now() - cached.updatedAt < this.avatarCacheTtlMs) {
-        return { avatarUrl: cached.avatarUrl, displayName: cached.displayName }
+      const cachedAvatarUrl = this.shouldPersistAvatarUrl(cached?.avatarUrl) ? cached?.avatarUrl : undefined
+      if (cached && cachedAvatarUrl && Date.now() - cached.updatedAt < this.avatarCacheTtlMs) {
+        return { avatarUrl: cachedAvatarUrl, displayName: cached.displayName }
       }
 
       const contact = await this.getContact(username)
@@ -7296,7 +7307,11 @@ class ChatService {
       }
       const displayName = contact?.remark || contact?.nickName || contact?.alias || cached?.displayName || username
       const cacheEntry: ContactCacheEntry = {
-        avatarUrl,
+        avatarUrl: this.shouldPersistAvatarUrl(avatarUrl)
+          ? avatarUrl
+          : this.shouldPersistAvatarUrl(cached?.avatarUrl)
+            ? cached?.avatarUrl
+            : undefined,
         displayName,
         updatedAt: Date.now()
       }
@@ -7732,7 +7747,7 @@ class ChatService {
       const cachedContact = this.avatarCache.get(normalizedSessionId)
       if (cachedContact) {
         displayName = cachedContact.displayName || normalizedSessionId
-        if (this.isValidAvatarUrl(cachedContact.avatarUrl)) {
+        if (this.shouldPersistAvatarUrl(cachedContact.avatarUrl)) {
           avatarUrl = cachedContact.avatarUrl
         }
       }
