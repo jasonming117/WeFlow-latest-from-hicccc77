@@ -127,9 +127,6 @@ export class WcdbCore {
   private wcdbStartMonitorPipe: any = null
   private wcdbStopMonitorPipe: any = null
   private wcdbGetMonitorPipeName: any = null
-  private wcdbCloudInit: any = null
-  private wcdbCloudReport: any = null
-  private wcdbCloudStop: any = null
 
   private monitorPipeClient: any = null
   private monitorCallback: ((type: string, json: string) => void) | null = null
@@ -1240,27 +1237,6 @@ export class WcdbCore {
         this.wcdbVerifyUser = null
       }
 
-      // wcdb_status wcdb_cloud_init(int32_t interval_seconds)
-      try {
-        this.wcdbCloudInit = this.lib.func('int32 wcdb_cloud_init(int32 intervalSeconds)')
-      } catch {
-        this.wcdbCloudInit = null
-      }
-
-      // wcdb_status wcdb_cloud_report(const char* stats_json)
-      try {
-        this.wcdbCloudReport = this.lib.func('int32 wcdb_cloud_report(const char* statsJson)')
-      } catch {
-        this.wcdbCloudReport = null
-      }
-
-      // void wcdb_cloud_stop()
-      try {
-        this.wcdbCloudStop = this.lib.func('void wcdb_cloud_stop()')
-      } catch {
-        this.wcdbCloudStop = null
-      }
-
 
       // 初始化
       const initResult = this.wcdbInit()
@@ -1658,9 +1634,8 @@ export class WcdbCore {
    */
   close(): void {
     if (this.handle !== null || this.initialized) {
-      // 先停止监控与云控回调，避免 shutdown 后仍有 native 回调访问已释放资源。
+      // 先停止监控，避免 shutdown 后仍有 native 回调访问已释放资源。
       try { this.stopMonitor() } catch {}
-      try { this.cloudStop() } catch {}
       try {
         // 不调用 closeAccount，直接 shutdown
         this.wcdbShutdown()
@@ -4156,58 +4131,6 @@ export class WcdbCore {
     }
   }
 
-  /**
-   * 数据收集初始化
-   */
-  async cloudInit(intervalSeconds: number = 600): Promise<{ success: boolean; error?: string }> {
-    if (!this.initialized) {
-      const initOk = await this.initialize()
-      if (!initOk) return { success: false, error: 'WCDB init failed' }
-    }
-    if (!this.wcdbCloudInit) {
-      return { success: false, error: 'Cloud init API not supported by DLL' }
-    }
-    try {
-      const result = this.wcdbCloudInit(intervalSeconds)
-      if (result !== 0) {
-        return { success: false, error: `Cloud init failed: ${result}` }
-      }
-      return { success: true }
-    } catch (e) {
-      return { success: false, error: String(e) }
-    }
-  }
-
-  async cloudReport(statsJson: string): Promise<{ success: boolean; error?: string }> {
-    if (!this.initialized) {
-      const initOk = await this.initialize()
-      if (!initOk) return { success: false, error: 'WCDB init failed' }
-    }
-    if (!this.wcdbCloudReport) {
-      return { success: false, error: 'Cloud report API not supported by DLL' }
-    }
-    try {
-      const result = this.wcdbCloudReport(statsJson || '')
-      if (result !== 0) {
-        return { success: false, error: `Cloud report failed: ${result}` }
-      }
-      return { success: true }
-    } catch (e) {
-      return { success: false, error: String(e) }
-    }
-  }
-
-  cloudStop(): { success: boolean; error?: string } {
-    if (!this.wcdbCloudStop) {
-      return { success: false, error: 'Cloud stop API not supported by DLL' }
-    }
-    try {
-      this.wcdbCloudStop()
-      return { success: true }
-    } catch (e) {
-      return { success: false, error: String(e) }
-    }
-  }
   async verifyUser(message: string, hwnd?: string): Promise<{ success: boolean; error?: string }> {
     if (!this.initialized) {
       const initOk = await this.initialize()

@@ -228,13 +228,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
   const [wordCloudExcludeWords, setWordCloudExcludeWords] = useState<string[]>([])
   const [excludeWordsInput, setExcludeWordsInput] = useState('')
 
-  // 数据收集同意状态
-  const [analyticsConsent, setAnalyticsConsent] = useState<boolean>(false)
-
-
-
-
-
   const [isLoading, setIsLoadingState] = useState(false)
   const [isTesting, setIsTesting] = useState(false)
   const [isDetectingPath, setIsDetectingPath] = useState(false)
@@ -566,8 +559,6 @@ function SettingsPage({ onClose }: SettingsPageProps = {}) {
 
       const savedAutoDownloadHighRes = await configService.getAutoDownloadHighRes()
       const savedAutoDownloadWhitelist = await configService.getAutoDownloadWhitelist()
-      const savedAnalyticsConsent = await configService.getAnalyticsConsent()
-      setAnalyticsConsent(savedAnalyticsConsent ?? false)
       setAutoDownloadHighRes(savedAutoDownloadHighRes)
       setAutoDownloadSelectedIds(new Set(savedAutoDownloadWhitelist))
 
@@ -5173,24 +5164,6 @@ JSON 输出格式：
           <a href="#" onClick={(e) => { e.preventDefault(); window.electronAPI.window.openAgreementWindow() }}>用户协议</a>
         </div>
         <p className="copyright">© 2026 WeFlow. All rights reserved.</p>
-
-        <div className="log-toggle-line" style={{ marginTop: '16px', justifyContent: 'center' }}>
-          <span style={{ fontSize: '13px', opacity: 0.7 }}>匿名数据收集</span>
-          <label className="switch">
-            <input
-              type="checkbox"
-              className="switch-input"
-              checked={analyticsConsent}
-              onChange={async (e) => {
-                const consent = e.target.checked
-                setAnalyticsConsent(consent)
-                await configService.setAnalyticsConsent(consent)
-                showMessage(consent ? '已允许数据收集' : '已拒绝数据收集', true)
-              }}
-            />
-            <span className="switch-slider"></span>
-          </label>
-        </div>
       </div>
 
     </div>

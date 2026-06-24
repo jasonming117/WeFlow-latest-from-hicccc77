@@ -25,8 +25,6 @@ import { videoService } from './services/videoService'
 import { snsService, isVideoUrl } from './services/snsService'
 import { windowsHelloService } from './services/windowsHelloService'
 import { exportCardDiagnosticsService } from './services/exportCardDiagnosticsService'
-import { cloudControlService } from './services/cloudControlService'
-
 import { destroyNotificationWindow, registerNotificationHandlers, showNotification, setNotificationNavigateHandler } from './windows/notificationWindow'
 import { httpService } from './services/httpService'
 import { messagePushService } from './services/messagePushService'
@@ -2051,19 +2049,6 @@ function registerIpcHandlers() {
       return { success: false, error: '导出路径不能为空' }
     }
     return exportCardDiagnosticsService.exportCombinedLogs(filePath, payload?.frontendLogs || [])
-  })
-
-  // 数据收集服务
-  ipcMain.handle('cloud:init', async () => {
-    await cloudControlService.init()
-  })
-
-  ipcMain.handle('cloud:recordPage', (_, pageName: string) => {
-    cloudControlService.recordPage(pageName)
-  })
-
-  ipcMain.handle('cloud:getLogs', async () => {
-    return cloudControlService.getLogs()
   })
 
   ipcMain.handle('app:checkForUpdates', async () => {
@@ -4462,7 +4447,6 @@ const shutdownAppServices = async (): Promise<void> => {
       app.exit(0)
     }, 5000)
     forceExitTimer.unref()
-    try { await cloudControlService.stop() } catch {}
     // 停止自动下载服务
     try { await imageDownloadService.stopAutoDownload() } catch {}
     // 停止 chatService（内部会关闭 cursor 与 DB），避免退出阶段仍触发监控回调

@@ -713,29 +713,6 @@ export class WcdbService {
     return this.callWorker('deleteMessage', { sessionId, localId, createTime, dbPathHint })
   }
 
-  /**
-   * 数据收集：初始化
-   */
-  async cloudInit(intervalSeconds: number): Promise<{ success: boolean; error?: string }> {
-    return this.callWorker('cloudInit', { intervalSeconds })
-  }
-
-  /**
-   * 数据收集：上报数据
-   */
-  async cloudReport(statsJson: string): Promise<{ success: boolean; error?: string }> {
-    return this.callWorker('cloudReport', { statsJson })
-  }
-
-  /**
-   * 数据收集：停止
-   */
-  cloudStop(): Promise<{ success: boolean; error?: string }> {
-    return this.callWorker('cloudStop', {})
-  }
-
-
-
 }
 
 export const wcdbService = new WcdbService()
